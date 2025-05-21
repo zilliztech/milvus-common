@@ -1,0 +1,2 @@
+add_source_at_current_directory_recursively()
+add_library(milvus_internal_common OBJECT ${SOURCE_FILES})
