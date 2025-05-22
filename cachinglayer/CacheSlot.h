@@ -29,7 +29,7 @@
 #include "common/EasyAssert.h"
 #include "common/type_c.h"
 #include "log/Log.h"
-#include "monitor/prometheus_client.h"
+#include "common/common_monitor.h"
 #include "common/ThreadPools.h"
 
 namespace milvus::cachinglayer {

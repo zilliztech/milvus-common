@@ -18,11 +18,11 @@
 
 #include "cachinglayer/Utils.h"
 #include "cachinglayer/lrucache/ListNode.h"
-#include "monitor/prometheus_client.h"
+#include "common/common_monitor.h"
 #include "log/Log.h"
 
 namespace milvus::cachinglayer::internal {
-    
+
 bool
 DList::reserveMemory(const ResourceUsage& size) {
     std::unique_lock<std::mutex> list_lock(list_mtx_);

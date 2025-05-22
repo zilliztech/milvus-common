@@ -21,7 +21,7 @@
 #include <prometheus/gauge.h>
 #include <prometheus/histogram.h>
 
-#include "monitor/prometheus_client.h"
+#include "common/prometheus_client.h"
 
 namespace milvus::cachinglayer {
 

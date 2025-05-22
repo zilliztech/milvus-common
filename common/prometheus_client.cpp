@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Zilliz. All rights reserved.
+// Copyright (C) 2019-2023 Zilliz. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
 // with the License. You may obtain a copy of the License at
@@ -9,15 +9,16 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 // or implied. See the License for the specific language governing permissions and limitations under the License.
 
-#pragma once
+#include "prometheus_client.h"
+#include <chrono>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+namespace milvus::monitor {
 
-char*
-GetCoreMetrics();
 
-#ifdef __cplusplus
-};
-#endif
+
+const std::unique_ptr<PrometheusClient> prometheusClient =
+    std::make_unique<PrometheusClient>();
+
+
+
+}  // namespace milvus::monitor
