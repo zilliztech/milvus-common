@@ -52,9 +52,6 @@ gtags.conf
 lcov_*.info
 coverage/
 
-
-**/thirdparty/cardinal
-
 *.bin
 
 CMakeUserPresets.json
