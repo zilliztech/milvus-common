@@ -13,6 +13,7 @@
 // Created by zilliz on 2023/7/31.
 //
 
+#include <map>
 #include "common/ThreadPools.h"
 
 namespace milvus {

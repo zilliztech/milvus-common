@@ -30,13 +30,12 @@ conan_basic_setup( KEEP_RPATHS )
 file(GLOB_RECURSE SRC_FILES src/*.cpp src/*.cc)
 add_library(milvus-common SHARED ${SRC_FILES})
 
-if (BUILD_TESTS)
-    add_subdirectory(test)
-endif()
+list(APPEND milvus-common_LINKER_LIBS ${CONAN_LIBS})
 
-list(APPEND MILVUS_BASE_LINKER_LIBS ${CONAN_LIBS})
-
-target_link_libraries(milvus-common PRIVATE ${MILVUS_BASE_LINKER_LIBS})
+target_link_libraries(milvus-common PUBLIC ${milvus-common_LINKER_LIBS})
 
 install(TARGETS milvus-common
         DESTINATION ${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR})
+
+install(DIRECTORY "${MILVUS_COMMON_WORKSPACE}/include/"
+        DESTINATION "${CMAKE_INSTALL_PREFIX}/include")
