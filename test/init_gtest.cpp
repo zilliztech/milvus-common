@@ -12,7 +12,7 @@
 #include <gtest/gtest.h>
 
 #include "folly/init/Init.h"
-#include "common/type_c.h"
+#include "common/common_type_c.h"
 #include "test_utils/Constants.h"
 #include "cachinglayer/Manager.h"
 

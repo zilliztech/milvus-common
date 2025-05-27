@@ -1,5 +1,0 @@
-macro(add_source_at_current_directory_recursively)
-    file(GLOB_RECURSE SOURCE_FILES RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "*.cc" "*.cpp" "*.c" "*.cxx")
-    message(STATUS "${CMAKE_CURRENT_SOURCE_DIR}  add new source files at current directory recursively: ${SOURCE_FILES}")
-    set(SOURCE_FILES ${SOURCE_FILES} PARENT_SCOPE)
-endmacro()

@@ -11,7 +11,6 @@ import os
 
 required_conan_version = ">=1.55.0"
 
-
 class MilvusCommonConan(ConanFile):
     keep_imports = True
     settings = "os", "compiler", "build_type", "arch"

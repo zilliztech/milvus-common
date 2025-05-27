@@ -23,7 +23,7 @@ add_executable(cachinglayer_test
 target_link_libraries(cachinglayer_test
     gtest 
     gmock
-    milvus_common
+    milvus-common
     pthread
     atomic
     ${CONAN_LIBS}
