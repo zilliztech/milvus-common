@@ -70,6 +70,7 @@ enum ErrorCode {
     GcpNativeError = 2040,
     TextIndexNotFound = 2041,
     InvalidParameter = 2042,
+    InsufficientResource = 2043,
 
     KnowhereError = 2099
 };
@@ -149,7 +150,7 @@ FailureCStatus(const std::exception* ex) {
 
 #define Assert(expr) AssertInfo((expr), "")
 
-#define PanicInfo(errcode, info, args...)                       \
+#define ThrowInfo(errcode, info, args...)                       \
     do {                                                        \
         milvus::impl::EasyAssertInfo(false,                     \
                                      "",                        \

@@ -29,7 +29,7 @@ class DListTestFriend {
  public:
     static ResourceUsage
     get_used_memory(const DList& dlist) {
-        return dlist.used_memory_.load();
+        return dlist.used_resources_.load();
     }
     static ResourceUsage
     get_max_memory(const DList& dlist) {
@@ -59,7 +59,7 @@ class DListTestFriend {
     static void
     test_add_used_memory(DList* dlist, const ResourceUsage& size) {
         std::lock_guard lock(dlist->list_mtx_);
-        dlist->used_memory_ += size;
+        dlist->used_resources_ += size;
     }
 
     // nodes are from tail to head
@@ -96,7 +96,7 @@ class DListTestFriend {
         EXPECT_EQ(prev, dlist->head_);
         EXPECT_EQ(dlist->head_->next_, nullptr);
 
-        EXPECT_EQ(total_size, dlist->used_memory_.load());
+        EXPECT_EQ(total_size, dlist->used_resources_.load());
     }
 };
 }  // namespace cachinglayer::internal

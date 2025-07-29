@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Zilliz. All rights reserved.
+// Copyright (C) 2019-2020 Zilliz. All rights reserved
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
 // with the License. You may obtain a copy of the License at
@@ -13,14 +13,19 @@
 #include <opentelemetry/exporters/otlp/otlp_http_exporter_factory.h>
 #include <opentelemetry/exporters/otlp/otlp_http_exporter_options.h>
 #include "log/Log.h"
-
+#include "nlohmann/json.hpp"
 #include <atomic>
 #include <cstddef>
 #include <iomanip>
 #include <iostream>
 #include <utility>
+#include <sstream>
+#include <algorithm>
+#include <cctype>
 
+#ifdef WITH_JAEGER
 #include "opentelemetry/exporters/jaeger/jaeger_exporter_factory.h"
+#endif
 #include "opentelemetry/exporters/ostream/span_exporter_factory.h"
 #include "opentelemetry/exporters/otlp/otlp_grpc_exporter_factory.h"
 #include "opentelemetry/sdk/resource/resource.h"
@@ -40,7 +45,9 @@ namespace nostd = opentelemetry::nostd;
 
 namespace trace_sdk = opentelemetry::sdk::trace;
 namespace resource = opentelemetry::sdk::resource;
+#ifdef WITH_JAEGER
 namespace jaeger = opentelemetry::exporter::jaeger;
+#endif
 namespace ostream = opentelemetry::exporter::trace;
 namespace otlp = opentelemetry::exporter::otlp;
 
@@ -54,22 +61,43 @@ initTelemetry(const TraceConfig& cfg) {
     std::unique_ptr<opentelemetry::sdk::trace::SpanExporter> exporter;
     if (cfg.exporter == "stdout") {
         exporter = ostream::OStreamSpanExporterFactory::Create();
+#ifdef WITH_JAEGER
     } else if (cfg.exporter == "jaeger") {
         auto opts = jaeger::JaegerExporterOptions{};
         opts.transport_format = jaeger::TransportFormat::kThriftHttp;
         opts.endpoint = cfg.jaegerURL;
         exporter = jaeger::JaegerExporterFactory::Create(opts);
         LOG_INFO("init jaeger exporter, endpoint: {}", opts.endpoint);
+#else
+    } else if (cfg.exporter == "jaeger") {
+        LOG_INFO("Jaeger exporter is not enabled. Please rebuild with -D{}=ON", "WITH_JAEGER");
+        export_created = false;
+#endif
     } else if (cfg.exporter == "otlp") {
         if (cfg.otlpMethod == "http") {
             auto opts = otlp::OtlpHttpExporterOptions{};
             opts.url = cfg.otlpEndpoint;
+            auto headers_map = parseHeaders(cfg.otlpHeaders);
+            if (!headers_map.empty()) {
+                for (const auto& pair : headers_map) {
+                    opts.http_headers.insert(
+                        std::pair<std::string, std::string>(pair.first,
+                                                            pair.second));
+                }
+            }
             exporter = otlp::OtlpHttpExporterFactory::Create(opts);
             LOG_INFO("init otlp http exporter, endpoint: {}", opts.url);
         } else if (cfg.otlpMethod == "grpc" ||
                    cfg.otlpMethod == "") {  // legacy configuration
             auto opts = otlp::OtlpGrpcExporterOptions{};
             opts.endpoint = cfg.otlpEndpoint;
+            auto headers_map = parseHeaders(cfg.otlpHeaders);
+            if (!headers_map.empty()) {
+                for (const auto& pair : headers_map) {
+                    opts.metadata.insert(std::pair<std::string, std::string>(
+                        pair.first, pair.second));
+                }
+            }
             opts.use_ssl_credentials = cfg.oltpSecure;
             exporter = otlp::OtlpGrpcExporterFactory::Create(opts);
             LOG_INFO("init otlp grpc exporter, endpoint: {}", opts.endpoint);
@@ -274,6 +302,24 @@ AutoSpan::~AutoSpan() {
     }
     if (is_root_span_) {
         CloseRootSpan();
+    }
+}
+
+std::map<std::string, std::string>
+parseHeaders(const std::string& headers) {
+    if (headers.empty()) {
+        return {};
+    }
+
+    try {
+        nlohmann::json json = nlohmann::json::parse(headers);
+        return json.get<std::map<std::string, std::string>>();
+    } catch (const std::exception& e) {
+        // Log the parsing error and return empty map
+        LOG_ERROR("Failed to parse headers as JSON: {}, error: {}",
+                  headers,
+                  e.what());
+        return {};
     }
 }
 
