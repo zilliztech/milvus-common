@@ -42,6 +42,26 @@ SemiInlineGet(folly::SemiFuture<T>&& future) {
     return std::move(future).via(&folly::InlineExecutor::instance()).get();
 }
 
+inline std::string
+FormatBytes(int64_t bytes) {
+    constexpr int64_t kUnlimitedThreshold =
+        std::numeric_limits<int64_t>::max() / 100;
+    if (bytes >= kUnlimitedThreshold) {
+        return "UNSET";
+    }
+    if (bytes < 1024) {
+        return fmt::format("{} B", bytes);
+    } else if (bytes < 1024 * 1024) {
+        return fmt::format("{:.2f} KB ({} B)", bytes / 1024.0, bytes);
+    } else if (bytes < 1024 * 1024 * 1024) {
+        return fmt::format(
+            "{:.2f} MB ({} B)", bytes / (1024.0 * 1024.0), bytes);
+    } else {
+        return fmt::format(
+            "{:.2f} GB ({} B)", bytes / (1024.0 * 1024.0 * 1024.0), bytes);
+    }
+}
+
 struct ResourceUsage {
     int64_t memory_bytes{0};
     int64_t file_bytes{0};
@@ -70,6 +90,18 @@ struct ResourceUsage {
                              file_bytes - rhs.file_bytes);
     }
 
+    ResourceUsage
+    operator*(double factor) const {
+        return ResourceUsage(
+            static_cast<int64_t>(std::round(memory_bytes * factor)),
+            static_cast<int64_t>(std::round(file_bytes * factor)));
+    }
+
+    friend ResourceUsage
+    operator*(double factor, const ResourceUsage& usage) {
+        return usage * factor;
+    }
+
     void
     operator-=(const ResourceUsage& rhs) {
         memory_bytes -= rhs.memory_bytes;
@@ -87,7 +119,12 @@ struct ResourceUsage {
     }
 
     bool
-    GEZero() const {
+    AnyGTZero() const {
+        return memory_bytes > 0 || file_bytes > 0;
+    }
+
+    bool
+    AllGEZero() const {
         return memory_bytes >= 0 && file_bytes >= 0;
     }
 
@@ -106,18 +143,27 @@ struct ResourceUsage {
 
     std::string
     ToString() const {
-        return fmt::format(
-            "memory {} bytes ({:.2} GB), disk {} bytes ({:.2} GB)",
-            memory_bytes,
-            memory_bytes / 1024.0 / 1024.0 / 1024.0,
-            file_bytes,
-            file_bytes / 1024.0 / 1024.0 / 1024.0);
+        if (memory_bytes == 0 && file_bytes == 0) {
+            return "EMPTY";
+        }
+
+        std::string result;
+        if (memory_bytes > 0) {
+            result += fmt::format("memory {}", FormatBytes(memory_bytes));
+        }
+        if (file_bytes > 0) {
+            if (!result.empty()) {
+                result += ", ";
+            }
+            result += fmt::format("disk {}", FormatBytes(file_bytes));
+        }
+        return result;
     }
 };
 
 inline std::ostream&
 operator<<(std::ostream& os, const ResourceUsage& usage) {
-    os << "memory=" << usage.memory_bytes << ", disk=" << usage.file_bytes;
+    os << usage.ToString();
     return os;
 }
 
@@ -168,6 +214,27 @@ struct CacheWarmupPolicies {
           scalarIndexCacheWarmupPolicy(scalarIndexCacheWarmupPolicy),
           vectorIndexCacheWarmupPolicy(vectorIndexCacheWarmupPolicy) {
     }
+
+    std::string
+    ToString() const {
+        auto policyToString = [](CacheWarmupPolicy policy) -> std::string {
+            switch (policy) {
+                case CacheWarmupPolicy::CacheWarmupPolicy_Sync:
+                    return "Sync";
+                case CacheWarmupPolicy::CacheWarmupPolicy_Disable:
+                    return "Disable";
+                default:
+                    return "Unknown";
+            }
+        };
+        return fmt::format(
+            "warmup policies: scalarField: {}, vectorField: {}, "
+            "scalarIndex: {}, vectorIndex: {}",
+            policyToString(scalarFieldCacheWarmupPolicy),
+            policyToString(vectorFieldCacheWarmupPolicy),
+            policyToString(scalarIndexCacheWarmupPolicy),
+            policyToString(vectorIndexCacheWarmupPolicy));
+    }
 };
 
 struct CacheLimit {
@@ -206,14 +273,52 @@ struct EvictionConfig {
     // Use cache_touch_window_ms to reduce the frequency of touching and reduce contention.
     std::chrono::milliseconds cache_touch_window;
     std::chrono::milliseconds eviction_interval;
+    // Time after which an unaccessed cache cell will be evicted
+    std::chrono::seconds cache_cell_unaccessed_survival_time;
+    // Overloaded memory threshold percentage - limits cache memory usage to this percentage of total physical memory
+    float overloaded_memory_threshold_percentage;
+    // Max disk usage percentage - limits disk cache usage to this percentage of total disk space (not used yet)
+    float max_disk_usage_percentage;
+    std::string disk_path;
+    // Loading memory factor for estimating memory during loading
+    float loading_memory_factor;
+
     EvictionConfig()
         : cache_touch_window(std::chrono::milliseconds(0)),
-          eviction_interval(std::chrono::milliseconds(0)) {
+          eviction_interval(std::chrono::milliseconds(0)),
+          cache_cell_unaccessed_survival_time(std::chrono::seconds(0)),
+          overloaded_memory_threshold_percentage(0.9),
+          max_disk_usage_percentage(0.95),
+          loading_memory_factor(2.5f),
+          disk_path("") {
     }
 
     EvictionConfig(int64_t cache_touch_window_ms, int64_t eviction_interval_ms)
         : cache_touch_window(std::chrono::milliseconds(cache_touch_window_ms)),
-          eviction_interval(std::chrono::milliseconds(eviction_interval_ms)) {
+          eviction_interval(std::chrono::milliseconds(eviction_interval_ms)),
+          cache_cell_unaccessed_survival_time(std::chrono::seconds(0)),
+          overloaded_memory_threshold_percentage(0.9),
+          max_disk_usage_percentage(0.95),
+          loading_memory_factor(2.5f),
+          disk_path("") {
+    }
+
+    EvictionConfig(int64_t cache_touch_window_ms,
+                   int64_t eviction_interval_ms,
+                   int64_t cache_cell_unaccessed_survival_time,
+                   float overloaded_memory_threshold_percentage,
+                   float max_disk_usage_percentage,
+                   const std::string& disk_path,
+                   float loading_memory_factor)
+        : cache_touch_window(std::chrono::milliseconds(cache_touch_window_ms)),
+          eviction_interval(std::chrono::milliseconds(eviction_interval_ms)),
+          cache_cell_unaccessed_survival_time(
+              std::chrono::seconds(cache_cell_unaccessed_survival_time)),
+          overloaded_memory_threshold_percentage(
+              overloaded_memory_threshold_percentage),
+          max_disk_usage_percentage(max_disk_usage_percentage),
+          disk_path(disk_path),
+          loading_memory_factor(loading_memory_factor) {
     }
 };
 
@@ -229,7 +334,7 @@ cache_slot_count(StorageType storage_type) {
         case StorageType::MIXED:
             return monitor::internal_cache_slot_count_mixed;
         default:
-            PanicInfo(ErrorCode::UnexpectedError, "Unknown StorageType");
+            ThrowInfo(ErrorCode::UnexpectedError, "Unknown StorageType");
     }
 }
 
@@ -243,7 +348,7 @@ cache_cell_count(StorageType storage_type) {
         case StorageType::MIXED:
             return monitor::internal_cache_cell_count_mixed;
         default:
-            PanicInfo(ErrorCode::UnexpectedError, "Unknown StorageType");
+            ThrowInfo(ErrorCode::UnexpectedError, "Unknown StorageType");
     }
 }
 
@@ -257,7 +362,7 @@ cache_cell_loaded_count(StorageType storage_type) {
         case StorageType::MIXED:
             return monitor::internal_cache_cell_loaded_count_mixed;
         default:
-            PanicInfo(ErrorCode::UnexpectedError, "Unknown StorageType");
+            ThrowInfo(ErrorCode::UnexpectedError, "Unknown StorageType");
     }
 }
 
@@ -271,7 +376,7 @@ cache_load_latency(StorageType storage_type) {
         case StorageType::MIXED:
             return monitor::internal_cache_load_latency_mixed;
         default:
-            PanicInfo(ErrorCode::UnexpectedError, "Unknown StorageType");
+            ThrowInfo(ErrorCode::UnexpectedError, "Unknown StorageType");
     }
 }
 
@@ -285,7 +390,7 @@ cache_op_result_count_hit(StorageType storage_type) {
         case StorageType::MIXED:
             return monitor::internal_cache_op_result_count_hit_mixed;
         default:
-            PanicInfo(ErrorCode::UnexpectedError, "Unknown StorageType");
+            ThrowInfo(ErrorCode::UnexpectedError, "Unknown StorageType");
     }
 }
 
@@ -299,7 +404,7 @@ cache_op_result_count_miss(StorageType storage_type) {
         case StorageType::MIXED:
             return monitor::internal_cache_op_result_count_miss_mixed;
         default:
-            PanicInfo(ErrorCode::UnexpectedError, "Unknown StorageType");
+            ThrowInfo(ErrorCode::UnexpectedError, "Unknown StorageType");
     }
 }
 
@@ -313,7 +418,7 @@ cache_cell_eviction_count(StorageType storage_type) {
         case StorageType::MIXED:
             return monitor::internal_cache_cell_eviction_count_mixed;
         default:
-            PanicInfo(ErrorCode::UnexpectedError, "Unknown StorageType");
+            ThrowInfo(ErrorCode::UnexpectedError, "Unknown StorageType");
     }
 }
 
@@ -332,7 +437,7 @@ cache_item_lifetime_seconds(StorageType storage_type) {
         case StorageType::MIXED:
             return monitor::internal_cache_item_lifetime_seconds_mixed;
         default:
-            PanicInfo(ErrorCode::UnexpectedError, "Unknown StorageType");
+            ThrowInfo(ErrorCode::UnexpectedError, "Unknown StorageType");
     }
 }
 
@@ -346,7 +451,7 @@ cache_load_count_success(StorageType storage_type) {
         case StorageType::MIXED:
             return monitor::internal_cache_load_count_success_mixed;
         default:
-            PanicInfo(ErrorCode::UnexpectedError, "Unknown StorageType");
+            ThrowInfo(ErrorCode::UnexpectedError, "Unknown StorageType");
     }
 }
 
@@ -360,7 +465,7 @@ cache_load_count_fail(StorageType storage_type) {
         case StorageType::MIXED:
             return monitor::internal_cache_load_count_fail_mixed;
         default:
-            PanicInfo(ErrorCode::UnexpectedError, "Unknown StorageType");
+            ThrowInfo(ErrorCode::UnexpectedError, "Unknown StorageType");
     }
 }
 
@@ -374,9 +479,31 @@ cache_memory_overhead_bytes(StorageType storage_type) {
         case StorageType::MIXED:
             return monitor::internal_cache_memory_overhead_bytes_mixed;
         default:
-            PanicInfo(ErrorCode::UnexpectedError, "Unknown StorageType");
+            ThrowInfo(ErrorCode::UnexpectedError, "Unknown StorageType");
     }
 }
+
+struct SystemResourceInfo {
+    int64_t total_bytes{0};
+    int64_t used_bytes{0};
+};
+
+int64_t
+getHostTotalMemory();
+int64_t
+getContainerMemLimit();
+
+// Returns unlimited if failed to get memory info, or if the platform is not supported.
+SystemResourceInfo
+getSystemMemoryInfo();
+
+// Returns unlimited if failed to get disk info, or if the platform is not supported.
+SystemResourceInfo
+getSystemDiskInfo(const std::string& disk_path);
+
+// Returns 0 if failed to get memory usage, or if the platform is not supported.
+int64_t
+getCurrentProcessMemoryUsage();
 
 }  // namespace internal
 

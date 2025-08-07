@@ -18,6 +18,8 @@
 
 int
 main(int argc, char** argv) {
+    testing::InitGoogleTest(&argc, argv);
+
     static const int64_t mb = 1024 * 1024;
 
     milvus::cachinglayer::Manager::ConfigureTieredStorage(

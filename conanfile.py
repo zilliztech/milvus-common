@@ -20,6 +20,7 @@ class MilvusCommonConan(ConanFile):
         "fmt/9.1.0#95259249fb7ef8c6b5674a40b00abba3",
         "prometheus-cpp/1.1.0#ea9b101cb785943adb40ad82eda7856c",
         "libcurl/7.86.0#bbc887fae3341b3cb776c601f814df05",
+        "gflags/2.2.2#b15c28c567c7ade7449cf994168a559f",
         "opentelemetry-cpp/1.8.1.1@milvus/2.4#7345034855d593047826b0c74d9a0ced",
         "xz_utils/5.4.0#a6d90890193dc851fa0d470163271c7a",
         "zlib/1.2.13#df233e6bed99052f285331b9f54d9070",

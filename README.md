@@ -9,8 +9,22 @@ Milvus Common is a core component library that serves as a bridge between Milvus
 ### Caching Layer
 
 ### Common Utilities
-- `ThreadPool`: Priority-based thread management
 - `Monitor`: Metrics collection and monitoring
 
 ### Log Module
 
+
+## Build from source
+
+```
+pip install conan==1.64.0
+mkdir build && cd build
+conan install .. --install-folder conan --build=missing  -s compiler.libcxx=libstdc++11
+# ut is off by default
+cmake .. -DENABLE_UNIT_TESTS=ON
+make
+
+# run ut
+export LD_LIBRARY_PATH=$PWD/lib/:$LD_LIBRARY_PATH
+./bin/cachinglayer_test 
+```
