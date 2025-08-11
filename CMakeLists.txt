@@ -24,11 +24,6 @@ set( CMAKE_EXPORT_COMPILE_COMMANDS ON )
 set(MILVUS_COMMON_WORKSPACE ${CMAKE_CURRENT_SOURCE_DIR})
 include_directories(${MILVUS_COMMON_WORKSPACE}/include)
 
-list( APPEND CMAKE_MODULE_PATH ${CMAKE_BINARY_DIR}/conan )
-include( ${CMAKE_BINARY_DIR}/conan/conanbuildinfo.cmake )
-set( CONAN_DISABLE_CHECK_COMPILER ON )
-conan_basic_setup( KEEP_RPATHS )
-
 find_package(opentelemetry-cpp REQUIRED)
 find_package(folly REQUIRED)
 find_package(gflags REQUIRED)
