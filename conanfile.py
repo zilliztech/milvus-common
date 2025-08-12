@@ -28,7 +28,7 @@ class MilvusCommonConan(ConanFile):
         "openssl/3.1.2#02594c4c0a6e2b4feb3cd15119993597",
         "folly/2023.10.30.08@milvus/dev#81d7729cd4013a1b708af3340a3b04d9",
     )
-    generators = ("cmake", "cmake_find_package")
+
     default_options = {
         "folly:shared": True,
         "gtest:build_gmock": True,
@@ -49,6 +49,42 @@ class MilvusCommonConan(ConanFile):
     def requirements(self):
         if self.settings.os != "Macos":
             self.requires("libunwind/1.7.2")
+    
+    def generate(self):
+        tc = CMakeToolchain(self)
+        tc.variables["CMAKE_POSITION_INDEPENDENT_CODE"] = self.options.get_safe(
+            "fPIC", True
+        )
+        # Relocatable shared lib on Macos
+        tc.cache_variables["CMAKE_POLICY_DEFAULT_CMP0042"] = "NEW"
+        # Honor BUILD_SHARED_LIBS from conan_toolchain (see https://github.com/conan-io/conan/issues/11840)
+        tc.cache_variables["CMAKE_POLICY_DEFAULT_CMP0077"] = "NEW"
+
+        cxx_std_flag = tools.cppstd_flag(self.settings)
+        cxx_std_value = (
+            cxx_std_flag.split("=")[1]
+            if cxx_std_flag
+            else "c++{}".format(self._minimum_cpp_standard)
+        )
+        tc.variables["CXX_STD"] = cxx_std_value
+        if is_msvc(self):
+            tc.variables["MSVC_LANGUAGE_VERSION"] = cxx_std_value
+            tc.variables["MSVC_ENABLE_ALL_WARNINGS"] = False
+            tc.variables["MSVC_USE_STATIC_RUNTIME"] = "MT" in msvc_runtime_flag(self)
+        tc.generate()
+
+        deps = CMakeDeps(self)
+        deps.generate()
+
+        pc = PkgConfigDeps(self)
+        pc.generate()
+
+    
+    def build(self):
+        # files.apply_conandata_patches(self)
+        cmake = CMake(self)
+        cmake.configure()
+        cmake.build()
 
     def imports(self):
         self.copy("*.dylib", "../lib", "lib")

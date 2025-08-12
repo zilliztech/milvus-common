@@ -21,7 +21,6 @@
 #include <unistd.h>
 #include "glog/logging.h"
 #include "fmt/core.h"
-#include "common/Tracer.h"
 
 // namespace milvus {
 
@@ -69,11 +68,10 @@
            __FUNCTION__,             \
            GetThreadName().c_str())
 #define SERVER_MODULE_FUNCTION      \
-    fmt::format("[{}][{}][{}][{}]", \
+    fmt::format("[{}][{}][{}]", \
                 SERVER_MODULE_NAME, \
                 __FUNCTION__,       \
-                GetThreadName(),    \
-                milvus::tracer::GetTraceID())
+                GetThreadName())
 
 // avoid evaluating args if trace log is not enabled
 #define LOG_TRACE(args...)                                               \

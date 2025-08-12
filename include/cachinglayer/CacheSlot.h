@@ -258,17 +258,21 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                     translator_->key());
 
                 if (!reservation_success) {
-                    auto error_msg = fmt::format(
+                    LOG_ERROR("[MCL] CacheSlot failed to reserve memory for "
+                        "cells: key={}, cell_ids=[{}], total "
+                        "resource_needed={}",
+                        translator_->key(),
+                        fmt::join(cids_vec, ","),
+                        resource_needed.ToString());
+                    reserve_resource_failure = true;
+                    ThrowInfo(ErrorCode::InsufficientResource,
                         "[MCL] CacheSlot failed to reserve memory for "
                         "cells: key={}, cell_ids=[{}], total "
                         "resource_needed={}",
                         translator_->key(),
                         fmt::join(cids_vec, ","),
                         resource_needed.ToString());
-                    LOG_ERROR(error_msg);
-                    reserve_resource_failure = true;
-                    ThrowInfo(ErrorCode::InsufficientResource, error_msg);
-                }
+                    }
             }
 
             auto results = translator_->get_cells(cids_vec);

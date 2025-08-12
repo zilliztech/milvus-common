@@ -24,11 +24,6 @@ set( CMAKE_EXPORT_COMPILE_COMMANDS ON )
 set(MILVUS_COMMON_WORKSPACE ${CMAKE_CURRENT_SOURCE_DIR})
 include_directories(${MILVUS_COMMON_WORKSPACE}/include)
 
-list( APPEND CMAKE_MODULE_PATH ${CMAKE_BINARY_DIR}/conan )
-include( ${CMAKE_BINARY_DIR}/conan/conanbuildinfo.cmake )
-set( CONAN_DISABLE_CHECK_COMPILER ON )
-conan_basic_setup( KEEP_RPATHS )
-
 find_package(opentelemetry-cpp REQUIRED)
 find_package(folly REQUIRED)
 find_package(gflags REQUIRED)
@@ -48,6 +43,9 @@ list(APPEND COMMON_LINKER_LIBS opentelemetry-cpp::opentelemetry_exporter_otlp_gr
 list(APPEND COMMON_LINKER_LIBS opentelemetry-cpp::opentelemetry_exporter_otlp_http)
 
 file(GLOB_RECURSE SRC_FILES src/*.cpp src/*.cc)
+if (NOT WITH_AIO)
+   list(REMOVE_ITEM src/knowhere/aio_context_pool.cc)
+endif()
 add_library(milvus-common SHARED ${SRC_FILES})
 
 if (WITH_JAEGER)
