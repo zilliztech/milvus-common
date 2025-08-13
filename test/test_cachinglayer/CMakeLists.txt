@@ -10,6 +10,10 @@
 # or implied. See the License for the specific language governing permissions and limitations under the License
 
 
+find_package(GTest CONFIG REQUIRED)
+find_package(OpenMP REQUIRED)
+find_package(BLAS REQUIRED)
+
 set(CACHINGLAYER_TEST_FILES
     ../init_gtest.cpp
     test_dlist.cpp
@@ -19,6 +23,11 @@ set(CACHINGLAYER_TEST_FILES
 add_executable(cachinglayer_test
     ${CACHINGLAYER_TEST_FILES}
 )
+
+# Ensure SSE4.2 CRC intrinsics are available to match Folly build (x86_64)
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64" AND NOT MSVC)
+    target_compile_options(cachinglayer_test PRIVATE -msse4.2)
+endif()
 
 target_link_libraries(cachinglayer_test
     GTest::gtest

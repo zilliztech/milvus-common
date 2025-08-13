@@ -32,9 +32,9 @@ class DList {
  public:
     DList(ResourceUsage max_memory, ResourceUsage low_watermark, ResourceUsage high_watermark,
           EvictionConfig eviction_config)
-        : low_watermark_(low_watermark),
+        : max_resource_limit_(max_memory),
+          low_watermark_(low_watermark),
           high_watermark_(high_watermark),
-          max_memory_(max_memory),
           eviction_config_(eviction_config),
           next_request_id_(1) {
         AssertInfo(low_watermark.AllGEZero(), "[MCL] low watermark must be greater than or equal to 0");
@@ -75,7 +75,7 @@ class DList {
     // and no eviction will be done.
     // Will throw if new_limit is negative.
     bool
-    UpdateLimit(const ResourceUsage& new_limit);
+    UpdateMaxLimit(const ResourceUsage& new_limit);
 
     // Update low/high watermark does not trigger eviction, thus will not fail.
     void
@@ -88,21 +88,21 @@ class DList {
     bool
     IsEmpty() const;
 
+    // Reserve loading resource with timeout, called before loading a cell.
     folly::SemiFuture<bool>
-    reserveMemoryWithTimeout(const ResourceUsage& size, std::chrono::milliseconds timeout);
+    reserveLoadingResourceWithTimeout(const ResourceUsage& size, std::chrono::milliseconds timeout);
 
-    // Called when a node becomes evictable (pin count drops to 0), or when a node is loaded as a bonus.
+    // Release resource used for loading, called after loading a cell.
     void
-    increaseEvictableSize(const ResourceUsage& size);
+    releaseLoadingResource(const ResourceUsage& loading_size);
 
-    // Called when a node is pinned(pin count increases from 0), or when a node is removed(evicted or released).
+    // Called when a cell is loaded.
     void
-    decreaseEvictableSize(const ResourceUsage& size);
+    chargeLoadedResource(const ResourceUsage& size);
 
-    // Used only when load failed. This will only cause used_resources_ to decrease, which will not affect the
-    // correctness of concurrent reserveMemoryWithTimeout() even without lock.
+    // Called when a cell is evicted or manually released.
     void
-    releaseMemory(const ResourceUsage& size);
+    refundLoadedResource(const ResourceUsage& size);
 
     // Caller must guarantee that the current thread holds the lock of list_node->mtx_.
     // touchItem is used in 2 places:
@@ -113,7 +113,7 @@ class DList {
     //
     // Returns the time point when the item was last touched. This methods always acquires the
     // global list_mtx_, thus the returned time point is guaranteed to be monotonically increasing.
-    std::chrono::high_resolution_clock::time_point
+    std::chrono::steady_clock::time_point
     touchItem(ListNode* list_node, std::optional<ResourceUsage> size = std::nullopt);
 
     // Caller must guarantee that the current thread holds the lock of list_node->mtx_.
@@ -122,10 +122,7 @@ class DList {
     removeItem(ListNode* list_node, ResourceUsage size);
 
     void
-    removeLoadingResource(const ResourceUsage& size);
-
-    void
-    removeLoadedResource(const ResourceUsage& size);
+    freezeItem(ListNode* list_node [[maybe_unused]], ResourceUsage size);
 
     const EvictionConfig&
     eviction_config() const {
@@ -224,13 +221,9 @@ class DList {
 
     // TODO(tiered storage 3): benchmark folly::DistributedMutex for this usecase.
     mutable std::mutex list_mtx_;
-    // access to used_resources_ and max_memory_ must be done under the lock of list_mtx_
-    std::atomic<ResourceUsage> used_resources_{};
-    // Track estimated resources currently being loaded
-    std::atomic<ResourceUsage> loading_{};
+    ResourceUsage max_resource_limit_;
     ResourceUsage low_watermark_;
     ResourceUsage high_watermark_;
-    ResourceUsage max_memory_;
     const EvictionConfig eviction_config_;
 
     std::thread eviction_thread_;
@@ -250,8 +243,12 @@ class DList {
     // Counter for generating unique request IDs
     std::atomic<uint64_t> next_request_id_;
 
-    // Total size of nodes that are loaded and unpinned
+    // Total size of nodes that are loaded and unpinned, used for eviction.
     std::atomic<ResourceUsage> evictable_size_{};
+
+    // Total size of nodes that are loading and loaded, used for memory reservation.
+    std::atomic<ResourceUsage> total_loading_size_{};
+    std::atomic<ResourceUsage> total_loaded_size_{};
 
     // EventBase and thread for handling timeout operations
     std::unique_ptr<folly::EventBase> event_base_;

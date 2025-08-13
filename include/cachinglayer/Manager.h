@@ -44,10 +44,29 @@ class Manager {
     std::shared_ptr<CacheSlot<CellT>>
     CreateCacheSlot(std::unique_ptr<Translator<CellT>> translator) {
         auto evictable = translator->meta()->support_eviction && evictionEnabled_;
-        // NOTE: when evictionEnabled_ is false, dlist_ is nullptr.
         auto cache_slot = std::make_shared<CacheSlot<CellT>>(std::move(translator), dlist_.get(), evictable);
         cache_slot->Warmup();
         return cache_slot;
+    }
+
+    bool
+    ReserveLoadingResourceWithTimeout(const ResourceUsage& size, std::chrono::milliseconds timeout) {
+        return SemiInlineGet(dlist_->reserveLoadingResourceWithTimeout(size, timeout));
+    }
+
+    void
+    ReleaseLoadingResource(const ResourceUsage& size) {
+        dlist_->releaseLoadingResource(size);
+    }
+
+    void
+    ChargeLoadedResource(const ResourceUsage& size) {
+        dlist_->chargeLoadedResource(size);
+    }
+
+    void
+    RefundLoadedResource(const ResourceUsage& size) {
+        dlist_->refundLoadedResource(size);
     }
 
     // memory overhead for managing all cache slots/cells/translators/policies.
