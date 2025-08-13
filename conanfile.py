@@ -55,6 +55,10 @@ class MilvusCommonConan(ConanFile):
         if self.settings.os != "Macos":
             self.requires("libunwind/1.7.2")
 
+    @property
+    def _minimum_cpp_standard(self):
+        return 17
+
     def generate(self):
         tc = CMakeToolchain(self)
         tc.variables["CMAKE_POSITION_INDEPENDENT_CODE"] = self.options.get_safe(
