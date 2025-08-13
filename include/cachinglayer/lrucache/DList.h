@@ -10,41 +10,37 @@
 // or implied. See the License for the specific language governing permissions and limitations under the License
 #pragma once
 
-#include <atomic>
-#include <condition_variable>
-#include <mutex>
-#include <chrono>
-#include <queue>
-#include <unordered_map>
-
 #include <folly/futures/Future.h>
 #include <folly/futures/SharedPromise.h>
 #include <folly/io/async/EventBase.h>
 #include <folly/system/ThreadName.h>
 
-#include "cachinglayer/lrucache/ListNode.h"
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <queue>
+#include <unordered_map>
+
 #include "cachinglayer/Utils.h"
+#include "cachinglayer/lrucache/ListNode.h"
 #include "log/Log.h"
 
 namespace milvus::cachinglayer::internal {
 
 class DList {
  public:
-    DList(ResourceUsage max_memory,
-          ResourceUsage low_watermark,
-          ResourceUsage high_watermark,
+    DList(ResourceUsage max_memory, ResourceUsage low_watermark, ResourceUsage high_watermark,
           EvictionConfig eviction_config)
         : max_memory_(max_memory),
           low_watermark_(low_watermark),
           high_watermark_(high_watermark),
           eviction_config_(eviction_config),
           next_request_id_(1) {
-        AssertInfo(low_watermark.AllGEZero(),
-                   "[MCL] low watermark must be greater than or equal to 0");
+        AssertInfo(low_watermark.AllGEZero(), "[MCL] low watermark must be greater than or equal to 0");
         AssertInfo((high_watermark - low_watermark).AllGEZero(),
                    "[MCL] high watermark must be greater than low watermark");
-        AssertInfo((max_memory - high_watermark).AllGEZero(),
-                   "[MCL] max memory must be greater than high watermark");
+        AssertInfo((max_memory - high_watermark).AllGEZero(), "[MCL] max memory must be greater than high watermark");
 
         // Initialize event base and thread
         event_base_ = std::make_unique<folly::EventBase>();
@@ -93,8 +89,7 @@ class DList {
     IsEmpty() const;
 
     folly::SemiFuture<bool>
-    reserveMemoryWithTimeout(const ResourceUsage& size,
-                             std::chrono::milliseconds timeout);
+    reserveMemoryWithTimeout(const ResourceUsage& size, std::chrono::milliseconds timeout);
 
     // Called when a node becomes evictable (pin count drops to 0), or when a node is loaded as a bonus.
     void
@@ -104,8 +99,8 @@ class DList {
     void
     decreaseEvictableSize(const ResourceUsage& size);
 
-    // Used only when load failed. This will only cause used_resources_ to decrease, which will not affect the correctness
-    // of concurrent reserveMemoryWithTimeout() even without lock.
+    // Used only when load failed. This will only cause used_resources_ to decrease, which will not affect the
+    // correctness of concurrent reserveMemoryWithTimeout() even without lock.
     void
     releaseMemory(const ResourceUsage& size);
 
@@ -119,8 +114,7 @@ class DList {
     // Returns the time point when the item was last touched. This methods always acquires the
     // global list_mtx_, thus the returned time point is guaranteed to be monotonically increasing.
     std::chrono::high_resolution_clock::time_point
-    touchItem(ListNode* list_node,
-              std::optional<ResourceUsage> size = std::nullopt);
+    touchItem(ListNode* list_node, std::optional<ResourceUsage> size = std::nullopt);
 
     // Caller must guarantee that the current thread holds the lock of list_node->mtx_.
     // Removes the node from the list and updates used_resources_.
@@ -149,33 +143,23 @@ class DList {
         folly::EventBase* event_base;
         uint64_t request_id;
 
-        WaitingRequest(ResourceUsage size,
-                       std::chrono::steady_clock::time_point dl,
-                       folly::Promise<bool> p,
-                       folly::EventBase* eb,
-                       uint64_t id)
-            : required_size(size),
-              deadline(dl),
-              promise(std::move(p)),
-              event_base(eb),
-              request_id(id) {
+        WaitingRequest(ResourceUsage size, std::chrono::steady_clock::time_point dl, folly::Promise<bool> p,
+                       folly::EventBase* eb, uint64_t id)
+            : required_size(size), deadline(dl), promise(std::move(p)), event_base(eb), request_id(id) {
         }
     };
 
     // Comparator for priority queue (smaller size and earlier deadline have higher priority)
     struct WaitingRequestComparator {
         bool
-        operator()(const std::unique_ptr<WaitingRequest>& a,
-                   const std::unique_ptr<WaitingRequest>& b) {
+        operator()(const std::unique_ptr<WaitingRequest>& a, const std::unique_ptr<WaitingRequest>& b) {
             // First priority: deadline (earlier deadline has higher priority)
             if (a->deadline != b->deadline) {
                 return a->deadline > b->deadline;
             }
             // Second priority: resource size (smaller size has higher priority)
-            int64_t total_a =
-                a->required_size.memory_bytes + a->required_size.file_bytes;
-            int64_t total_b =
-                b->required_size.memory_bytes + b->required_size.file_bytes;
+            int64_t total_a = a->required_size.memory_bytes + a->required_size.file_bytes;
+            int64_t total_b = b->required_size.memory_bytes + b->required_size.file_bytes;
             return total_a > total_b;
         }
     };
@@ -193,8 +177,7 @@ class DList {
     // Must be called under the lock of list_mtx_.
     // Returns the logical amount of resources that are evicted. 0 means no eviction happened.
     ResourceUsage
-    tryEvict(const ResourceUsage& expected_eviction,
-             const ResourceUsage& min_eviction,
+    tryEvict(const ResourceUsage& expected_eviction, const ResourceUsage& min_eviction,
              const bool evict_expired_items = false);
 
     // Notify waiting requests when resources are available.
@@ -255,8 +238,7 @@ class DList {
     std::atomic<bool> stop_eviction_loop_{false};
 
     // Waiting queue for timeout-based memory reservation
-    std::priority_queue<std::unique_ptr<WaitingRequest>,
-                        std::vector<std::unique_ptr<WaitingRequest>>,
+    std::priority_queue<std::unique_ptr<WaitingRequest>, std::vector<std::unique_ptr<WaitingRequest>>,
                         WaitingRequestComparator>
         waiting_queue_;
     // using a separate variable to avoid locking just to check if the queue is empty.

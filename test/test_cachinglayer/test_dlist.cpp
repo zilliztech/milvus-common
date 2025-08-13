@@ -1,15 +1,15 @@
-#include <gtest/gtest.h>
 #include <gmock/gmock.h>
+#include <gtest/gtest.h>
 
+#include <memory>
 #include <thread>
 #include <vector>
-#include <memory>
 
-#include "cachinglayer/lrucache/DList.h"
 #include "cachinglayer/Utils.h"
+#include "cachinglayer/lrucache/DList.h"
+#include "cachinglayer_test_utils.h"
 #include "common/EasyAssert.h"
 #include "mock_list_node.h"
-#include "cachinglayer_test_utils.h"
 
 using namespace milvus::cachinglayer;
 using namespace milvus::cachinglayer::internal;
@@ -34,8 +34,7 @@ class DListTest : public ::testing::Test {
 
     void
     SetUp() override {
-        dlist = std::make_unique<DList>(
-            initial_limit, low_watermark, high_watermark, eviction_config_);
+        dlist = std::make_unique<DList>(initial_limit, low_watermark, high_watermark, eviction_config_);
         managed_nodes.clear();
     }
 
@@ -48,9 +47,7 @@ class DListTest : public ::testing::Test {
     // Helper method to reserve memory with a large timeout for testing
     // This simulates the old synchronous reserveMemory behavior
     bool
-    reserveMemorySync(
-        const ResourceUsage& size,
-        std::chrono::milliseconds timeout = std::chrono::milliseconds(100)) {
+    reserveMemorySync(const ResourceUsage& size, std::chrono::milliseconds timeout = std::chrono::milliseconds(100)) {
         // Use 1 hour timeout for tests
         auto future = dlist->reserveMemoryWithTimeout(size, timeout);
         return std::move(future).get();
@@ -59,21 +56,16 @@ class DListTest : public ::testing::Test {
     // Helper to create a mock node, simulate loading it, and add it to the list.
     // Returns a raw pointer, but ownership is managed by the shared_ptr in managed_nodes.
     MockListNode*
-    add_and_load_node(ResourceUsage size,
-                      const std::string& key = "key",
-                      cid_t cid = 0,
-                      int pin_count = 0) {
+    add_and_load_node(ResourceUsage size, const std::string& key = "key", cid_t cid = 0, int pin_count = 0) {
         // Check if adding this node would exceed capacity before creating/adding it.
         // We want to use add_and_load_node to create a DList in valid state.
         ResourceUsage current_usage = get_used_memory();
         ResourceUsage limit = DLF::get_max_memory(*dlist);
         if (!limit.CanHold(current_usage + size)) {
-            throw std::invalid_argument(
-                "Adding this node would exceed capacity");
+            throw std::invalid_argument("Adding this node would exceed capacity");
         }
 
-        auto node_ptr = std::make_shared<StrictMock<MockListNode>>(
-            dlist.get(), size, key, cid);
+        auto node_ptr = std::make_shared<StrictMock<MockListNode>>(dlist.get(), size, key, cid);
         managed_nodes.push_back(node_ptr);
         MockListNode* node = node_ptr.get();
 
@@ -332,8 +324,7 @@ TEST_F(DListTest, TouchItemRefreshWindow) {
     DLF::verify_list(dlist.get(), {node2, node1});
 
     // Use eviction_config from dlist
-    std::this_thread::sleep_for(dlist->eviction_config().cache_touch_window +
-                                std::chrono::milliseconds(10));
+    std::this_thread::sleep_for(dlist->eviction_config().cache_touch_window + std::chrono::milliseconds(10));
 
     {
         std::unique_lock node_lock(node1->test_get_mutex());
@@ -342,8 +333,7 @@ TEST_F(DListTest, TouchItemRefreshWindow) {
     DLF::verify_list(dlist.get(), {node2, node1});
 
     // Use eviction_config from dlist
-    std::this_thread::sleep_for(dlist->eviction_config().cache_touch_window +
-                                std::chrono::milliseconds(10));
+    std::this_thread::sleep_for(dlist->eviction_config().cache_touch_window + std::chrono::milliseconds(10));
 
     {
         std::unique_lock node_lock(node2->test_get_mutex());
@@ -460,8 +450,7 @@ TEST_F(DListTest, ReserveToAboveHighWatermarkNoEvictionThenAutoEviction) {
     // wait for background eviction to run, current usage 95, 46, above high watermark.
     // reserved 55, 26 is considered pinned, thus evict node 1, resulting in 65, 31, below low watermark
     EXPECT_CALL(*node1, clear_data()).Times(1);
-    std::this_thread::sleep_for(dlist->eviction_config().eviction_interval +
-                                std::chrono::milliseconds(10));
+    std::this_thread::sleep_for(dlist->eviction_config().eviction_interval + std::chrono::milliseconds(10));
 
     EXPECT_EQ(get_used_memory(), usage2 + reserve_size);
     DLF::verify_list(dlist.get(), {node2});
@@ -510,8 +499,7 @@ TEST_F(DListTest, ReserveMemoryFailsAllLocked) {
 }
 
 TEST_F(DListTest, ReserveMemoryFailsSpecificPinned) {
-    MockListNode* node_evict =
-        add_and_load_node({80, 40}, "evict_candidate", 0, 1);
+    MockListNode* node_evict = add_and_load_node({80, 40}, "evict_candidate", 0, 1);
     MockListNode* node_small = add_and_load_node({9, 4}, "small");
     ResourceUsage usage_evict = node_evict->size();
     ResourceUsage usage_small = node_small->size();
@@ -556,8 +544,7 @@ TEST_F(DListTest, TouchItemHeadOutsideWindow) {
     DLF::verify_list(dlist.get(), {node1, node2});
 
     // Use eviction_config from dlist
-    std::this_thread::sleep_for(dlist->eviction_config().cache_touch_window +
-                                std::chrono::milliseconds(10));
+    std::this_thread::sleep_for(dlist->eviction_config().cache_touch_window + std::chrono::milliseconds(10));
 
     {
         std::unique_lock node_lock(node2->test_get_mutex());
@@ -587,8 +574,7 @@ TEST_F(DListTest, PopItemNotPresent) {
     ResourceUsage initial_usage = get_used_memory();
     DLF::verify_list(dlist.get(), {node1, node2});
 
-    auto orphan_node_ptr = std::make_unique<StrictMock<MockListNode>>(
-        dlist.get(), ResourceUsage{10, 0}, "orphan", 0);
+    auto orphan_node_ptr = std::make_unique<StrictMock<MockListNode>>(dlist.get(), ResourceUsage{10, 0}, "orphan", 0);
     MockListNode* orphan_node = orphan_node_ptr.get();
 
     {
@@ -642,9 +628,8 @@ TEST_F(DListTest, EvictedNodeDestroyed) {
 
     // destroy node1 by removing its shared_ptr
     // node1's destructor should not decrement used_resources_ again
-    auto it = std::find_if(managed_nodes.begin(),
-                           managed_nodes.end(),
-                           [&](const auto& ptr) { return ptr.get() == node1; });
+    auto it =
+        std::find_if(managed_nodes.begin(), managed_nodes.end(), [&](const auto& ptr) { return ptr.get() == node1; });
     ASSERT_NE(it, managed_nodes.end());
     managed_nodes.erase(it);
 
@@ -664,9 +649,8 @@ TEST_F(DListTest, NodeInListDestroyed) {
 
     // destroy node1 by removing its shared_ptr
     // node1's destructor should decrement used_resources_ by node1->size() and remove node1 from the list
-    auto it = std::find_if(managed_nodes.begin(),
-                           managed_nodes.end(),
-                           [&](const auto& ptr) { return ptr.get() == node1; });
+    auto it =
+        std::find_if(managed_nodes.begin(), managed_nodes.end(), [&](const auto& ptr) { return ptr.get() == node1; });
     ASSERT_NE(it, managed_nodes.end());
     managed_nodes.erase(it);
 
@@ -719,8 +703,7 @@ TEST_F(DListTest, ReserveMemoryUsesLowWatermark) {
     DLF::verify_list(dlist.get(), {node1, node2});
     ASSERT_EQ(get_used_memory(), usage1 + usage2);  // 95, 95
 
-    EXPECT_CALL(*node1, clear_data())
-        .Times(1);  // Evict node1 to get below low watermark
+    EXPECT_CALL(*node1, clear_data()).Times(1);  // Evict node1 to get below low watermark
     EXPECT_CALL(*node2, clear_data()).Times(0);
 
     // Reserve 10/10. Current usage 95/95. New potential usage 105/105.

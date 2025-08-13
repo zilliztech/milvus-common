@@ -24,9 +24,7 @@ Manager::GetInstance() {
 }
 
 void
-Manager::ConfigureTieredStorage(CacheWarmupPolicies warmup_policies,
-                                CacheLimit cache_limit,
-                                bool evictionEnabled,
+Manager::ConfigureTieredStorage(CacheWarmupPolicies warmup_policies, CacheLimit cache_limit, bool evictionEnabled,
                                 EvictionConfig eviction_config) {
     static std::once_flag once;
     std::call_once(once, [&]() {
@@ -44,15 +42,11 @@ Manager::ConfigureTieredStorage(CacheWarmupPolicies warmup_policies,
             return;
         }
 
-        ResourceUsage max{cache_limit.memory_max_bytes,
-                          cache_limit.disk_max_bytes};
-        ResourceUsage low_watermark{cache_limit.memory_low_watermark_bytes,
-                                    cache_limit.disk_low_watermark_bytes};
-        ResourceUsage high_watermark{cache_limit.memory_high_watermark_bytes,
-                                     cache_limit.disk_high_watermark_bytes};
+        ResourceUsage max{cache_limit.memory_max_bytes, cache_limit.disk_max_bytes};
+        ResourceUsage low_watermark{cache_limit.memory_low_watermark_bytes, cache_limit.disk_low_watermark_bytes};
+        ResourceUsage high_watermark{cache_limit.memory_high_watermark_bytes, cache_limit.disk_high_watermark_bytes};
 
-        manager.dlist_ = std::make_unique<internal::DList>(
-            max, low_watermark, high_watermark, eviction_config);
+        manager.dlist_ = std::make_unique<internal::DList>(max, low_watermark, high_watermark, eviction_config);
 
         LOG_INFO(
             "[MCL] Configured Tiered Storage manager with "
@@ -62,18 +56,12 @@ Manager::ConfigureTieredStorage(CacheWarmupPolicies warmup_policies,
             "physical memory max ratio: {}, max disk usage percentage: {}, "
             "loading memory factor: {}, cache cell unaccessed survival time: "
             "{} ms, warmup policies: {}",
-            FormatBytes(low_watermark.memory_bytes),
-            FormatBytes(high_watermark.memory_bytes),
-            FormatBytes(max.memory_bytes),
-            FormatBytes(low_watermark.file_bytes),
-            FormatBytes(high_watermark.file_bytes),
-            FormatBytes(max.file_bytes),
-            eviction_config.cache_touch_window.count(),
-            eviction_config.eviction_interval.count(),
-            eviction_config.overloaded_memory_threshold_percentage,
-            eviction_config.max_disk_usage_percentage,
-            eviction_config.loading_memory_factor,
-            eviction_config.cache_cell_unaccessed_survival_time.count(),
+            FormatBytes(low_watermark.memory_bytes), FormatBytes(high_watermark.memory_bytes),
+            FormatBytes(max.memory_bytes), FormatBytes(low_watermark.file_bytes),
+            FormatBytes(high_watermark.file_bytes), FormatBytes(max.file_bytes),
+            eviction_config.cache_touch_window.count(), eviction_config.eviction_interval.count(),
+            eviction_config.overloaded_memory_threshold_percentage, eviction_config.max_disk_usage_percentage,
+            eviction_config.loading_memory_factor, eviction_config.cache_cell_unaccessed_survival_time.count(),
             policy_str);
     });
 }

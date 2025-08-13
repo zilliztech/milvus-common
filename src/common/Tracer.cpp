@@ -10,18 +10,21 @@
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
 #include "common/Tracer.h"
+
 #include <opentelemetry/exporters/otlp/otlp_http_exporter_factory.h>
 #include <opentelemetry/exporters/otlp/otlp_http_exporter_options.h>
-#include "log/Log.h"
-#include "nlohmann/json.hpp"
+
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cstddef>
 #include <iomanip>
 #include <iostream>
-#include <utility>
 #include <sstream>
-#include <algorithm>
-#include <cctype>
+#include <utility>
+
+#include "log/Log.h"
+#include "nlohmann/json.hpp"
 
 #ifdef WITH_JAEGER
 #include "opentelemetry/exporters/jaeger/jaeger_exporter_factory.h"
@@ -80,22 +83,18 @@ initTelemetry(const TraceConfig& cfg) {
             auto headers_map = parseHeaders(cfg.otlpHeaders);
             if (!headers_map.empty()) {
                 for (const auto& pair : headers_map) {
-                    opts.http_headers.insert(
-                        std::pair<std::string, std::string>(pair.first,
-                                                            pair.second));
+                    opts.http_headers.insert(std::pair<std::string, std::string>(pair.first, pair.second));
                 }
             }
             exporter = otlp::OtlpHttpExporterFactory::Create(opts);
             LOG_INFO("init otlp http exporter, endpoint: {}", opts.url);
-        } else if (cfg.otlpMethod == "grpc" ||
-                   cfg.otlpMethod == "") {  // legacy configuration
+        } else if (cfg.otlpMethod == "grpc" || cfg.otlpMethod == "") {  // legacy configuration
             auto opts = otlp::OtlpGrpcExporterOptions{};
             opts.endpoint = cfg.otlpEndpoint;
             auto headers_map = parseHeaders(cfg.otlpHeaders);
             if (!headers_map.empty()) {
                 for (const auto& pair : headers_map) {
-                    opts.metadata.insert(std::pair<std::string, std::string>(
-                        pair.first, pair.second));
+                    opts.metadata.insert(std::pair<std::string, std::string>(pair.first, pair.second));
                 }
             }
             opts.use_ssl_credentials = cfg.oltpSecure;
@@ -110,16 +109,12 @@ initTelemetry(const TraceConfig& cfg) {
         export_created = false;
     }
     if (export_created) {
-        auto processor = trace_sdk::BatchSpanProcessorFactory::Create(
-            std::move(exporter), {});
-        resource::ResourceAttributes attributes = {
-            {"service.name", TRACE_SERVICE_SEGCORE}, {"NodeID", cfg.nodeID}};
+        auto processor = trace_sdk::BatchSpanProcessorFactory::Create(std::move(exporter), {});
+        resource::ResourceAttributes attributes = {{"service.name", TRACE_SERVICE_SEGCORE}, {"NodeID", cfg.nodeID}};
         auto resource = resource::Resource::Create(attributes);
-        auto sampler = std::make_unique<trace_sdk::ParentBasedSampler>(
-            std::make_shared<trace_sdk::AlwaysOnSampler>());
+        auto sampler = std::make_unique<trace_sdk::ParentBasedSampler>(std::make_shared<trace_sdk::AlwaysOnSampler>());
         std::shared_ptr<trace::TracerProvider> provider =
-            trace_sdk::TracerProviderFactory::Create(
-                std::move(processor), resource, std::move(sampler));
+            trace_sdk::TracerProviderFactory::Create(std::move(processor), resource, std::move(sampler));
         trace::Provider::SetTracerProvider(provider);
         enable_trace.store(true);
     } else {
@@ -131,23 +126,19 @@ initTelemetry(const TraceConfig& cfg) {
 std::shared_ptr<trace::Tracer>
 GetTracer() {
     auto provider = trace::Provider::GetTracerProvider();
-    return provider->GetTracer(TRACE_SERVICE_SEGCORE,
-                               OPENTELEMETRY_SDK_VERSION);
+    return provider->GetTracer(TRACE_SERVICE_SEGCORE, OPENTELEMETRY_SDK_VERSION);
 }
 
 std::shared_ptr<trace::Span>
 StartSpan(const std::string& name, TraceContext* parentCtx) {
     trace::StartSpanOptions opts;
-    if (enable_trace.load() && parentCtx != nullptr &&
-        parentCtx->traceID != nullptr && parentCtx->spanID != nullptr) {
+    if (enable_trace.load() && parentCtx != nullptr && parentCtx->traceID != nullptr && parentCtx->spanID != nullptr) {
         if (EmptyTraceID(parentCtx) || EmptySpanID(parentCtx)) {
             return noop_trace_provider->GetTracer("noop")->StartSpan("noop");
         }
-        opts.parent = trace::SpanContext(
-            trace::TraceId({parentCtx->traceID, trace::TraceId::kSize}),
-            trace::SpanId({parentCtx->spanID, trace::SpanId::kSize}),
-            trace::TraceFlags(parentCtx->traceFlags),
-            true);
+        opts.parent = trace::SpanContext(trace::TraceId({parentCtx->traceID, trace::TraceId::kSize}),
+                                         trace::SpanId({parentCtx->spanID, trace::SpanId::kSize}),
+                                         trace::TraceFlags(parentCtx->traceFlags), true);
     }
     return GetTracer()->StartSpan(name, opts);
 }
@@ -239,8 +230,7 @@ std::string
 BytesToHexStr(const uint8_t* data, const size_t len) {
     std::stringstream ss;
     for (size_t i = 0; i < len; i++) {
-        ss << std::hex << std::setw(2) << std::setfill('0')
-           << static_cast<int>(data[i]);
+        ss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(data[i]);
     }
     return ss.str();
 }
@@ -259,8 +249,7 @@ GetIDFromHexStr(const std::string& hexStr) {
 std::string
 GetTraceIDAsHexStr(const TraceContext* ctx) {
     if (ctx != nullptr && !EmptyTraceID(ctx)) {
-        return BytesToHexStr(ctx->traceID,
-                             opentelemetry::trace::TraceId::kSize);
+        return BytesToHexStr(ctx->traceID, opentelemetry::trace::TraceId::kSize);
     } else {
         return std::string();
     }
@@ -275,19 +264,14 @@ GetSpanIDAsHexStr(const TraceContext* ctx) {
     }
 }
 
-AutoSpan::AutoSpan(const std::string& name,
-                   TraceContext* ctx,
-                   bool is_root_span)
-    : is_root_span_(is_root_span) {
+AutoSpan::AutoSpan(const std::string& name, TraceContext* ctx, bool is_root_span) : is_root_span_(is_root_span) {
     span_ = StartSpan(name, ctx);
     if (is_root_span) {
         SetRootSpan(span_);
     }
 }
 
-AutoSpan::AutoSpan(const std::string& name,
-                   const std::shared_ptr<trace::Span>& span)
-    : is_root_span_(false) {
+AutoSpan::AutoSpan(const std::string& name, const std::shared_ptr<trace::Span>& span) : is_root_span_(false) {
     span_ = StartSpan(name, span);
 }
 
@@ -316,9 +300,7 @@ parseHeaders(const std::string& headers) {
         return json.get<std::map<std::string, std::string>>();
     } catch (const std::exception& e) {
         // Log the parsing error and return empty map
-        LOG_ERROR("Failed to parse headers as JSON: {}, error: {}",
-                  headers,
-                  e.what());
+        LOG_ERROR("Failed to parse headers as JSON: {}, error: {}", headers, e.what());
         return {};
     }
 }

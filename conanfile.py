@@ -12,7 +12,6 @@ import os
 required_conan_version = ">=1.55.0"
 
 class MilvusCommonConan(ConanFile):
-    keep_imports = True
     settings = "os", "compiler", "build_type", "arch"
     requires = (
         "gtest/1.13.0#f9548be18a41ccc6367efcb8146e92be",
@@ -26,8 +25,13 @@ class MilvusCommonConan(ConanFile):
         "zlib/1.2.13#df233e6bed99052f285331b9f54d9070",
         "libevent/2.1.12#4fd19d10d3bed63b3a8952c923454bc0",
         "openssl/3.1.2#02594c4c0a6e2b4feb3cd15119993597",
-        "folly/2023.10.30.08@milvus/dev#81d7729cd4013a1b708af3340a3b04d9",
+        "folly/2023.10.30.10@milvus/dev",
+        "boost/1.82.0"
     )
+
+    options = {
+        "with_ut": [True, False],
+    }
 
     default_options = {
         "folly:shared": True,
@@ -36,6 +40,7 @@ class MilvusCommonConan(ConanFile):
         "glog:shared": True,
         "prometheus-cpp:with_pull": False,
         "fmt:header_only": True,
+        "with_ut": False,
     }
 
     def configure(self):
@@ -49,7 +54,11 @@ class MilvusCommonConan(ConanFile):
     def requirements(self):
         if self.settings.os != "Macos":
             self.requires("libunwind/1.7.2")
-    
+
+    @property
+    def _minimum_cpp_standard(self):
+        return 17
+
     def generate(self):
         tc = CMakeToolchain(self)
         tc.variables["CMAKE_POSITION_INDEPENDENT_CODE"] = self.options.get_safe(
@@ -71,6 +80,8 @@ class MilvusCommonConan(ConanFile):
             tc.variables["MSVC_LANGUAGE_VERSION"] = cxx_std_value
             tc.variables["MSVC_ENABLE_ALL_WARNINGS"] = False
             tc.variables["MSVC_USE_STATIC_RUNTIME"] = "MT" in msvc_runtime_flag(self)
+
+        tc.variables["WITH_COMMON_UT"] = self.options.with_ut
         tc.generate()
 
         deps = CMakeDeps(self)
@@ -79,16 +90,9 @@ class MilvusCommonConan(ConanFile):
         pc = PkgConfigDeps(self)
         pc.generate()
 
-    
+
     def build(self):
         # files.apply_conandata_patches(self)
         cmake = CMake(self)
         cmake.configure()
         cmake.build()
-
-    def imports(self):
-        self.copy("*.dylib", "../lib", "lib")
-        self.copy("*.dll", "../lib", "lib")
-        self.copy("*.so*", "../lib", "lib")
-        self.copy("*", "../bin", "bin")
-        self.copy("*.proto", "../include", "include")

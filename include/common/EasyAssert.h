@@ -15,14 +15,14 @@
 // limitations under the License.
 
 #pragma once
-#include <string_view>
-#include <stdexcept>
-#include <exception>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
+#include <stdexcept>
 #include <string>
-#include "common/common_type_c.h"
+#include <string_view>
 
+#include "common/common_type_c.h"
 #include "fmt/core.h"
 
 /* Paste this on the file if you want to debug. */
@@ -77,12 +77,8 @@ enum ErrorCode {
 
 namespace impl {
 void
-EasyAssertInfo(bool value,
-               std::string_view expr_str,
-               std::string_view filename,
-               int lineno,
-               std::string_view extra_info,
-               ErrorCode error_code = ErrorCode::UnexpectedError);
+EasyAssertInfo(bool value, std::string_view expr_str, std::string_view filename, int lineno,
+               std::string_view extra_info, ErrorCode error_code = ErrorCode::UnexpectedError);
 
 std::string
 EasyStackTrace();
@@ -127,36 +123,26 @@ FailureCStatus(int code, const std::string& msg) {
 inline CStatus
 FailureCStatus(const std::exception* ex) {
     if (auto segcore_err = dynamic_cast<const SegcoreError*>(ex)) {
-        return CStatus{static_cast<int>(segcore_err->get_error_code()),
-                       strdup(segcore_err->what())};
+        return CStatus{static_cast<int>(segcore_err->get_error_code()), strdup(segcore_err->what())};
     }
     return CStatus{static_cast<int>(UnexpectedError), strdup(ex->what())};
 }
 
 }  // namespace milvus
 
-#define AssertInfo(expr, info, args...)                              \
-    do {                                                             \
-        auto _expr_res = static_cast<bool>(expr);                    \
-        /* call func only when needed */                             \
-        if (!_expr_res) {                                            \
-            milvus::impl::EasyAssertInfo(_expr_res,                  \
-                                         #expr,                      \
-                                         __FILE__,                   \
-                                         __LINE__,                   \
-                                         fmt::format(info, ##args)); \
-        }                                                            \
+#define AssertInfo(expr, info, args...)                                                                    \
+    do {                                                                                                   \
+        auto _expr_res = static_cast<bool>(expr);                                                          \
+        /* call func only when needed */                                                                   \
+        if (!_expr_res) {                                                                                  \
+            milvus::impl::EasyAssertInfo(_expr_res, #expr, __FILE__, __LINE__, fmt::format(info, ##args)); \
+        }                                                                                                  \
     } while (0)
 
 #define Assert(expr) AssertInfo((expr), "")
 
-#define ThrowInfo(errcode, info, args...)                       \
-    do {                                                        \
-        milvus::impl::EasyAssertInfo(false,                     \
-                                     "",                        \
-                                     __FILE__,                  \
-                                     __LINE__,                  \
-                                     fmt::format(info, ##args), \
-                                     errcode);                  \
-        __builtin_unreachable();                                \
+#define ThrowInfo(errcode, info, args...)                                                                \
+    do {                                                                                                 \
+        milvus::impl::EasyAssertInfo(false, "", __FILE__, __LINE__, fmt::format(info, ##args), errcode); \
+        __builtin_unreachable();                                                                         \
     } while (0)

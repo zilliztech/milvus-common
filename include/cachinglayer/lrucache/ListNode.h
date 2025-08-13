@@ -10,13 +10,13 @@
 // or implied. See the License for the specific language governing permissions and limitations under the License
 #pragma once
 
-#include <atomic>
-#include <chrono>
-#include <memory>
-
 #include <folly/ExceptionWrapper.h>
 #include <folly/futures/Future.h>
 #include <folly/futures/SharedPromise.h>
+
+#include <atomic>
+#include <chrono>
+#include <memory>
 
 #include "cachinglayer/Utils.h"
 #include "common/EasyAssert.h"
@@ -100,11 +100,10 @@ class ListNode {
         {
             std::unique_lock<std::shared_mutex> lock(mtx_);
             if (requesting_thread) {
-                AssertInfo(
-                    state_ != State::NOT_LOADED,
-                    "Programming error: mark_loaded(requesting_thread=true) "
-                    "called on a {} cell",
-                    state_to_string(state_));
+                AssertInfo(state_ != State::NOT_LOADED,
+                           "Programming error: mark_loaded(requesting_thread=true) "
+                           "called on a {} cell",
+                           state_to_string(state_));
                 // no need to touch() here: node is pinned thus not eligible for eviction.
                 // we can delay touch() to when unpin() is called.
                 if (state_ == State::LOADING) {

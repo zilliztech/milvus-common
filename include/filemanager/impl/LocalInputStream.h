@@ -1,12 +1,13 @@
 #pragma once
 
 #include <fstream>
+
 #include "filemanager/InputStream.h"
 
 namespace milvus {
 
 class LocalInputStream : public InputStream {
-public:
+ public:
     LocalInputStream(const std::string& filename);
     ~LocalInputStream() override;
 
@@ -34,7 +35,7 @@ public:
     bool
     Eof() const override;
 
-private:
+ private:
     mutable std::ifstream stream_;
     size_t size_;
     std::string filename_;

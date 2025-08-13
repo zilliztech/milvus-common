@@ -10,18 +10,18 @@
 // or implied. See the License for the specific language governing permissions and limitations under the License
 #include "cachinglayer/lrucache/ListNode.h"
 
-#include <atomic>
-#include <chrono>
-#include <memory>
-#include <mutex>
-
 #include <fmt/core.h>
 #include <folly/ExceptionWrapper.h>
 #include <folly/futures/Future.h>
 #include <folly/futures/SharedPromise.h>
 
-#include "cachinglayer/lrucache/DList.h"
+#include <atomic>
+#include <chrono>
+#include <memory>
+#include <mutex>
+
 #include "cachinglayer/Utils.h"
+#include "cachinglayer/lrucache/DList.h"
 #include "common/EasyAssert.h"
 #include "log/Log.h"
 
@@ -48,8 +48,7 @@ ListNode::NodePin::operator=(NodePin&& other) {
 }
 
 ListNode::ListNode(DList* dlist, ResourceUsage size, bool evictable)
-    : last_touch_(dlist ? (std::chrono::high_resolution_clock::now() -
-                           2 * dlist->eviction_config().cache_touch_window)
+    : last_touch_(dlist ? (std::chrono::high_resolution_clock::now() - 2 * dlist->eviction_config().cache_touch_window)
                         : std::chrono::high_resolution_clock::now()),
       dlist_(dlist),
       size_(size),
@@ -71,9 +70,7 @@ bool
 ListNode::manual_evict() {
     std::unique_lock<std::shared_mutex> lock(mtx_);
     if (state_ == State::LOADING) {
-        LOG_ERROR("[MCL] manual_evict() called on a {} cell {}",
-                  state_to_string(state_),
-                  key());
+        LOG_ERROR("[MCL] manual_evict() called on a {} cell {}", state_to_string(state_), key());
         return false;
     }
     if (state_ == State::NOT_LOADED) {
@@ -103,27 +100,21 @@ std::pair<bool, folly::SemiFuture<ListNode::NodePin>>
 ListNode::pin() {
     // must be called with lock acquired, and state must not be NOT_LOADED.
     auto read_op = [this]() -> std::pair<bool, folly::SemiFuture<NodePin>> {
-        AssertInfo(state_ != State::NOT_LOADED,
-                   "Programming error: read_op called on a {} cell",
+        AssertInfo(state_ != State::NOT_LOADED, "Programming error: read_op called on a {} cell",
                    state_to_string(state_));
         // pin the cell now so that we can avoid taking the lock again in deferValue.
-        if (pin_count_.fetch_add(1) == 0 && state_ == State::LOADED && dlist_ &&
-            evictable_) {
+        if (pin_count_.fetch_add(1) == 0 && state_ == State::LOADED && dlist_ && evictable_) {
             // node became inevictable, decrease evictable size
             dlist_->decreaseEvictableSize(size_);
         }
         auto p = NodePin(this);
         if (state_ == State::LOADED) {
-            internal::cache_op_result_count_hit(size_.storage_type())
-                .Increment();
+            internal::cache_op_result_count_hit(size_.storage_type()).Increment();
             return std::make_pair(false, std::move(p));
         }
         internal::cache_op_result_count_miss(size_.storage_type()).Increment();
-        return std::make_pair(false,
-                              load_promise_->getSemiFuture().deferValue(
-                                  [this, p = std::move(p)](auto&&) mutable {
-                                      return std::move(p);
-                                  }));
+        return std::make_pair(false, load_promise_->getSemiFuture().deferValue(
+                                         [this, p = std::move(p)](auto&&) mutable { return std::move(p); }));
     };
     {
         std::shared_lock<std::shared_mutex> lock(mtx_);
@@ -143,10 +134,8 @@ ListNode::pin() {
     // pin the cell now so that we can avoid taking the lock again in deferValue.
     pin_count_.fetch_add(1);
     auto p = NodePin(this);
-    return std::make_pair(
-        true,
-        load_promise_->getSemiFuture().deferValue(
-            [this, p = std::move(p)](auto&&) mutable { return std::move(p); }));
+    return std::make_pair(true, load_promise_->getSemiFuture().deferValue(
+                                    [this, p = std::move(p)](auto&&) mutable { return std::move(p); }));
 }
 
 void
@@ -154,8 +143,7 @@ ListNode::set_error(folly::exception_wrapper error) {
     std::unique_ptr<folly::SharedPromise<folly::Unit>> promise = nullptr;
     {
         std::unique_lock<std::shared_mutex> lock(mtx_);
-        AssertInfo(state_ != State::NOT_LOADED,
-                   "Programming error: set_error() called on a {} cell",
+        AssertInfo(state_ != State::NOT_LOADED, "Programming error: set_error() called on a {} cell",
                    state_to_string(state_));
         // may be successfully loaded by another thread as a bonus, they will update used memory.
         if (state_ == State::LOADED) {
@@ -205,8 +193,7 @@ ListNode::unpin() {
 void
 ListNode::touch(bool update_used_memory) {
     auto now = std::chrono::high_resolution_clock::now();
-    if (dlist_ &&
-        now - last_touch_ > dlist_->eviction_config().cache_touch_window) {
+    if (dlist_ && now - last_touch_ > dlist_->eviction_config().cache_touch_window) {
         std::optional<ResourceUsage> size = std::nullopt;
         if (update_used_memory) {
             size = size_;
@@ -220,12 +207,10 @@ ListNode::clear_data() {
     // if the cell is evicted, loaded, pinned and unpinned within a single refresh window,
     // the cell should be inserted into the cache again.
     if (dlist_) {
-        last_touch_ = std::chrono::high_resolution_clock::now() -
-                      2 * dlist_->eviction_config().cache_touch_window;
+        last_touch_ = std::chrono::high_resolution_clock::now() - 2 * dlist_->eviction_config().cache_touch_window;
     }
     unload();
-    LOG_TRACE(
-        "[MCL] ListNode evicted: key={}, size={}", key(), size_.ToString());
+    LOG_TRACE("[MCL] ListNode evicted: key={}, size={}", key(), size_.ToString());
     state_ = State::NOT_LOADED;
 }
 

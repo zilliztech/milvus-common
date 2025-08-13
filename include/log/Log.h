@@ -16,11 +16,13 @@
 
 #pragma once
 
-#include <string>
 #include <sys/types.h>
 #include <unistd.h>
-#include "glog/logging.h"
+
+#include <string>
+
 #include "fmt/core.h"
+#include "glog/logging.h"
 
 // namespace milvus {
 
@@ -43,16 +45,8 @@
 /////////////////////////////////////////////////////////////////////////////////////////////////
 #define SEGCORE_MODULE_NAME "SEGCORE"
 #define SEGCORE_MODULE_CLASS_FUNCTION \
-    LogOut("[%s][%s::%s][%s] ",       \
-           SEGCORE_MODULE_NAME,       \
-           (typeid(*this).name()),    \
-           __FUNCTION__,              \
-           GetThreadName().c_str())
-#define SEGCORE_MODULE_FUNCTION \
-    LogOut("[%s][%s][%s] ",     \
-           SEGCORE_MODULE_NAME, \
-           __FUNCTION__,        \
-           GetThreadName().c_str())
+    LogOut("[%s][%s::%s][%s] ", SEGCORE_MODULE_NAME, (typeid(*this).name()), __FUNCTION__, GetThreadName().c_str())
+#define SEGCORE_MODULE_FUNCTION LogOut("[%s][%s][%s] ", SEGCORE_MODULE_NAME, __FUNCTION__, GetThreadName().c_str())
 
 // GLOG has no debug and trace level,
 // Using VLOG to implement it.
@@ -62,16 +56,8 @@
 /////////////////////////////////////////////////////////////////////////////////////////////////
 #define SERVER_MODULE_NAME "SERVER"
 #define SERVER_MODULE_CLASS_FUNCTION \
-    LogOut("[%s][%s::%s][%s] ",      \
-           SERVER_MODULE_NAME,       \
-           (typeid(*this).name()),   \
-           __FUNCTION__,             \
-           GetThreadName().c_str())
-#define SERVER_MODULE_FUNCTION      \
-    fmt::format("[{}][{}][{}]", \
-                SERVER_MODULE_NAME, \
-                __FUNCTION__,       \
-                GetThreadName())
+    LogOut("[%s][%s::%s][%s] ", SERVER_MODULE_NAME, (typeid(*this).name()), __FUNCTION__, GetThreadName().c_str())
+#define SERVER_MODULE_FUNCTION fmt::format("[{}][{}][{}]", SERVER_MODULE_NAME, __FUNCTION__, GetThreadName())
 
 // avoid evaluating args if trace log is not enabled
 #define LOG_TRACE(args...)                                               \
@@ -79,16 +65,11 @@
         VLOG(GLOG_TRACE) << SERVER_MODULE_FUNCTION << fmt::format(args); \
     }
 
-#define LOG_DEBUG(args...) \
-    VLOG(GLOG_DEBUG) << SERVER_MODULE_FUNCTION << fmt::format(args)
-#define LOG_INFO(args...) \
-    LOG(INFO) << SERVER_MODULE_FUNCTION << fmt::format(args)
-#define LOG_WARN(args...) \
-    LOG(WARNING) << SERVER_MODULE_FUNCTION << fmt::format(args)
-#define LOG_ERROR(args...) \
-    LOG(ERROR) << SERVER_MODULE_FUNCTION << fmt::format(args)
-#define LOG_FATAL(args...) \
-    LOG(FATAL) << SERVER_MODULE_FUNCTION << fmt::format(args)
+#define LOG_DEBUG(args...) VLOG(GLOG_DEBUG) << SERVER_MODULE_FUNCTION << fmt::format(args)
+#define LOG_INFO(args...) LOG(INFO) << SERVER_MODULE_FUNCTION << fmt::format(args)
+#define LOG_WARN(args...) LOG(WARNING) << SERVER_MODULE_FUNCTION << fmt::format(args)
+#define LOG_ERROR(args...) LOG(ERROR) << SERVER_MODULE_FUNCTION << fmt::format(args)
+#define LOG_FATAL(args...) LOG(FATAL) << SERVER_MODULE_FUNCTION << fmt::format(args)
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 

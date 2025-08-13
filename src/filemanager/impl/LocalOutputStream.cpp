@@ -1,5 +1,7 @@
 #include "filemanager/impl/LocalOutputStream.h"
+
 #include <unistd.h>
+
 #include <algorithm>
 #include <vector>
 
