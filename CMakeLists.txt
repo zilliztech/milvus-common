@@ -51,7 +51,7 @@ if(__X86_64)
      COMPILE_OPTIONS "-msse4.2"
    )
 else()
-   list(REMOVE_ITEM src/knowhere/aio_context_pool.cc)
+   list(REMOVE_ITEM SRC_FILES src/knowhere/aio_context_pool.cc)
 endif()
 add_library(milvus-common SHARED ${SRC_FILES})
 
