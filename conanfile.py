@@ -13,6 +13,7 @@ required_conan_version = ">=1.55.0"
 
 class MilvusCommonConan(ConanFile):
     keep_imports = True
+    minimum_cpp_standard = 17
     settings = "os", "compiler", "build_type", "arch"
     requires = (
         "gtest/1.13.0#f9548be18a41ccc6367efcb8146e92be",
@@ -64,7 +65,7 @@ class MilvusCommonConan(ConanFile):
         cxx_std_value = (
             cxx_std_flag.split("=")[1]
             if cxx_std_flag
-            else "c++{}".format(self._minimum_cpp_standard)
+            else "c++{}".format(self.minimum_cpp_standard)
         )
         tc.variables["CXX_STD"] = cxx_std_value
         if is_msvc(self):

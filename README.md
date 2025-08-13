@@ -21,7 +21,7 @@ pip install conan==1.64.0
 mkdir build && cd build
 conan install .. --install-folder conan --build=missing  -s compiler.libcxx=libstdc++11
 # ut is off by default
-cmake .. -DENABLE_UNIT_TESTS=ON
+cmake .. -DENABLE_UNIT_TESTS=ON -DCMAKE_TOOLCHAIN_FILE=conan/conan_toolchain.cmake
 make
 
 # run ut

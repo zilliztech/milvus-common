@@ -14,12 +14,10 @@ project(milvus_common CXX C)
 
 option(ENABLE_UNIT_TESTS "Enable unit tests" OFF)
 
-set( CMAKE_CXX_STANDARD 17 )
-set( CMAKE_CXX_STANDARD_REQUIRED on )
-
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-
-set( CMAKE_EXPORT_COMPILE_COMMANDS ON )
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 set(MILVUS_COMMON_WORKSPACE ${CMAKE_CURRENT_SOURCE_DIR})
 include_directories(${MILVUS_COMMON_WORKSPACE}/include)
@@ -47,6 +45,11 @@ if (NOT WITH_AIO)
    list(REMOVE_ITEM src/knowhere/aio_context_pool.cc)
 endif()
 add_library(milvus-common SHARED ${SRC_FILES})
+
+# Ensure SSE4.2 CRC intrinsics are available to match Folly build (x86_64)
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64" AND NOT MSVC)
+    target_compile_options(milvus-common PUBLIC -msse4.2)
+endif()
 
 if (WITH_JAEGER)
     # list(APPEND COMMON_LINKER_LIBS opentelemetry-cpp::opentelemetry_exporter_jaeger_trace)
