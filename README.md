@@ -19,12 +19,9 @@ Milvus Common is a core component library that serves as a bridge between Milvus
 ```
 pip install conan==1.64.0
 mkdir build && cd build
-conan install .. --build=missing -s compiler.libcxx=libstdc++11 -s compiler.version=12 -s build_type=Release
-# ut is off by default
-cmake .. -DENABLE_UNIT_TESTS=ON
-make
+conan install .. --build=missing -o with_ut=True -s compiler.libcxx=libstdc++11 -s compiler.version=12 -s build_type=Release
+conan build ..
 
 # run ut
-export LD_LIBRARY_PATH=$PWD/lib/:$LD_LIBRARY_PATH
-./bin/cachinglayer_test
+./test/test_cachinglayer/cachinglayer_test
 ```
