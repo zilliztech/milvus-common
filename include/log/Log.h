@@ -21,6 +21,7 @@
 
 #include <string>
 
+#include "common/TracerBase.h"
 #include "fmt/core.h"
 #include "glog/logging.h"
 
@@ -57,7 +58,8 @@
 #define SERVER_MODULE_NAME "SERVER"
 #define SERVER_MODULE_CLASS_FUNCTION \
     LogOut("[%s][%s::%s][%s] ", SERVER_MODULE_NAME, (typeid(*this).name()), __FUNCTION__, GetThreadName().c_str())
-#define SERVER_MODULE_FUNCTION fmt::format("[{}][{}][{}]", SERVER_MODULE_NAME, __FUNCTION__, GetThreadName())
+#define SERVER_MODULE_FUNCTION \
+    fmt::format("[{}][{}][{}][{}]", SERVER_MODULE_NAME, __FUNCTION__, GetThreadName(), milvus::tracer::GetTraceID())
 
 // avoid evaluating args if trace log is not enabled
 #define LOG_TRACE(args...)                                               \

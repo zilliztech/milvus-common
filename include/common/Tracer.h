@@ -15,6 +15,7 @@
 #include <memory>
 #include <string>
 
+#include "common/TracerBase.h"
 #include "opentelemetry/trace/provider.h"
 
 #define TRACE_SERVICE_SEGCORE "segcore"
@@ -81,9 +82,6 @@ GetTraceIDAsHexStr(const TraceContext* ctx);
 
 std::string
 GetSpanIDAsHexStr(const TraceContext* ctx);
-
-std::string
-GetTraceID();
 
 std::map<std::string, std::string>
 parseHeaders(const std::string& headers);
