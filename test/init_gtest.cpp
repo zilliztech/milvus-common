@@ -11,10 +11,10 @@
 
 #include <gtest/gtest.h>
 
-#include "folly/init/Init.h"
-#include "common/common_type_c.h"
-#include "test_utils/Constants.h"
 #include "cachinglayer/Manager.h"
+#include "common/common_type_c.h"
+#include "folly/init/Init.h"
+#include "test_utils/Constants.h"
 
 int
 main(int argc, char** argv) {
@@ -23,13 +23,9 @@ main(int argc, char** argv) {
     static const int64_t mb = 1024 * 1024;
 
     milvus::cachinglayer::Manager::ConfigureTieredStorage(
-        {CacheWarmupPolicy::CacheWarmupPolicy_Disable,
-         CacheWarmupPolicy::CacheWarmupPolicy_Disable,
-         CacheWarmupPolicy::CacheWarmupPolicy_Disable,
-         CacheWarmupPolicy::CacheWarmupPolicy_Disable},
-        {1024 * mb, 1024 * mb, 1024 * mb, 1024 * mb, 1024 * mb, 1024 * mb},
-        true,
-        {10, 30});
+        {CacheWarmupPolicy::CacheWarmupPolicy_Disable, CacheWarmupPolicy::CacheWarmupPolicy_Disable,
+         CacheWarmupPolicy::CacheWarmupPolicy_Disable, CacheWarmupPolicy::CacheWarmupPolicy_Disable},
+        {1024 * mb, 1024 * mb, 1024 * mb, 1024 * mb, 1024 * mb, 1024 * mb}, true, {10, 30});
 
     return RUN_ALL_TESTS();
 }

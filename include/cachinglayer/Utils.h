@@ -11,17 +11,17 @@
 
 #pragma once
 
-#include <atomic>
-#include <cstdint>
-
-#include "common/EasyAssert.h"
-#include "folly/executors/InlineExecutor.h"
 #include <folly/futures/Future.h>
 #include <prometheus/counter.h>
 #include <prometheus/gauge.h>
 #include <prometheus/histogram.h>
 
+#include <atomic>
+#include <cstdint>
+
 #include "common/CommonMonitor.h"
+#include "common/EasyAssert.h"
+#include "folly/executors/InlineExecutor.h"
 
 namespace milvus::cachinglayer {
 
@@ -44,8 +44,7 @@ SemiInlineGet(folly::SemiFuture<T>&& future) {
 
 inline std::string
 FormatBytes(int64_t bytes) {
-    constexpr int64_t kUnlimitedThreshold =
-        std::numeric_limits<int64_t>::max() / 100;
+    constexpr int64_t kUnlimitedThreshold = std::numeric_limits<int64_t>::max() / 100;
     if (bytes >= kUnlimitedThreshold) {
         return "UNSET";
     }
@@ -54,11 +53,9 @@ FormatBytes(int64_t bytes) {
     } else if (bytes < 1024 * 1024) {
         return fmt::format("{:.2f} KB ({} B)", bytes / 1024.0, bytes);
     } else if (bytes < 1024 * 1024 * 1024) {
-        return fmt::format(
-            "{:.2f} MB ({} B)", bytes / (1024.0 * 1024.0), bytes);
+        return fmt::format("{:.2f} MB ({} B)", bytes / (1024.0 * 1024.0), bytes);
     } else {
-        return fmt::format(
-            "{:.2f} GB ({} B)", bytes / (1024.0 * 1024.0 * 1024.0), bytes);
+        return fmt::format("{:.2f} GB ({} B)", bytes / (1024.0 * 1024.0 * 1024.0), bytes);
     }
 }
 
@@ -68,14 +65,12 @@ struct ResourceUsage {
 
     ResourceUsage() noexcept : memory_bytes(0), file_bytes(0) {
     }
-    ResourceUsage(int64_t mem, int64_t file) noexcept
-        : memory_bytes(mem), file_bytes(file) {
+    ResourceUsage(int64_t mem, int64_t file) noexcept : memory_bytes(mem), file_bytes(file) {
     }
 
     ResourceUsage
     operator+(const ResourceUsage& rhs) const {
-        return ResourceUsage(memory_bytes + rhs.memory_bytes,
-                             file_bytes + rhs.file_bytes);
+        return ResourceUsage(memory_bytes + rhs.memory_bytes, file_bytes + rhs.file_bytes);
     }
 
     void
@@ -86,15 +81,13 @@ struct ResourceUsage {
 
     ResourceUsage
     operator-(const ResourceUsage& rhs) const {
-        return ResourceUsage(memory_bytes - rhs.memory_bytes,
-                             file_bytes - rhs.file_bytes);
+        return ResourceUsage(memory_bytes - rhs.memory_bytes, file_bytes - rhs.file_bytes);
     }
 
     ResourceUsage
     operator*(double factor) const {
-        return ResourceUsage(
-            static_cast<int64_t>(std::round(memory_bytes * factor)),
-            static_cast<int64_t>(std::round(file_bytes * factor)));
+        return ResourceUsage(static_cast<int64_t>(std::round(memory_bytes * factor)),
+                             static_cast<int64_t>(std::round(file_bytes * factor)));
     }
 
     friend ResourceUsage
@@ -195,20 +188,14 @@ struct CacheWarmupPolicies {
     CacheWarmupPolicy vectorIndexCacheWarmupPolicy;
 
     CacheWarmupPolicies()
-        : scalarFieldCacheWarmupPolicy(
-              CacheWarmupPolicy::CacheWarmupPolicy_Sync),
-          vectorFieldCacheWarmupPolicy(
-              CacheWarmupPolicy::CacheWarmupPolicy_Disable),
-          scalarIndexCacheWarmupPolicy(
-              CacheWarmupPolicy::CacheWarmupPolicy_Sync),
-          vectorIndexCacheWarmupPolicy(
-              CacheWarmupPolicy::CacheWarmupPolicy_Sync) {
+        : scalarFieldCacheWarmupPolicy(CacheWarmupPolicy::CacheWarmupPolicy_Sync),
+          vectorFieldCacheWarmupPolicy(CacheWarmupPolicy::CacheWarmupPolicy_Disable),
+          scalarIndexCacheWarmupPolicy(CacheWarmupPolicy::CacheWarmupPolicy_Sync),
+          vectorIndexCacheWarmupPolicy(CacheWarmupPolicy::CacheWarmupPolicy_Sync) {
     }
 
-    CacheWarmupPolicies(CacheWarmupPolicy scalarFieldCacheWarmupPolicy,
-                        CacheWarmupPolicy vectorFieldCacheWarmupPolicy,
-                        CacheWarmupPolicy scalarIndexCacheWarmupPolicy,
-                        CacheWarmupPolicy vectorIndexCacheWarmupPolicy)
+    CacheWarmupPolicies(CacheWarmupPolicy scalarFieldCacheWarmupPolicy, CacheWarmupPolicy vectorFieldCacheWarmupPolicy,
+                        CacheWarmupPolicy scalarIndexCacheWarmupPolicy, CacheWarmupPolicy vectorIndexCacheWarmupPolicy)
         : scalarFieldCacheWarmupPolicy(scalarFieldCacheWarmupPolicy),
           vectorFieldCacheWarmupPolicy(vectorFieldCacheWarmupPolicy),
           scalarIndexCacheWarmupPolicy(scalarIndexCacheWarmupPolicy),
@@ -230,10 +217,8 @@ struct CacheWarmupPolicies {
         return fmt::format(
             "warmup policies: scalarField: {}, vectorField: {}, "
             "scalarIndex: {}, vectorIndex: {}",
-            policyToString(scalarFieldCacheWarmupPolicy),
-            policyToString(vectorFieldCacheWarmupPolicy),
-            policyToString(scalarIndexCacheWarmupPolicy),
-            policyToString(vectorIndexCacheWarmupPolicy));
+            policyToString(scalarFieldCacheWarmupPolicy), policyToString(vectorFieldCacheWarmupPolicy),
+            policyToString(scalarIndexCacheWarmupPolicy), policyToString(vectorIndexCacheWarmupPolicy));
     }
 };
 
@@ -253,12 +238,8 @@ struct CacheLimit {
           disk_max_bytes(0) {
     }
 
-    CacheLimit(int64_t memory_low_watermark_bytes,
-               int64_t memory_high_watermark_bytes,
-               int64_t memory_max_bytes,
-               int64_t disk_low_watermark_bytes,
-               int64_t disk_high_watermark_bytes,
-               int64_t disk_max_bytes)
+    CacheLimit(int64_t memory_low_watermark_bytes, int64_t memory_high_watermark_bytes, int64_t memory_max_bytes,
+               int64_t disk_low_watermark_bytes, int64_t disk_high_watermark_bytes, int64_t disk_max_bytes)
         : memory_low_watermark_bytes(memory_low_watermark_bytes),
           memory_high_watermark_bytes(memory_high_watermark_bytes),
           memory_max_bytes(memory_max_bytes),
@@ -303,19 +284,13 @@ struct EvictionConfig {
           disk_path("") {
     }
 
-    EvictionConfig(int64_t cache_touch_window_ms,
-                   int64_t eviction_interval_ms,
-                   int64_t cache_cell_unaccessed_survival_time,
-                   float overloaded_memory_threshold_percentage,
-                   float max_disk_usage_percentage,
-                   const std::string& disk_path,
-                   float loading_memory_factor)
+    EvictionConfig(int64_t cache_touch_window_ms, int64_t eviction_interval_ms,
+                   int64_t cache_cell_unaccessed_survival_time, float overloaded_memory_threshold_percentage,
+                   float max_disk_usage_percentage, const std::string& disk_path, float loading_memory_factor)
         : cache_touch_window(std::chrono::milliseconds(cache_touch_window_ms)),
           eviction_interval(std::chrono::milliseconds(eviction_interval_ms)),
-          cache_cell_unaccessed_survival_time(
-              std::chrono::seconds(cache_cell_unaccessed_survival_time)),
-          overloaded_memory_threshold_percentage(
-              overloaded_memory_threshold_percentage),
+          cache_cell_unaccessed_survival_time(std::chrono::seconds(cache_cell_unaccessed_survival_time)),
+          overloaded_memory_threshold_percentage(overloaded_memory_threshold_percentage),
           max_disk_usage_percentage(max_disk_usage_percentage),
           disk_path(disk_path),
           loading_memory_factor(loading_memory_factor) {

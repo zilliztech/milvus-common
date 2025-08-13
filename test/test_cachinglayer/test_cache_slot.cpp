@@ -1,17 +1,17 @@
-#include <gtest/gtest.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/executors/InlineExecutor.h>
 #include <folly/futures/Future.h>
+#include <gtest/gtest.h>
 
 #include <chrono>
 #include <memory>
 #include <random>
 #include <stdexcept>
 #include <thread>
-#include <vector>
-#include <utility>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 
 #include "cachinglayer/CacheSlot.h"
 #include "cachinglayer/Translator.h"
@@ -40,16 +40,11 @@ struct TestCell {
 class MockTranslator : public Translator<TestCell> {
  public:
     MockTranslator(std::vector<std::pair<cid_t, int64_t>> cell_sizes,
-                   std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map,
-                   const std::string& key,
-                   StorageType storage_type,
+                   std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map, const std::string& key, StorageType storage_type,
                    bool for_concurrent_test = false)
         : uid_to_cid_map_(std::move(uid_to_cid_map)),
           key_(key),
-          meta_(storage_type,
-                CellIdMappingMode::CUSTOMIZED,
-                CacheWarmupPolicy::CacheWarmupPolicy_Disable,
-                true),
+          meta_(storage_type, CellIdMappingMode::CUSTOMIZED, CacheWarmupPolicy::CacheWarmupPolicy_Disable, true),
           num_unique_cids_(cell_sizes.size()),
           for_concurrent_test_(for_concurrent_test) {
         cid_set_.reserve(cell_sizes.size());
@@ -113,30 +108,21 @@ class MockTranslator : public Translator<TestCell> {
         for (cid_t cid : cids) {
             auto delay_it = cid_load_delay_ms_.find(cid);
             if (delay_it != cid_load_delay_ms_.end() && delay_it->second > 0) {
-                std::this_thread::sleep_for(
-                    std::chrono::milliseconds(delay_it->second));
+                std::this_thread::sleep_for(std::chrono::milliseconds(delay_it->second));
             }
 
-            result.emplace_back(
-                cid,
-                std::make_unique<TestCell>(static_cast<int>(cid * 10), cid));
+            result.emplace_back(cid, std::make_unique<TestCell>(static_cast<int>(cid * 10), cid));
 
-            if (auto extra_cids = extra_cids_.find(cid);
-                extra_cids != extra_cids_.end()) {
+            if (auto extra_cids = extra_cids_.find(cid); extra_cids != extra_cids_.end()) {
                 for (cid_t extra_cid : extra_cids->second) {
                     // if extra cid is not explicitly requested, and not yet added as extra cell by other
                     // cells, add it to the result.
-                    if (std::find(cids.begin(), cids.end(), extra_cid) ==
-                            cids.end() &&
-                        std::find_if(result.begin(),
-                                     result.end(),
-                                     [extra_cid](const auto& pair) {
-                                         return pair.first == extra_cid;
-                                     }) == result.end()) {
-                        result.emplace_back(
-                            extra_cid,
-                            std::make_unique<TestCell>(
-                                static_cast<int>(extra_cid * 10), extra_cid));
+                    if (std::find(cids.begin(), cids.end(), extra_cid) == cids.end() &&
+                        std::find_if(result.begin(), result.end(), [extra_cid](const auto& pair) {
+                            return pair.first == extra_cid;
+                        }) == result.end()) {
+                        result.emplace_back(extra_cid,
+                                            std::make_unique<TestCell>(static_cast<int>(extra_cid * 10), extra_cid));
                     }
                 }
             }
@@ -156,8 +142,7 @@ class MockTranslator : public Translator<TestCell> {
     }
     // for some cid, translator will return extra cells.
     void
-    SetExtraReturnCids(
-        std::unordered_map<cid_t, std::vector<cid_t>> extra_cids) {
+    SetExtraReturnCids(std::unordered_map<cid_t, std::vector<cid_t>> extra_cids) {
         extra_cids_ = extra_cids;
     }
     int
@@ -201,17 +186,9 @@ class CacheSlotTest : public ::testing::Test {
     MockTranslator* translator_ = nullptr;
     std::shared_ptr<CacheSlot<TestCell>> cache_slot_;
 
-    std::vector<std::pair<cid_t, int64_t>> cell_sizes_ = {
-        {0, 50}, {1, 150}, {2, 100}, {3, 200}, {4, 75}};
-    std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map_ = {{10, 0},
-                                                           {11, 0},
-                                                           {20, 1},
-                                                           {30, 2},
-                                                           {31, 2},
-                                                           {32, 2},
-                                                           {40, 3},
-                                                           {50, 4},
-                                                           {51, 4}};
+    std::vector<std::pair<cid_t, int64_t>> cell_sizes_ = {{0, 50}, {1, 150}, {2, 100}, {3, 200}, {4, 75}};
+    std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map_ = {{10, 0}, {11, 0}, {20, 1}, {30, 2}, {31, 2},
+                                                           {32, 2}, {40, 3}, {50, 4}, {51, 4}};
 
     size_t NUM_UNIQUE_CIDS = 5;
     int64_t TOTAL_CELL_SIZE_BYTES = 50 + 150 + 100 + 200 + 75;
@@ -224,14 +201,12 @@ class CacheSlotTest : public ::testing::Test {
     void
     SetUp() override {
         auto limit = ResourceUsage{MEMORY_LIMIT, DISK_LIMIT};
-        dlist_ = std::make_unique<DList>(
-            limit, limit, limit, EvictionConfig{10, 600});
+        dlist_ = std::make_unique<DList>(limit, limit, limit, EvictionConfig{10, 600});
 
-        auto temp_translator_uptr = std::make_unique<MockTranslator>(
-            cell_sizes_, uid_to_cid_map_, SLOT_KEY, StorageType::MEMORY);
+        auto temp_translator_uptr =
+            std::make_unique<MockTranslator>(cell_sizes_, uid_to_cid_map_, SLOT_KEY, StorageType::MEMORY);
         translator_ = temp_translator_uptr.get();
-        cache_slot_ = std::make_shared<CacheSlot<TestCell>>(
-            std::move(temp_translator_uptr), dlist_.get(), true);
+        cache_slot_ = std::make_shared<CacheSlot<TestCell>>(std::move(temp_translator_uptr), dlist_.get(), true);
     }
 
     void
@@ -248,8 +223,7 @@ TEST_F(CacheSlotTest, Initialization) {
 TEST_F(CacheSlotTest, PinSingleCellSuccess) {
     cl_uid_t target_uid = 30;
     cid_t expected_cid = 2;
-    ResourceUsage expected_size =
-        translator_->estimated_byte_size_of_cell(expected_cid);
+    ResourceUsage expected_size = translator_->estimated_byte_size_of_cell(expected_cid);
 
     translator_->ResetCounters();
     auto future = cache_slot_->PinCells({target_uid});
@@ -350,8 +324,7 @@ TEST_F(CacheSlotTest, PinInvalidUid) {
                 SemiInlineGet(std::move(future));
             } catch (const milvus::SegcoreError& e) {
                 std::string error_what = e.what();
-                EXPECT_TRUE(error_what.find("out of range") !=
-                                std::string::npos ||
+                EXPECT_TRUE(error_what.find("out of range") != std::string::npos ||
                             error_what.find("invalid") != std::string::npos);
                 throw;
             }
@@ -376,12 +349,9 @@ TEST_F(CacheSlotTest, LoadFailure) {
                 SemiInlineGet(std::move(future));
             } catch (const std::runtime_error& e) {
                 std::string error_what = e.what();
-                EXPECT_TRUE(error_what.find("Simulated load error") !=
-                                std::string::npos ||
-                            error_what.find("Failed to load") !=
-                                std::string::npos ||
-                            error_what.find("Exception during Future") !=
-                                std::string::npos);
+                EXPECT_TRUE(error_what.find("Simulated load error") != std::string::npos ||
+                            error_what.find("Failed to load") != std::string::npos ||
+                            error_what.find("Exception during Future") != std::string::npos);
                 throw;
             }
         },
@@ -397,8 +367,7 @@ TEST_F(CacheSlotTest, LoadFailure) {
 TEST_F(CacheSlotTest, PinAlreadyLoadedCell) {
     cl_uid_t target_uid = 40;
     cid_t expected_cid = 3;
-    ResourceUsage expected_size =
-        translator_->estimated_byte_size_of_cell(expected_cid);
+    ResourceUsage expected_size = translator_->estimated_byte_size_of_cell(expected_cid);
 
     translator_->ResetCounters();
 
@@ -435,8 +404,7 @@ TEST_F(CacheSlotTest, PinAlreadyLoadedCellViaDifferentUid) {
     cl_uid_t uid1 = 30;
     cl_uid_t uid2 = 31;
     cid_t expected_cid = 2;
-    ResourceUsage expected_size =
-        translator_->estimated_byte_size_of_cell(expected_cid);
+    ResourceUsage expected_size = translator_->estimated_byte_size_of_cell(expected_cid);
 
     translator_->ResetCounters();
 
@@ -481,8 +449,7 @@ TEST_F(CacheSlotTest, TranslatorReturnsExtraCells) {
     cl_uid_t extra_uid = 20;
 
     ResourceUsage expected_size =
-        translator_->estimated_byte_size_of_cell(requested_cid) +
-        translator_->estimated_byte_size_of_cell(extra_cid);
+        translator_->estimated_byte_size_of_cell(requested_cid) + translator_->estimated_byte_size_of_cell(extra_cid);
 
     translator_->ResetCounters();
     translator_->SetExtraReturnCids({{requested_cid, {extra_cid}}});
@@ -493,8 +460,7 @@ TEST_F(CacheSlotTest, TranslatorReturnsExtraCells) {
     ASSERT_NE(accessor, nullptr);
     ASSERT_EQ(translator_->GetCellsCallCount(), 1);
     ASSERT_EQ(translator_->GetRequestedCids().size(), 1);
-    EXPECT_EQ(translator_->GetRequestedCids()[0],
-              std::vector<cid_t>{requested_cid});
+    EXPECT_EQ(translator_->GetRequestedCids()[0], std::vector<cid_t>{requested_cid});
     EXPECT_EQ(DListTestFriend::get_used_memory(*dlist_), expected_size);
 
     TestCell* requested_cell = accessor->get_cell_of(requested_uid);
@@ -526,8 +492,7 @@ TEST_F(CacheSlotTest, EvictionTest) {
 
     std::vector<cl_uid_t> uids_012 = {10, 20, 30};
     std::vector<cid_t> cids_012 = {0, 1, 2};
-    ResourceUsage size_012 = translator_->estimated_byte_size_of_cell(0) +
-                             translator_->estimated_byte_size_of_cell(1) +
+    ResourceUsage size_012 = translator_->estimated_byte_size_of_cell(0) + translator_->estimated_byte_size_of_cell(1) +
                              translator_->estimated_byte_size_of_cell(2);
     ASSERT_EQ(size_012, ResourceUsage(50 + 150 + 100, 0));
 
@@ -567,13 +532,11 @@ TEST_F(CacheSlotTest, EvictionTest) {
     ResourceUsage used_after_evict1 = DListTestFriend::get_used_memory(*dlist_);
     EXPECT_LE(used_after_evict1.memory_bytes, new_limit.memory_bytes);
     EXPECT_GE(used_after_evict1.memory_bytes, size_3.memory_bytes);
-    EXPECT_LT(
-        used_after_evict1.memory_bytes,
-        size_012.memory_bytes + size_3.memory_bytes);  // Eviction occurred
+    EXPECT_LT(used_after_evict1.memory_bytes,
+              size_012.memory_bytes + size_3.memory_bytes);  // Eviction occurred
 }
 
-class CacheSlotConcurrentTest : public CacheSlotTest,
-                                public ::testing::WithParamInterface<bool> {};
+class CacheSlotConcurrentTest : public CacheSlotTest, public ::testing::WithParamInterface<bool> {};
 
 TEST_P(CacheSlotConcurrentTest, ConcurrentAccessMultipleSlots) {
     // Slot 1 Cells: 0-4 (Sizes: 50, 60, 70, 80, 90) -> Total 350
@@ -586,54 +549,31 @@ TEST_P(CacheSlotConcurrentTest, ConcurrentAccessMultipleSlots) {
     dlist_->UpdateLowWatermark(new_low_watermark);
     dlist_->UpdateHighWatermark(new_high_watermark);
     ASSERT_TRUE(dlist_->UpdateLimit(new_limit));
-    EXPECT_EQ(DListTestFriend::get_max_memory(*dlist_).memory_bytes,
-              new_limit.memory_bytes);
+    EXPECT_EQ(DListTestFriend::get_max_memory(*dlist_).memory_bytes, new_limit.memory_bytes);
 
     // 1. Setup CacheSlots sharing dlist_
-    std::vector<std::pair<cid_t, int64_t>> cell_sizes_1 = {
-        {0, 50}, {1, 60}, {2, 70}, {3, 80}, {4, 90}};
-    std::unordered_map<cl_uid_t, cid_t> uid_map_1 = {
-        {1000, 0}, {1001, 1}, {1002, 2}, {1003, 3}, {1004, 4}};
-    auto translator_1_ptr =
-        std::make_unique<MockTranslator>(cell_sizes_1,
-                                         uid_map_1,
-                                         "slot1",
-                                         StorageType::MEMORY,
-                                         /*for_concurrent_test*/ true);
+    std::vector<std::pair<cid_t, int64_t>> cell_sizes_1 = {{0, 50}, {1, 60}, {2, 70}, {3, 80}, {4, 90}};
+    std::unordered_map<cl_uid_t, cid_t> uid_map_1 = {{1000, 0}, {1001, 1}, {1002, 2}, {1003, 3}, {1004, 4}};
+    auto translator_1_ptr = std::make_unique<MockTranslator>(cell_sizes_1, uid_map_1, "slot1", StorageType::MEMORY,
+                                                             /*for_concurrent_test*/ true);
     MockTranslator* translator_1 = translator_1_ptr.get();
-    auto slot1 = std::make_shared<CacheSlot<TestCell>>(
-        std::move(translator_1_ptr), dlist_.get(), true);
+    auto slot1 = std::make_shared<CacheSlot<TestCell>>(std::move(translator_1_ptr), dlist_.get(), true);
 
-    std::vector<std::pair<cid_t, int64_t>> cell_sizes_2 = {
-        {0, 55}, {1, 65}, {2, 75}, {3, 85}, {4, 95}};
-    std::unordered_map<cl_uid_t, cid_t> uid_map_2 = {
-        {2000, 0}, {2001, 1}, {2002, 2}, {2003, 3}, {2004, 4}};
-    auto translator_2_ptr =
-        std::make_unique<MockTranslator>(cell_sizes_2,
-                                         uid_map_2,
-                                         "slot2",
-                                         StorageType::MEMORY,
-                                         /*for_concurrent_test*/ true);
+    std::vector<std::pair<cid_t, int64_t>> cell_sizes_2 = {{0, 55}, {1, 65}, {2, 75}, {3, 85}, {4, 95}};
+    std::unordered_map<cl_uid_t, cid_t> uid_map_2 = {{2000, 0}, {2001, 1}, {2002, 2}, {2003, 3}, {2004, 4}};
+    auto translator_2_ptr = std::make_unique<MockTranslator>(cell_sizes_2, uid_map_2, "slot2", StorageType::MEMORY,
+                                                             /*for_concurrent_test*/ true);
     MockTranslator* translator_2 = translator_2_ptr.get();
-    auto slot2 = std::make_shared<CacheSlot<TestCell>>(
-        std::move(translator_2_ptr), dlist_.get(), true);
+    auto slot2 = std::make_shared<CacheSlot<TestCell>>(std::move(translator_2_ptr), dlist_.get(), true);
 
     bool with_bonus_cells = GetParam();
     if (with_bonus_cells) {
         // Configure translators to return bonus cells
         std::unordered_map<cid_t, std::vector<cid_t>> bonus_map_1{
-            {0, {2}},
-            {1, {3}},
-            {2, {1, 4}},
-            {3, {0}},
-            {4, {2, 3}},
+            {0, {2}}, {1, {3}}, {2, {1, 4}}, {3, {0}}, {4, {2, 3}},
         };
         std::unordered_map<cid_t, std::vector<cid_t>> bonus_map_2{
-            {0, {1, 4}},
-            {1, {2, 3}},
-            {2, {0}},
-            {3, {0, 1}},
-            {4, {2}},
+            {0, {1, 4}}, {1, {2, 3}}, {2, {0}}, {3, {0, 1}}, {4, {2}},
         };
         translator_1->SetExtraReturnCids(bonus_map_1);
         translator_2->SetExtraReturnCids(bonus_map_2);
@@ -643,8 +583,7 @@ TEST_P(CacheSlotConcurrentTest, ConcurrentAccessMultipleSlots) {
     // Store uid maps in a structure easily accessible by slot index
     std::vector<std::vector<cl_uid_t>> slot_uids;
     slot_uids.resize(slots.size());
-    std::vector<std::unordered_map<cl_uid_t, cid_t>> uid_to_cid_maps = {
-        uid_map_1, uid_map_2};
+    std::vector<std::unordered_map<cl_uid_t, cid_t>> uid_to_cid_maps = {uid_map_1, uid_map_2};
     for (const auto& pair : uid_map_1) slot_uids[0].push_back(pair.first);
     for (const auto& pair : uid_map_2) slot_uids[1].push_back(pair.first);
 
@@ -661,8 +600,7 @@ TEST_P(CacheSlotConcurrentTest, ConcurrentAccessMultipleSlots) {
     for (int i = 0; i < num_threads; ++i) {
         futures.push_back(folly::via(&executor, [&, i, tid = i]() {
             // Seed random generator uniquely for each thread
-            std::mt19937 gen(
-                std::hash<std::thread::id>{}(std::this_thread::get_id()) + tid);
+            std::mt19937 gen(std::hash<std::thread::id>{}(std::this_thread::get_id()) + tid);
             std::uniform_int_distribution<> slot_dist(0, slots.size() - 1);
             std::uniform_int_distribution<> sleep_dist(5, 15);
 
@@ -672,8 +610,7 @@ TEST_P(CacheSlotConcurrentTest, ConcurrentAccessMultipleSlots) {
                 auto& current_slot_uids = slot_uids[slot_idx];
                 auto& current_uid_to_cid_map = uid_to_cid_maps[slot_idx];
 
-                std::uniform_int_distribution<> uid_idx_dist(
-                    0, current_slot_uids.size() - 1);
+                std::uniform_int_distribution<> uid_idx_dist(0, current_slot_uids.size() - 1);
                 cl_uid_t target_uid = current_slot_uids[uid_idx_dist(gen)];
                 cid_t expected_cid = current_uid_to_cid_map.at(target_uid);
                 int expected_data = static_cast<int>(expected_cid * 10);
@@ -682,54 +619,43 @@ TEST_P(CacheSlotConcurrentTest, ConcurrentAccessMultipleSlots) {
                     auto accessor = current_slot->PinCells({target_uid}).get();
 
                     if (!accessor) {
-                        ADD_FAILURE()
-                            << "T" << tid << " Op" << j
-                            << ": PinCells returned null accessor for UID "
-                            << target_uid;
+                        ADD_FAILURE() << "T" << tid << " Op" << j << ": PinCells returned null accessor for UID "
+                                      << target_uid;
                         test_failed = true;
                         break;
                     }
 
                     TestCell* cell = accessor->get_cell_of(target_uid);
                     if (!cell) {
-                        ADD_FAILURE() << "T" << tid << " Op" << j
-                                      << ": get_cell_of returned null for UID "
+                        ADD_FAILURE() << "T" << tid << " Op" << j << ": get_cell_of returned null for UID "
                                       << target_uid;
                         test_failed = true;
                         break;
                     }
 
                     if (cell->cid != expected_cid) {
-                        ADD_FAILURE() << "T" << tid << " Op" << j
-                                      << ": Incorrect CID for UID "
-                                      << target_uid << ". Slot: " << slot_idx
-                                      << ", Expected: " << expected_cid
+                        ADD_FAILURE() << "T" << tid << " Op" << j << ": Incorrect CID for UID " << target_uid
+                                      << ". Slot: " << slot_idx << ", Expected: " << expected_cid
                                       << ", Got: " << cell->cid;
                         test_failed = true;
                         break;
                     }
                     if (cell->data != expected_data) {
-                        ADD_FAILURE() << "T" << tid << " Op" << j
-                                      << ": Incorrect Data for UID "
-                                      << target_uid << ". Slot: " << slot_idx
-                                      << ", Expected: " << expected_data
+                        ADD_FAILURE() << "T" << tid << " Op" << j << ": Incorrect Data for UID " << target_uid
+                                      << ". Slot: " << slot_idx << ", Expected: " << expected_data
                                       << ", Got: " << cell->data;
                         test_failed = true;
                         break;
                     }
                     int sleep_ms = sleep_dist(gen);
-                    std::this_thread::sleep_for(
-                        std::chrono::milliseconds(sleep_ms));
+                    std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
                 } catch (const std::exception& e) {
-                    ADD_FAILURE()
-                        << "T" << tid << " Op" << j << ": Exception for UID "
-                        << target_uid << ", Slot: " << slot_idx
-                        << ". What: " << e.what();
+                    ADD_FAILURE() << "T" << tid << " Op" << j << ": Exception for UID " << target_uid
+                                  << ", Slot: " << slot_idx << ". What: " << e.what();
                     test_failed = true;
                 } catch (...) {
-                    ADD_FAILURE() << "T" << tid << " Op" << j
-                                  << ": Unknown exception for UID "
-                                  << target_uid << ", Slot: " << slot_idx;
+                    ADD_FAILURE() << "T" << tid << " Op" << j << ": Unknown exception for UID " << target_uid
+                                  << ", Slot: " << slot_idx;
                     test_failed = true;
                 }
             }
@@ -739,26 +665,18 @@ TEST_P(CacheSlotConcurrentTest, ConcurrentAccessMultipleSlots) {
     // number of ops between recreating slot3
     const int recreate_interval = 25;
     auto dlist_ptr = dlist_.get();
-    std::vector<std::pair<cid_t, int64_t>> cell_sizes_3 = {
-        {0, 40}, {1, 50}, {2, 60}, {3, 70}, {4, 80}};
-    std::unordered_map<cl_uid_t, cid_t> uid_map_3 = {
-        {3000, 0}, {3001, 1}, {3002, 2}, {3003, 3}, {3004, 4}};
+    std::vector<std::pair<cid_t, int64_t>> cell_sizes_3 = {{0, 40}, {1, 50}, {2, 60}, {3, 70}, {4, 80}};
+    std::unordered_map<cl_uid_t, cid_t> uid_map_3 = {{3000, 0}, {3001, 1}, {3002, 2}, {3003, 3}, {3004, 4}};
     std::vector<cl_uid_t> slot3_uids = {3000, 3001, 3002, 3003, 3004};
     auto create_new_slot3 = [&]() {
-        auto translator_3_ptr =
-            std::make_unique<MockTranslator>(cell_sizes_3,
-                                             uid_map_3,
-                                             "slot3",
-                                             StorageType::MEMORY,
-                                             /*for_concurrent_test*/ true);
-        auto sl = std::make_shared<CacheSlot<TestCell>>(
-            std::move(translator_3_ptr), dlist_ptr, dlist_ptr != nullptr);
+        auto translator_3_ptr = std::make_unique<MockTranslator>(cell_sizes_3, uid_map_3, "slot3", StorageType::MEMORY,
+                                                                 /*for_concurrent_test*/ true);
+        auto sl = std::make_shared<CacheSlot<TestCell>>(std::move(translator_3_ptr), dlist_ptr, dlist_ptr != nullptr);
         return sl;
     };
     std::shared_ptr<CacheSlot<TestCell>> slot3 = create_new_slot3();
     futures.push_back(folly::via(&executor, [&, tid = num_threads]() {
-        std::mt19937 gen(
-            std::hash<std::thread::id>{}(std::this_thread::get_id()) + tid);
+        std::mt19937 gen(std::hash<std::thread::id>{}(std::this_thread::get_id()) + tid);
         std::uniform_int_distribution<> sleep_dist(5, 15);
         std::uniform_int_distribution<> recreate_sleep_dist(20, 30);
         std::uniform_int_distribution<> uid_idx_dist(0, slot3_uids.size() - 1);
@@ -771,39 +689,30 @@ TEST_P(CacheSlotConcurrentTest, ConcurrentAccessMultipleSlots) {
             try {
                 auto accessor = slot3->PinCells({target_uid}).get();
                 if (!accessor) {
-                    ADD_FAILURE()
-                        << "T" << tid << " Op" << j
-                        << ": PinCells returned null accessor for UID "
-                        << target_uid;
+                    ADD_FAILURE() << "T" << tid << " Op" << j << ": PinCells returned null accessor for UID "
+                                  << target_uid;
                     test_failed = true;
                     break;
                 }
 
                 TestCell* cell = accessor->get_cell_of(target_uid);
                 if (!cell) {
-                    ADD_FAILURE()
-                        << "T" << tid << " Op" << j
-                        << ": get_cell_of returned null for UID " << target_uid;
+                    ADD_FAILURE() << "T" << tid << " Op" << j << ": get_cell_of returned null for UID " << target_uid;
                     test_failed = true;
                     break;
                 }
 
                 if (cell->cid != expected_cid) {
-                    ADD_FAILURE() << "T" << tid << " Op" << j
-                                  << ": Incorrect CID for UID " << target_uid
-                                  << ". Slot: 3"
-                                  << ", Expected: " << expected_cid
-                                  << ", Got: " << cell->cid;
+                    ADD_FAILURE() << "T" << tid << " Op" << j << ": Incorrect CID for UID " << target_uid << ". Slot: 3"
+                                  << ", Expected: " << expected_cid << ", Got: " << cell->cid;
                     test_failed = true;
                     break;
                 }
 
                 if (cell->data != expected_data) {
-                    ADD_FAILURE() << "T" << tid << " Op" << j
-                                  << ": Incorrect Data for UID " << target_uid
+                    ADD_FAILURE() << "T" << tid << " Op" << j << ": Incorrect Data for UID " << target_uid
                                   << ". Slot: 3"
-                                  << ", Expected: " << expected_data
-                                  << ", Got: " << cell->data;
+                                  << ", Expected: " << expected_data << ", Got: " << cell->data;
                     test_failed = true;
                     break;
                 }
@@ -811,25 +720,20 @@ TEST_P(CacheSlotConcurrentTest, ConcurrentAccessMultipleSlots) {
                 if (ops_since_recreate >= recreate_interval) {
                     slot3 = nullptr;
                     int sleep_ms = recreate_sleep_dist(gen);
-                    std::this_thread::sleep_for(
-                        std::chrono::milliseconds(sleep_ms));
+                    std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
                     slot3 = create_new_slot3();
                     ops_since_recreate = 0;
                 } else {
                     ops_since_recreate++;
                     int sleep_ms = sleep_dist(gen);
-                    std::this_thread::sleep_for(
-                        std::chrono::milliseconds(sleep_ms));
+                    std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
                 }
             } catch (const std::exception& e) {
-                ADD_FAILURE()
-                    << "T" << tid << " Op" << j << ": Exception for UID "
-                    << target_uid << ", Slot: 3"
-                    << ". What: " << e.what();
+                ADD_FAILURE() << "T" << tid << " Op" << j << ": Exception for UID " << target_uid << ", Slot: 3"
+                              << ". What: " << e.what();
                 test_failed = true;
             } catch (...) {
-                ADD_FAILURE() << "T" << tid << " Op" << j
-                              << ": Unknown exception for UID " << target_uid
+                ADD_FAILURE() << "T" << tid << " Op" << j << ": Unknown exception for UID " << target_uid
                               << ", Slot: 3";
                 test_failed = true;
             }
@@ -845,27 +749,21 @@ TEST_P(CacheSlotConcurrentTest, ConcurrentAccessMultipleSlots) {
         FAIL() << "Unknown exception waiting for thread pool completion.";
     }
 
-    ASSERT_FALSE(test_failed.load())
-        << "Test failed due to assertion failures within threads.";
+    ASSERT_FALSE(test_failed.load()) << "Test failed due to assertion failures within threads.";
 
-    ResourceUsage final_memory_usage =
-        DListTestFriend::get_used_memory(*dlist_);
+    ResourceUsage final_memory_usage = DListTestFriend::get_used_memory(*dlist_);
 
     // bonus cell may cause memory usage to exceed the limit
     if (!with_bonus_cells) {
         EXPECT_LE(final_memory_usage.memory_bytes, new_limit.memory_bytes)
-            << "Final memory usage (" << final_memory_usage.memory_bytes
-            << ") exceeds the limit (" << new_limit.memory_bytes
-            << ") after concurrent access.";
+            << "Final memory usage (" << final_memory_usage.memory_bytes << ") exceeds the limit ("
+            << new_limit.memory_bytes << ") after concurrent access.";
     }
 
     DListTestFriend::verify_integrity(dlist_.get());
 }
 
-INSTANTIATE_TEST_SUITE_P(BonusCellParam,
-                         CacheSlotConcurrentTest,
-                         ::testing::Bool(),
+INSTANTIATE_TEST_SUITE_P(BonusCellParam, CacheSlotConcurrentTest, ::testing::Bool(),
                          [](const ::testing::TestParamInfo<bool>& info) {
-                             return info.param ? "WithBonusCells"
-                                               : "NoBonusCells";
+                             return info.param ? "WithBonusCells" : "NoBonusCells";
                          });

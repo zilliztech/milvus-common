@@ -24,6 +24,9 @@ set( CMAKE_EXPORT_COMPILE_COMMANDS ON )
 set(MILVUS_COMMON_WORKSPACE ${CMAKE_CURRENT_SOURCE_DIR})
 include_directories(${MILVUS_COMMON_WORKSPACE}/include)
 
+include(CheckSymbolExists)
+check_symbol_exists(__x86_64__ "" __X86_64)
+
 find_package(opentelemetry-cpp REQUIRED)
 find_package(folly REQUIRED)
 find_package(gflags REQUIRED)
@@ -43,7 +46,10 @@ list(APPEND COMMON_LINKER_LIBS opentelemetry-cpp::opentelemetry_exporter_otlp_gr
 list(APPEND COMMON_LINKER_LIBS opentelemetry-cpp::opentelemetry_exporter_otlp_http)
 
 file(GLOB_RECURSE SRC_FILES src/*.cpp src/*.cc)
-if (NOT WITH_AIO)
+if(__X86_64)
+   set_source_files_properties(src/knowhere/thread_pool.cc PROPERTIES
+     COMPILE_OPTIONS "-msse4.2"
+   )
    list(REMOVE_ITEM src/knowhere/aio_context_pool.cc)
 endif()
 add_library(milvus-common SHARED ${SRC_FILES})
@@ -60,11 +66,12 @@ if (WITH_JAEGER)
     add_definitions(-DWITH_JAEGER)
 endif()
 
-target_link_libraries(milvus-common PUBLIC 
+target_link_libraries(milvus-common PUBLIC
     ${COMMON_LINKER_LIBS}
 )
 
-if(ENABLE_UNIT_TESTS)
+if(WITH_UT)
+    find_package(GTest REQUIRED)
     add_subdirectory(test)
 endif()
 

@@ -29,17 +29,16 @@
 #endif
 #endif
 
+#include <cassert>
 #include <cerrno>
 #include <cstring>
 #include <memory>
 #include <thread>
 #include <utility>
-#include <cassert>
 
 #include "folly/executors/CPUThreadPoolExecutor.h"
 #include "folly/executors/task_queue/UnboundedBlockingQueue.h"
 #include "folly/futures/Future.h"
-
 #include "log/Log.h"
 
 namespace knowhere {
@@ -211,7 +210,7 @@ class ThreadPool {
 
      public:
         explicit ScopedSearchOmpSetter(int num_threads = 1);
-        
+
         ~ScopedSearchOmpSetter();
     };
 

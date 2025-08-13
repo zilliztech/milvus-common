@@ -14,9 +14,9 @@
 #include <memory>
 
 #include "cachinglayer/CacheSlot.h"
-#include "cachinglayer/lrucache/DList.h"
 #include "cachinglayer/Translator.h"
 #include "cachinglayer/Utils.h"
+#include "cachinglayer/lrucache/DList.h"
 #include "common/common_type_c.h"
 
 namespace milvus::cachinglayer {
@@ -30,9 +30,7 @@ class Manager {
     // and before any Manager instance method is called.
     // TODO(tiered storage 4): support dynamic update.
     static void
-    ConfigureTieredStorage(CacheWarmupPolicies warmup_policies,
-                           CacheLimit cache_limit,
-                           bool evictionEnabled,
+    ConfigureTieredStorage(CacheWarmupPolicies warmup_policies, CacheLimit cache_limit, bool evictionEnabled,
                            EvictionConfig eviction_config);
 
     Manager(const Manager&) = delete;
@@ -45,11 +43,9 @@ class Manager {
     template <typename CellT>
     std::shared_ptr<CacheSlot<CellT>>
     CreateCacheSlot(std::unique_ptr<Translator<CellT>> translator) {
-        auto evictable =
-            translator->meta()->support_eviction && evictionEnabled_;
+        auto evictable = translator->meta()->support_eviction && evictionEnabled_;
         // NOTE: when evictionEnabled_ is false, dlist_ is nullptr.
-        auto cache_slot = std::make_shared<CacheSlot<CellT>>(
-            std::move(translator), dlist_.get(), evictable);
+        auto cache_slot = std::make_shared<CacheSlot<CellT>>(std::move(translator), dlist_.get(), evictable);
         cache_slot->Warmup();
         return cache_slot;
     }
@@ -85,9 +81,7 @@ class Manager {
 
  private:
     friend void
-    ConfigureTieredStorage(CacheWarmupPolicies warmup_policies,
-                           CacheLimit cache_limit,
-                           bool evictionEnabled,
+    ConfigureTieredStorage(CacheWarmupPolicies warmup_policies, CacheLimit cache_limit, bool evictionEnabled,
                            EvictionConfig eviction_config);
 
     Manager() = default;

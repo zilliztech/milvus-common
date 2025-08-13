@@ -7,7 +7,7 @@
 namespace milvus {
 
 class LocalOutputStream : public OutputStream {
-public:
+ public:
     LocalOutputStream(const std::string& filename);
     ~LocalOutputStream() override;
 
@@ -26,7 +26,7 @@ public:
     size_t
     Write(int fd, size_t size) override;
 
-private:
+ private:
     mutable std::ofstream stream_;
     std::string filename_;
 };

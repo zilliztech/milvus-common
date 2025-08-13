@@ -14,11 +14,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <iostream>
 #include "common/EasyAssert.h"
-#include "fmt/core.h"
+
 #include <boost/stacktrace.hpp>
+#include <iostream>
 #include <sstream>
+
+#include "fmt/core.h"
 
 namespace milvus::impl {
 
@@ -35,12 +37,8 @@ EasyStackTrace() {
 }
 
 void
-EasyAssertInfo(bool value,
-               std::string_view expr_str,
-               std::string_view filename,
-               int lineno,
-               std::string_view extra_info,
-               ErrorCode error_code) {
+EasyAssertInfo(bool value, std::string_view expr_str, std::string_view filename, int lineno,
+               std::string_view extra_info, ErrorCode error_code) {
     // enable error code
     if (!value) {
         std::string info;
@@ -50,8 +48,7 @@ EasyAssertInfo(bool value,
         if (!extra_info.empty()) {
             info += " => " + std::string(extra_info);
         }
-        info += fmt::format(
-            " at {}:{}\n", std::string(filename), std::to_string(lineno));
+        info += fmt::format(" at {}:{}\n", std::string(filename), std::to_string(lineno));
         std::cout << info << std::endl;
 
         throw SegcoreError(error_code, std::string(info));

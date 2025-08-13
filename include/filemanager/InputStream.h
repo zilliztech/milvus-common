@@ -15,7 +15,7 @@
 
 namespace milvus {
 class InputStream {
-public:
+ public:
     virtual ~InputStream() = default;
 
     /**

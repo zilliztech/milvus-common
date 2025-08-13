@@ -14,9 +14,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "log/Log.h"
+
 #include "common/EasyAssert.h"
 #include "fmt/core.h"
-#include "log/Log.h"
 
 /*
  * INITIALIZE_EASYLOGGINGPP will create a global variable whose name is same to that already created in knowhere,
@@ -31,8 +32,8 @@
 #endif
 #include <chrono>
 #include <cstdarg>
-#include <iostream>
 #include <cstdio>
+#include <iostream>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -51,13 +52,10 @@ LogOut(const char* pattern, ...) {
     va_end(vl);
 
     if (result < 0) {
-        std::cerr << "Error: vsnprintf failed to format the string."
-                  << std::endl;
+        std::cerr << "Error: vsnprintf failed to format the string." << std::endl;
         return "Formatting Error";
     } else if (static_cast<size_t>(result) >= len) {
-        std::cerr
-            << "Warning: Output was truncated. Buffer size was insufficient."
-            << std::endl;
+        std::cerr << "Warning: Output was truncated. Buffer size was insufficient." << std::endl;
         return "Truncated Output";
     }
 
@@ -110,15 +108,11 @@ get_thread_starttime() {
 
     int64_t pid = getpid();
     char filename[256];
-    int ret_snprintf =
-        snprintf(filename,
-                 sizeof(filename),
-                 "/proc/%lld/task/%lld/stat",
-                 (long long)pid,   // NOLINT, TODO: How to solve this?
-                 (long long)tid);  // NOLINT
+    int ret_snprintf = snprintf(filename, sizeof(filename), "/proc/%lld/task/%lld/stat",
+                                (long long)pid,   // NOLINT, TODO: How to solve this?
+                                (long long)tid);  // NOLINT
 
-    if (ret_snprintf < 0 ||
-        static_cast<size_t>(ret_snprintf) >= sizeof(filename)) {
+    if (ret_snprintf < 0 || static_cast<size_t>(ret_snprintf) >= sizeof(filename)) {
         std::cerr << "Error: snprintf failed or output was truncated when "
                      "creating filename."
                   << std::endl;
@@ -129,8 +123,7 @@ get_thread_starttime() {
     char comm[16], state;
     FILE* thread_stat = fopen(filename, "r");
     AssertInfo(thread_stat != nullptr, "opening file:{} failed!", filename);
-    auto ret = fscanf(
-        thread_stat, "%lld %s %s ", (long long*)&val, comm, &state);  // NOLINT
+    auto ret = fscanf(thread_stat, "%lld %s %s ", (long long*)&val, comm, &state);  // NOLINT
 
     for (auto i = 4; i < 23; i++) {
         ret = fscanf(thread_stat, "%lld ", (long long*)&val);  // NOLINT
