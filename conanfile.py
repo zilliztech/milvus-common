@@ -81,7 +81,7 @@ class MilvusCommonConan(ConanFile):
             tc.variables["MSVC_ENABLE_ALL_WARNINGS"] = False
             tc.variables["MSVC_USE_STATIC_RUNTIME"] = "MT" in msvc_runtime_flag(self)
 
-        tc.variables["WITH_UT"] = self.options.with_ut
+        tc.variables["WITH_COMMON_UT"] = self.options.with_ut
         tc.generate()
 
         deps = CMakeDeps(self)

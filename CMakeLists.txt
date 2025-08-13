@@ -71,7 +71,7 @@ target_link_libraries(milvus-common PUBLIC
     ${COMMON_LINKER_LIBS}
 )
 
-if(WITH_UT)
+if(WITH_COMMON_UT)
     find_package(GTest REQUIRED)
     add_subdirectory(test)
 endif()
