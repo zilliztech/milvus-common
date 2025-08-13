@@ -49,7 +49,7 @@ class DListTest : public ::testing::Test {
     bool
     reserveMemorySync(const ResourceUsage& size, std::chrono::milliseconds timeout = std::chrono::milliseconds(100)) {
         // Use 1 hour timeout for tests
-        auto future = dlist->reserveMemoryWithTimeout(size, timeout);
+        auto future = dlist->reserveLoadingResourceWithTimeout(size, timeout);
         return std::move(future).get();
     }
 
@@ -77,7 +77,7 @@ class DListTest : public ::testing::Test {
         DLF::test_push_head(dlist.get(), node);
 
         if (pin_count == 0) {
-            dlist->increaseEvictableSize(size);
+            DLF::test_add_evictable_memory(dlist.get(), size);
         }
 
         return node;
@@ -87,45 +87,51 @@ class DListTest : public ::testing::Test {
     get_used_memory() const {
         return DLF::get_used_memory(*dlist);
     }
+
+    ResourceUsage
+    get_loading_memory() const {
+        return DLF::get_loading_memory(*dlist);
+    }
 };
 
 TEST_F(DListTest, Initialization) {
     EXPECT_TRUE(dlist->IsEmpty());
     EXPECT_EQ(get_used_memory(), ResourceUsage{});
+    EXPECT_EQ(get_loading_memory(), ResourceUsage{});
     EXPECT_EQ(DLF::get_head(*dlist), nullptr);
     EXPECT_EQ(DLF::get_tail(*dlist), nullptr);
 }
 
-TEST_F(DListTest, UpdateLimitIncrease) {
+TEST_F(DListTest, UpdateMaxLimitIncrease) {
     MockListNode* node1 = add_and_load_node({10, 5});
-    EXPECT_EQ(get_used_memory(), node1->size());
+    EXPECT_EQ(get_used_memory(), node1->loaded_size());
 
     ResourceUsage new_limit{200, 100};
-    EXPECT_TRUE(dlist->UpdateLimit(new_limit));
+    EXPECT_TRUE(dlist->UpdateMaxLimit(new_limit));
 
-    EXPECT_EQ(get_used_memory(), node1->size());
+    EXPECT_EQ(get_used_memory(), node1->loaded_size());
     DLF::verify_list(dlist.get(), {node1});
 }
 
-TEST_F(DListTest, UpdateLimitDecreaseNoEviction) {
+TEST_F(DListTest, UpdateMaxLimitDecreaseNoEviction) {
     MockListNode* node1 = add_and_load_node({10, 5});
-    ResourceUsage current_usage = node1->size();
+    ResourceUsage current_usage = node1->loaded_size();
     ASSERT_EQ(get_used_memory(), current_usage);
 
     ResourceUsage new_limit{50, 25};
     dlist->UpdateLowWatermark({40, 20});
     dlist->UpdateHighWatermark({50, 25});
-    EXPECT_TRUE(dlist->UpdateLimit(new_limit));
+    EXPECT_TRUE(dlist->UpdateMaxLimit(new_limit));
 
     EXPECT_EQ(get_used_memory(), current_usage);
     DLF::verify_list(dlist.get(), {node1});
 }
 
-TEST_F(DListTest, UpdateLimitDecreaseWithEvictionLRU) {
+TEST_F(DListTest, UpdateMaxLimitDecreaseWithEvictionLRU) {
     MockListNode* node1 = add_and_load_node({50, 20}, "key1");
     MockListNode* node2 = add_and_load_node({50, 30}, "key2");
-    ResourceUsage usage_node1 = node1->size();
-    ResourceUsage usage_node2 = node2->size();
+    ResourceUsage usage_node1 = node1->loaded_size();
+    ResourceUsage usage_node2 = node2->loaded_size();
     DLF::verify_list(dlist.get(), {node1, node2});
     EXPECT_EQ(get_used_memory(), usage_node1 + usage_node2);
     EXPECT_EQ(get_used_memory(), DLF::get_max_memory(*dlist));
@@ -137,20 +143,20 @@ TEST_F(DListTest, UpdateLimitDecreaseWithEvictionLRU) {
     ResourceUsage new_limit{70, 40};
     dlist->UpdateLowWatermark({56, 32});
     dlist->UpdateHighWatermark({70, 40});
-    EXPECT_TRUE(dlist->UpdateLimit(new_limit));
+    EXPECT_TRUE(dlist->UpdateMaxLimit(new_limit));
 
     EXPECT_EQ(get_used_memory(), usage_node2);
     DLF::verify_list(dlist.get(), {node2});
     EXPECT_FALSE(dlist->IsEmpty());
 }
 
-TEST_F(DListTest, UpdateLimitDecreaseWithEvictionMultiple) {
+TEST_F(DListTest, UpdateMaxLimitDecreaseWithEvictionMultiple) {
     MockListNode* node1 = add_and_load_node({30, 10}, "key1");
     MockListNode* node2 = add_and_load_node({30, 10}, "key2");
     MockListNode* node3 = add_and_load_node({30, 10}, "key3");
-    ResourceUsage usage_node1 = node1->size();
-    ResourceUsage usage_node2 = node2->size();
-    ResourceUsage usage_node3 = node3->size();
+    ResourceUsage usage_node1 = node1->loaded_size();
+    ResourceUsage usage_node2 = node2->loaded_size();
+    ResourceUsage usage_node3 = node3->loaded_size();
     DLF::verify_list(dlist.get(), {node1, node2, node3});
     ASSERT_EQ(get_used_memory(), usage_node1 + usage_node2 + usage_node3);
 
@@ -161,17 +167,17 @@ TEST_F(DListTest, UpdateLimitDecreaseWithEvictionMultiple) {
     ResourceUsage new_limit{40, 15};
     dlist->UpdateLowWatermark({32, 12});
     dlist->UpdateHighWatermark({40, 15});
-    EXPECT_TRUE(dlist->UpdateLimit(new_limit));
+    EXPECT_TRUE(dlist->UpdateMaxLimit(new_limit));
 
     EXPECT_EQ(get_used_memory(), usage_node3);
     DLF::verify_list(dlist.get(), {node3});
 }
 
-TEST_F(DListTest, UpdateLimitSkipsPinned) {
+TEST_F(DListTest, UpdateMaxLimitSkipsPinned) {
     MockListNode* node1 = add_and_load_node({40, 15}, "key1", 0, 1);
     MockListNode* node2 = add_and_load_node({50, 25}, "key2");
-    ResourceUsage usage_node1 = node1->size();
-    ResourceUsage usage_node2 = node2->size();
+    ResourceUsage usage_node1 = node1->loaded_size();
+    ResourceUsage usage_node2 = node2->loaded_size();
     DLF::verify_list(dlist.get(), {node1, node2});
     ASSERT_EQ(get_used_memory(), usage_node1 + usage_node2);
 
@@ -181,13 +187,13 @@ TEST_F(DListTest, UpdateLimitSkipsPinned) {
     ResourceUsage new_limit{70, 40};
     dlist->UpdateLowWatermark({56, 32});
     dlist->UpdateHighWatermark({70, 40});
-    EXPECT_TRUE(dlist->UpdateLimit(new_limit));
+    EXPECT_TRUE(dlist->UpdateMaxLimit(new_limit));
 
     EXPECT_EQ(get_used_memory(), usage_node1);
     DLF::verify_list(dlist.get(), {node1});
 }
 
-TEST_F(DListTest, UpdateLimitToZero) {
+TEST_F(DListTest, UpdateMaxLimitToZero) {
     MockListNode* node1 = add_and_load_node({10, 0});
     MockListNode* node2 = add_and_load_node({0, 5});
     EXPECT_CALL(*node1, clear_data()).Times(1);
@@ -195,28 +201,28 @@ TEST_F(DListTest, UpdateLimitToZero) {
 
     dlist->UpdateLowWatermark({0, 0});
     dlist->UpdateHighWatermark({1, 1});
-    EXPECT_TRUE(dlist->UpdateLimit({1, 1}));
+    EXPECT_TRUE(dlist->UpdateMaxLimit({1, 1}));
 
     EXPECT_EQ(get_used_memory(), ResourceUsage{});
     EXPECT_TRUE(dlist->IsEmpty());
 }
 
-TEST_F(DListTest, UpdateLimitInvalid) {
-    EXPECT_THROW(dlist->UpdateLimit({-10, 0}), milvus::SegcoreError);
-    EXPECT_THROW(dlist->UpdateLimit({0, -5}), milvus::SegcoreError);
+TEST_F(DListTest, UpdateMaxLimitInvalid) {
+    EXPECT_THROW(dlist->UpdateMaxLimit({-10, 0}), milvus::SegcoreError);
+    EXPECT_THROW(dlist->UpdateMaxLimit({0, -5}), milvus::SegcoreError);
 }
 
 TEST_F(DListTest, ReserveMemorySufficient) {
     ResourceUsage size{20, 10};
     EXPECT_TRUE(reserveMemorySync(size));
-    EXPECT_EQ(get_used_memory(), size);
+    EXPECT_EQ(get_loading_memory(), size);
 }
 
 TEST_F(DListTest, ReserveMemoryRequiresEviction) {
     MockListNode* node1 = add_and_load_node({40, 15}, "key1");
     MockListNode* node2 = add_and_load_node({50, 25}, "key2");
-    ResourceUsage usage_node1 = node1->size();
-    ResourceUsage usage_node2 = node2->size();
+    ResourceUsage usage_node1 = node1->loaded_size();
+    ResourceUsage usage_node2 = node2->loaded_size();
     DLF::verify_list(dlist.get(), {node1, node2});
 
     ASSERT_EQ(get_used_memory(), usage_node1 + usage_node2);
@@ -237,8 +243,8 @@ TEST_F(DListTest, ReserveMemoryRequiresEviction) {
 TEST_F(DListTest, ReserveMemoryEvictPinnedSkipped) {
     MockListNode* node_pinned = add_and_load_node({40, 15}, "key_pinned", 0, 1);
     MockListNode* node_evict = add_and_load_node({50, 25}, "key_evict");
-    ResourceUsage usage_pinned = node_pinned->size();
-    ResourceUsage usage_evict = node_evict->size();
+    ResourceUsage usage_pinned = node_pinned->loaded_size();
+    ResourceUsage usage_evict = node_evict->loaded_size();
     DLF::verify_list(dlist.get(), {node_pinned, node_evict});
 
     ASSERT_EQ(get_used_memory(), usage_pinned + usage_evict);
@@ -256,8 +262,8 @@ TEST_F(DListTest, ReserveMemoryEvictPinnedSkipped) {
 TEST_F(DListTest, ReserveMemoryEvictLockedSkipped) {
     MockListNode* node_locked = add_and_load_node({40, 15}, "key_locked");
     MockListNode* node_evict = add_and_load_node({50, 25}, "key_evict");
-    ResourceUsage usage_locked = node_locked->size();
-    ResourceUsage usage_evict = node_evict->size();
+    ResourceUsage usage_locked = node_locked->loaded_size();
+    ResourceUsage usage_evict = node_evict->loaded_size();
     DLF::verify_list(dlist.get(), {node_locked, node_evict});
 
     ASSERT_EQ(get_used_memory(), usage_locked + usage_evict);
@@ -279,7 +285,7 @@ TEST_F(DListTest, ReserveMemoryEvictLockedSkipped) {
 
 TEST_F(DListTest, ReserveMemoryInsufficientEvenWithEviction) {
     MockListNode* node1 = add_and_load_node({10, 5});
-    ResourceUsage usage_node1 = node1->size();
+    ResourceUsage usage_node1 = node1->loaded_size();
     ASSERT_EQ(get_used_memory(), usage_node1);
 
     ResourceUsage reserve_size{200, 100};
@@ -348,7 +354,7 @@ TEST_F(DListTest, releaseMemory) {
     ASSERT_EQ(get_used_memory(), initial_size);
 
     ResourceUsage failed_load_size{10, 5};
-    dlist->releaseMemory(failed_load_size);
+    dlist->releaseLoadingResource(failed_load_size);
 
     EXPECT_EQ(get_used_memory(), initial_size - failed_load_size);
 }
@@ -356,8 +362,8 @@ TEST_F(DListTest, releaseMemory) {
 TEST_F(DListTest, ReserveMemoryEvictOnlyMemoryNeeded) {
     MockListNode* node_disk_only = add_and_load_node({0, 20}, "disk_only");
     MockListNode* node_mixed = add_and_load_node({50, 10}, "mixed");
-    ResourceUsage usage_disk = node_disk_only->size();
-    ResourceUsage usage_mixed = node_mixed->size();
+    ResourceUsage usage_disk = node_disk_only->loaded_size();
+    ResourceUsage usage_mixed = node_mixed->loaded_size();
     DLF::verify_list(dlist.get(), {node_disk_only, node_mixed});
     ASSERT_EQ(get_used_memory(), usage_disk + usage_mixed);
 
@@ -376,8 +382,8 @@ TEST_F(DListTest, ReserveMemoryEvictOnlyMemoryNeeded) {
 TEST_F(DListTest, ReserveMemoryEvictOnlyDiskNeeded) {
     MockListNode* node_memory_only = add_and_load_node({40, 0}, "memory_only");
     MockListNode* node_mixed = add_and_load_node({20, 25}, "mixed");
-    ResourceUsage usage_memory = node_memory_only->size();
-    ResourceUsage usage_mixed = node_mixed->size();
+    ResourceUsage usage_memory = node_memory_only->loaded_size();
+    ResourceUsage usage_mixed = node_mixed->loaded_size();
     DLF::verify_list(dlist.get(), {node_memory_only, node_mixed});
     ASSERT_EQ(get_used_memory(), usage_memory + usage_mixed);
 
@@ -397,9 +403,9 @@ TEST_F(DListTest, ReserveMemoryEvictBothNeeded) {
     MockListNode* node1 = add_and_load_node({30, 5}, "node1");
     MockListNode* node2 = add_and_load_node({10, 15}, "node2");
     MockListNode* node3 = add_and_load_node({50, 25}, "node3");
-    ResourceUsage usage1 = node1->size();
-    ResourceUsage usage2 = node2->size();
-    ResourceUsage usage3 = node3->size();
+    ResourceUsage usage1 = node1->loaded_size();
+    ResourceUsage usage2 = node2->loaded_size();
+    ResourceUsage usage3 = node3->loaded_size();
     DLF::verify_list(dlist.get(), {node1, node2, node3});
     ASSERT_EQ(get_used_memory(), usage1 + usage2 + usage3);
 
@@ -418,8 +424,8 @@ TEST_F(DListTest, ReserveToAboveLowWatermarkNoEviction) {
     // initial 40, 20
     MockListNode* node1 = add_and_load_node({30, 5}, "node1");
     MockListNode* node2 = add_and_load_node({10, 15}, "node2");
-    ResourceUsage usage1 = node1->size();
-    ResourceUsage usage2 = node2->size();
+    ResourceUsage usage1 = node1->loaded_size();
+    ResourceUsage usage2 = node2->loaded_size();
     DLF::verify_list(dlist.get(), {node1, node2});
     ASSERT_EQ(get_used_memory(), usage1 + usage2);
 
@@ -435,8 +441,8 @@ TEST_F(DListTest, ReserveToAboveHighWatermarkNoEvictionThenAutoEviction) {
     // initial 40, 20
     MockListNode* node1 = add_and_load_node({30, 15}, "node1");
     MockListNode* node2 = add_and_load_node({10, 5}, "node2");
-    ResourceUsage usage1 = node1->size();
-    ResourceUsage usage2 = node2->size();
+    ResourceUsage usage1 = node1->loaded_size();
+    ResourceUsage usage2 = node2->loaded_size();
     DLF::verify_list(dlist.get(), {node1, node2});
     ASSERT_EQ(get_used_memory(), usage1 + usage2);
 
@@ -459,8 +465,8 @@ TEST_F(DListTest, ReserveToAboveHighWatermarkNoEvictionThenAutoEviction) {
 TEST_F(DListTest, ReserveMemoryFailsAllPinned) {
     MockListNode* node1 = add_and_load_node({40, 15}, "key1", 0, 1);
     MockListNode* node2 = add_and_load_node({50, 25}, "key2", 0, 1);
-    ResourceUsage usage_node1 = node1->size();
-    ResourceUsage usage_node2 = node2->size();
+    ResourceUsage usage_node1 = node1->loaded_size();
+    ResourceUsage usage_node2 = node2->loaded_size();
     DLF::verify_list(dlist.get(), {node1, node2});
     ASSERT_EQ(get_used_memory(), usage_node1 + usage_node2);
 
@@ -477,8 +483,8 @@ TEST_F(DListTest, ReserveMemoryFailsAllPinned) {
 TEST_F(DListTest, ReserveMemoryFailsAllLocked) {
     MockListNode* node1 = add_and_load_node({40, 15}, "key1");
     MockListNode* node2 = add_and_load_node({50, 25}, "key2");
-    ResourceUsage usage_node1 = node1->size();
-    ResourceUsage usage_node2 = node2->size();
+    ResourceUsage usage_node1 = node1->loaded_size();
+    ResourceUsage usage_node2 = node2->loaded_size();
     DLF::verify_list(dlist.get(), {node1, node2});
     ASSERT_EQ(get_used_memory(), usage_node1 + usage_node2);
 
@@ -501,8 +507,8 @@ TEST_F(DListTest, ReserveMemoryFailsAllLocked) {
 TEST_F(DListTest, ReserveMemoryFailsSpecificPinned) {
     MockListNode* node_evict = add_and_load_node({80, 40}, "evict_candidate", 0, 1);
     MockListNode* node_small = add_and_load_node({9, 4}, "small");
-    ResourceUsage usage_evict = node_evict->size();
-    ResourceUsage usage_small = node_small->size();
+    ResourceUsage usage_evict = node_evict->loaded_size();
+    ResourceUsage usage_small = node_small->loaded_size();
     DLF::verify_list(dlist.get(), {node_evict, node_small});
     ASSERT_EQ(get_used_memory(), usage_evict + usage_small);
 
@@ -519,8 +525,8 @@ TEST_F(DListTest, ReserveMemoryFailsSpecificPinned) {
 TEST_F(DListTest, ReserveMemoryFailsSpecificLocked) {
     MockListNode* node_evict = add_and_load_node({80, 40}, "evict_candidate");
     MockListNode* node_small = add_and_load_node({9, 4}, "small");
-    ResourceUsage usage_evict = node_evict->size();
-    ResourceUsage usage_small = node_small->size();
+    ResourceUsage usage_evict = node_evict->loaded_size();
+    ResourceUsage usage_small = node_small->loaded_size();
     DLF::verify_list(dlist.get(), {node_evict, node_small});
     ASSERT_EQ(get_used_memory(), usage_evict + usage_small);
 
@@ -561,11 +567,11 @@ TEST_F(DListTest, RemoveItemFromList) {
 
     {
         std::unique_lock node_lock(node1->test_get_mutex());
-        dlist->removeItem(node1, node1->size());
+        dlist->removeItem(node1, node1->loaded_size());
     }
 
     DLF::verify_list(dlist.get(), {node2});
-    EXPECT_EQ(get_used_memory(), node2->size());
+    EXPECT_EQ(get_used_memory(), node2->loaded_size());
 }
 
 TEST_F(DListTest, PopItemNotPresent) {
@@ -586,11 +592,11 @@ TEST_F(DListTest, PopItemNotPresent) {
     EXPECT_EQ(get_used_memory(), initial_usage);
 }
 
-TEST_F(DListTest, UpdateLimitIncreaseMemDecreaseDisk) {
+TEST_F(DListTest, UpdateMaxLimitIncreaseMemDecreaseDisk) {
     MockListNode* node1 = add_and_load_node({20, 30}, "node1");
     MockListNode* node2 = add_and_load_node({30, 10}, "node2");
-    ResourceUsage usage1 = node1->size();
-    ResourceUsage usage2 = node2->size();
+    ResourceUsage usage1 = node1->loaded_size();
+    ResourceUsage usage2 = node2->loaded_size();
     DLF::verify_list(dlist.get(), {node1, node2});
     ASSERT_EQ(get_used_memory(), usage1 + usage2);
 
@@ -600,7 +606,7 @@ TEST_F(DListTest, UpdateLimitIncreaseMemDecreaseDisk) {
     ResourceUsage new_limit{200, 35};
     dlist->UpdateLowWatermark({90, 34});
     dlist->UpdateHighWatermark({90, 34});
-    EXPECT_TRUE(dlist->UpdateLimit(new_limit));
+    EXPECT_TRUE(dlist->UpdateMaxLimit(new_limit));
 
     EXPECT_EQ(get_used_memory(), usage2);
     DLF::verify_list(dlist.get(), {node2});
@@ -610,8 +616,8 @@ TEST_F(DListTest, UpdateLimitIncreaseMemDecreaseDisk) {
 TEST_F(DListTest, EvictedNodeDestroyed) {
     MockListNode* node1 = add_and_load_node({40, 15}, "node1");
     MockListNode* node2 = add_and_load_node({50, 25}, "node2");
-    ResourceUsage usage1 = node1->size();
-    ResourceUsage usage2 = node2->size();
+    ResourceUsage usage1 = node1->loaded_size();
+    ResourceUsage usage2 = node2->loaded_size();
     DLF::verify_list(dlist.get(), {node1, node2});
     ASSERT_EQ(managed_nodes.size(), 2);
     ASSERT_EQ(get_used_memory(), usage1 + usage2);
@@ -621,7 +627,7 @@ TEST_F(DListTest, EvictedNodeDestroyed) {
     ResourceUsage new_limit{70, 40};
     dlist->UpdateLowWatermark({56, 32});
     dlist->UpdateHighWatermark({70, 40});
-    EXPECT_TRUE(dlist->UpdateLimit(new_limit));
+    EXPECT_TRUE(dlist->UpdateMaxLimit(new_limit));
     DLF::verify_list(dlist.get(), {node2});
     ResourceUsage memory_after_eviction = get_used_memory();
     ASSERT_EQ(memory_after_eviction, usage2);
@@ -640,8 +646,8 @@ TEST_F(DListTest, EvictedNodeDestroyed) {
 TEST_F(DListTest, NodeInListDestroyed) {
     MockListNode* node1 = add_and_load_node({40, 15}, "node1");
     MockListNode* node2 = add_and_load_node({50, 25}, "node2");
-    ResourceUsage usage1 = node1->size();
-    ResourceUsage usage2 = node2->size();
+    ResourceUsage usage1 = node1->loaded_size();
+    ResourceUsage usage2 = node2->loaded_size();
     DLF::verify_list(dlist.get(), {node1, node2});
     ASSERT_EQ(managed_nodes.size(), 2);
     ResourceUsage memory_before_destroy = get_used_memory();
@@ -691,15 +697,15 @@ TEST_F(DListTest, ReserveMemoryUsesLowWatermark) {
     initial_limit = {100, 100};
     low_watermark = {80, 80};
     high_watermark = {90, 90};
-    EXPECT_TRUE(dlist->UpdateLimit(initial_limit));
+    EXPECT_TRUE(dlist->UpdateMaxLimit(initial_limit));
     dlist->UpdateHighWatermark(high_watermark);
     dlist->UpdateLowWatermark(low_watermark);
 
     // Add nodes totaling 95/95 usage (above high watermark)
     MockListNode* node1 = add_and_load_node({45, 45}, "node1");  // Tail
     MockListNode* node2 = add_and_load_node({50, 50}, "node2");  // Head
-    ResourceUsage usage1 = node1->size();
-    ResourceUsage usage2 = node2->size();
+    ResourceUsage usage1 = node1->loaded_size();
+    ResourceUsage usage2 = node2->loaded_size();
     DLF::verify_list(dlist.get(), {node1, node2});
     ASSERT_EQ(get_used_memory(), usage1 + usage2);  // 95, 95
 

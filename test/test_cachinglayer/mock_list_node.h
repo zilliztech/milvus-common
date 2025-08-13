@@ -22,7 +22,7 @@ namespace milvus::cachinglayer::internal {
 class MockListNode : public ListNode {
  public:
     MockListNode(DList* dlist, ResourceUsage size, const std::string& key = "mock_key", cid_t cid = 0)
-        : ListNode(dlist, size, true), mock_key_(fmt::format("{}:{}", key, cid)) {
+        : ListNode(dlist, true), mock_key_(fmt::format("{}:{}", key, cid)) {
         ON_CALL(*this, clear_data).WillByDefault([this]() {
             unload();
             state_ = State::NOT_LOADED;
