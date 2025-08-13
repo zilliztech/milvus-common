@@ -160,8 +160,7 @@ static constexpr int8_t min_lookups = 4;
 template <typename T>
 struct sherwood_v3_entry {
     sherwood_v3_entry() = default;
-    sherwood_v3_entry(int8_t distance_from_desired)
-        : distance_from_desired(distance_from_desired) {
+    sherwood_v3_entry(int8_t distance_from_desired) : distance_from_desired(distance_from_desired) {
     }
     ~sherwood_v3_entry() = default;
 
@@ -200,11 +199,10 @@ struct sherwood_v3_entry {
 inline int8_t
 log2(uint64_t value) {
     // NOLINTNEXTLINE(*c-arrays*)
-    static constexpr int8_t table[64] = {
-        63, 0,  58, 1,  59, 47, 53, 2,  60, 39, 48, 27, 54, 33, 42, 3,
-        61, 51, 37, 40, 49, 18, 28, 20, 55, 30, 34, 11, 43, 14, 22, 4,
-        62, 57, 46, 52, 38, 26, 32, 41, 50, 36, 17, 19, 29, 10, 13, 21,
-        56, 45, 25, 31, 35, 16, 9,  12, 44, 24, 15, 8,  23, 7,  6,  5};
+    static constexpr int8_t table[64] = {63, 0,  58, 1,  59, 47, 53, 2,  60, 39, 48, 27, 54, 33, 42, 3,
+                                         61, 51, 37, 40, 49, 18, 28, 20, 55, 30, 34, 11, 43, 14, 22, 4,
+                                         62, 57, 46, 52, 38, 26, 32, 41, 50, 36, 17, 19, 29, 10, 13, 21,
+                                         56, 45, 25, 31, 35, 16, 9,  12, 44, 24, 15, 8,  23, 7,  6,  5};
     value |= value >> 1;
     value |= value >> 2;
     value |= value >> 4;
@@ -245,17 +243,9 @@ struct HashPolicySelector<T, void_t<typename T::hash_policy>> {
     typedef typename T::hash_policy type;
 };
 
-template <typename T,
-          typename FindKey,
-          typename ArgumentHash,
-          typename DetailHasher,
-          typename ArgumentEqual,
-          typename Equal,
-          typename ArgumentAlloc,
-          typename EntryAlloc>
-class sherwood_v3_table : private EntryAlloc,
-                          private DetailHasher,
-                          private Equal {
+template <typename T, typename FindKey, typename ArgumentHash, typename DetailHasher, typename ArgumentEqual,
+          typename Equal, typename ArgumentAlloc, typename EntryAlloc>
+class sherwood_v3_table : private EntryAlloc, private DetailHasher, private Equal {
     using Entry = detailv3::sherwood_v3_entry<T>;
     using AllocatorTraits = std::allocator_traits<EntryAlloc>;
     using EntryPointer = typename AllocatorTraits::pointer;
@@ -275,89 +265,54 @@ class sherwood_v3_table : private EntryAlloc,
     using const_pointer = const value_type*;
 
     sherwood_v3_table() = default;
-    explicit sherwood_v3_table(size_type bucket_count,
-                               const ArgumentHash& hash = ArgumentHash(),
+    explicit sherwood_v3_table(size_type bucket_count, const ArgumentHash& hash = ArgumentHash(),
                                const ArgumentEqual& equal = ArgumentEqual(),
                                const ArgumentAlloc& alloc = ArgumentAlloc())
         : EntryAlloc(alloc), DetailHasher(hash), Equal(equal) {
         rehash(bucket_count);
     }
     sherwood_v3_table(size_type bucket_count, const ArgumentAlloc& alloc)
-        : sherwood_v3_table(
-              bucket_count, ArgumentHash(), ArgumentEqual(), alloc) {
+        : sherwood_v3_table(bucket_count, ArgumentHash(), ArgumentEqual(), alloc) {
     }
-    sherwood_v3_table(size_type bucket_count,
-                      const ArgumentHash& hash,
-                      const ArgumentAlloc& alloc)
+    sherwood_v3_table(size_type bucket_count, const ArgumentHash& hash, const ArgumentAlloc& alloc)
         : sherwood_v3_table(bucket_count, hash, ArgumentEqual(), alloc) {
     }
     explicit sherwood_v3_table(const ArgumentAlloc& alloc) : EntryAlloc(alloc) {
     }
     template <typename It>
-    sherwood_v3_table(It first,
-                      It last,
-                      size_type bucket_count = 0,
-                      const ArgumentHash& hash = ArgumentHash(),
-                      const ArgumentEqual& equal = ArgumentEqual(),
-                      const ArgumentAlloc& alloc = ArgumentAlloc())
+    sherwood_v3_table(It first, It last, size_type bucket_count = 0, const ArgumentHash& hash = ArgumentHash(),
+                      const ArgumentEqual& equal = ArgumentEqual(), const ArgumentAlloc& alloc = ArgumentAlloc())
         : sherwood_v3_table(bucket_count, hash, equal, alloc) {
         insert(first, last);
     }
     template <typename It>
-    sherwood_v3_table(It first,
-                      It last,
-                      size_type bucket_count,
-                      const ArgumentAlloc& alloc)
-        : sherwood_v3_table(first,
-                            last,
-                            bucket_count,
-                            ArgumentHash(),
-                            ArgumentEqual(),
-                            alloc) {
+    sherwood_v3_table(It first, It last, size_type bucket_count, const ArgumentAlloc& alloc)
+        : sherwood_v3_table(first, last, bucket_count, ArgumentHash(), ArgumentEqual(), alloc) {
     }
     template <typename It>
-    sherwood_v3_table(It first,
-                      It last,
-                      size_type bucket_count,
-                      const ArgumentHash& hash,
-                      const ArgumentAlloc& alloc)
-        : sherwood_v3_table(
-              first, last, bucket_count, hash, ArgumentEqual(), alloc) {
+    sherwood_v3_table(It first, It last, size_type bucket_count, const ArgumentHash& hash, const ArgumentAlloc& alloc)
+        : sherwood_v3_table(first, last, bucket_count, hash, ArgumentEqual(), alloc) {
     }
-    sherwood_v3_table(std::initializer_list<T> il,
-                      size_type bucket_count = 0,
-                      const ArgumentHash& hash = ArgumentHash(),
-                      const ArgumentEqual& equal = ArgumentEqual(),
+    sherwood_v3_table(std::initializer_list<T> il, size_type bucket_count = 0,
+                      const ArgumentHash& hash = ArgumentHash(), const ArgumentEqual& equal = ArgumentEqual(),
                       const ArgumentAlloc& alloc = ArgumentAlloc())
         : sherwood_v3_table(bucket_count, hash, equal, alloc) {
         if (bucket_count == 0)
             rehash(il.size());
         insert(il.begin(), il.end());
     }
-    sherwood_v3_table(std::initializer_list<T> il,
-                      size_type bucket_count,
-                      const ArgumentAlloc& alloc)
-        : sherwood_v3_table(
-              il, bucket_count, ArgumentHash(), ArgumentEqual(), alloc) {
+    sherwood_v3_table(std::initializer_list<T> il, size_type bucket_count, const ArgumentAlloc& alloc)
+        : sherwood_v3_table(il, bucket_count, ArgumentHash(), ArgumentEqual(), alloc) {
     }
-    sherwood_v3_table(std::initializer_list<T> il,
-                      size_type bucket_count,
-                      const ArgumentHash& hash,
+    sherwood_v3_table(std::initializer_list<T> il, size_type bucket_count, const ArgumentHash& hash,
                       const ArgumentAlloc& alloc)
         : sherwood_v3_table(il, bucket_count, hash, ArgumentEqual(), alloc) {
     }
     sherwood_v3_table(const sherwood_v3_table& other)
-        : sherwood_v3_table(
-              other,
-              AllocatorTraits::select_on_container_copy_construction(
-                  other.get_allocator())) {
+        : sherwood_v3_table(other, AllocatorTraits::select_on_container_copy_construction(other.get_allocator())) {
     }
-    sherwood_v3_table(const sherwood_v3_table& other,
-                      const ArgumentAlloc& alloc)
-        : EntryAlloc(alloc),
-          DetailHasher(other),
-          Equal(other),
-          _max_load_factor(other._max_load_factor) {
+    sherwood_v3_table(const sherwood_v3_table& other, const ArgumentAlloc& alloc)
+        : EntryAlloc(alloc), DetailHasher(other), Equal(other), _max_load_factor(other._max_load_factor) {
         rehash_for_other_container(other);
         try {
             insert(other.begin(), other.end());
@@ -368,16 +323,11 @@ class sherwood_v3_table : private EntryAlloc,
         }
     }
     sherwood_v3_table(sherwood_v3_table&& other) noexcept
-        : EntryAlloc(std::move(other)),
-          DetailHasher(std::move(other)),
-          Equal(std::move(other)) {
+        : EntryAlloc(std::move(other)), DetailHasher(std::move(other)), Equal(std::move(other)) {
         swap_pointers(other);
     }
-    sherwood_v3_table(sherwood_v3_table&& other,
-                      const ArgumentAlloc& alloc) noexcept
-        : EntryAlloc(alloc),
-          DetailHasher(std::move(other)),
-          Equal(std::move(other)) {
+    sherwood_v3_table(sherwood_v3_table&& other, const ArgumentAlloc& alloc) noexcept
+        : EntryAlloc(alloc), DetailHasher(std::move(other)), Equal(std::move(other)) {
         swap_pointers(other);
     }
     sherwood_v3_table&
@@ -386,10 +336,8 @@ class sherwood_v3_table : private EntryAlloc,
             return *this;
 
         clear();
-        if constexpr (AllocatorTraits::propagate_on_container_copy_assignment::
-                          value) {
-            if (static_cast<EntryAlloc&>(*this) !=
-                static_cast<const EntryAlloc&>(other)) {
+        if constexpr (AllocatorTraits::propagate_on_container_copy_assignment::value) {
+            if (static_cast<EntryAlloc&>(*this) != static_cast<const EntryAlloc&>(other)) {
                 reset_to_empty_state();
             }
             static_cast<EntryAlloc&>(*this) = other;
@@ -405,14 +353,12 @@ class sherwood_v3_table : private EntryAlloc,
     operator=(sherwood_v3_table&& other) noexcept {
         if (this == std::addressof(other))
             return *this;
-        else if constexpr (AllocatorTraits::
-                               propagate_on_container_move_assignment::value) {
+        else if constexpr (AllocatorTraits::propagate_on_container_move_assignment::value) {
             clear();
             reset_to_empty_state();
             static_cast<EntryAlloc&>(*this) = std::move(other);
             swap_pointers(other);
-        } else if (static_cast<EntryAlloc&>(*this) ==
-                   static_cast<EntryAlloc&>(other)) {
+        } else if (static_cast<EntryAlloc&>(*this) == static_cast<EntryAlloc&>(other)) {
             swap_pointers(other);
         } else {
             clear();
@@ -457,13 +403,11 @@ class sherwood_v3_table : private EntryAlloc,
         using reference = ValueType&;
 
         friend bool
-        operator==(const templated_iterator& lhs,
-                   const templated_iterator& rhs) {
+        operator==(const templated_iterator& lhs, const templated_iterator& rhs) {
             return lhs.current == rhs.current;
         }
         friend bool
-        operator!=(const templated_iterator& lhs,
-                   const templated_iterator& rhs) {
+        operator!=(const templated_iterator& lhs, const templated_iterator& rhs) {
             return !(lhs == rhs);
         }
 
@@ -494,9 +438,8 @@ class sherwood_v3_table : private EntryAlloc,
         // already const, because that would cause a lot of compiler warnings
         // otherwise.
         template <class target_type = const value_type,
-                  class = std::enable_if_t<
-                      std::is_same_v<target_type, const value_type> &&
-                      !std::is_same_v<target_type, value_type>>>
+                  class = std::enable_if_t<std::is_same_v<target_type, const value_type> &&
+                                           !std::is_same_v<target_type, value_type>>>
         operator templated_iterator<target_type>() const {
             return {current};
         }
@@ -524,13 +467,11 @@ class sherwood_v3_table : private EntryAlloc,
     }
     iterator
     end() {
-        return {entries +
-                static_cast<ptrdiff_t>(num_slots_minus_one + max_lookups)};
+        return {entries + static_cast<ptrdiff_t>(num_slots_minus_one + max_lookups)};
     }
     const_iterator
     end() const {
-        return {entries +
-                static_cast<ptrdiff_t>(num_slots_minus_one + max_lookups)};
+        return {entries + static_cast<ptrdiff_t>(num_slots_minus_one + max_lookups)};
     }
     const_iterator
     cend() const {
@@ -539,11 +480,9 @@ class sherwood_v3_table : private EntryAlloc,
 
     iterator
     find(const FindKey& key) {
-        uint64_t index =
-            hash_policy.index_for_hash(hash_object(key), num_slots_minus_one);
+        uint64_t index = hash_policy.index_for_hash(hash_object(key), num_slots_minus_one);
         EntryPointer it = entries + ptrdiff_t(index);
-        for (int8_t distance = 0; it->distance_from_desired >= distance;
-             ++distance, ++it) {
+        for (int8_t distance = 0; it->distance_from_desired >= distance; ++distance, ++it) {
             if (compares_equal(key, it->value))
                 return {it};
         }
@@ -578,8 +517,7 @@ class sherwood_v3_table : private EntryAlloc,
     template <typename Key, typename... Args>
     std::pair<iterator, bool>
     emplace(Key&& key, Args&&... args) {
-        uint64_t index =
-            hash_policy.index_for_hash(hash_object(key), num_slots_minus_one);
+        uint64_t index = hash_policy.index_for_hash(hash_object(key), num_slots_minus_one);
         EntryPointer current_entry = entries + ptrdiff_t(index);
         int8_t distance_from_desired = 0;
         for (; current_entry->distance_from_desired >= distance_from_desired;
@@ -587,9 +525,7 @@ class sherwood_v3_table : private EntryAlloc,
             if (compares_equal(key, current_entry->value))
                 return {{current_entry}, false};
         }
-        return emplace_new_key(distance_from_desired,
-                               current_entry,
-                               std::forward<Key>(key),
+        return emplace_new_key(distance_from_desired, current_entry, std::forward<Key>(key),
                                std::forward<Args>(args)...);
     }
 
@@ -629,10 +565,8 @@ class sherwood_v3_table : private EntryAlloc,
 
     void
     rehash(uint64_t num_buckets) {
-        num_buckets = std::max(
-            num_buckets,
-            static_cast<uint64_t>(std::ceil(
-                num_elements / static_cast<double>(_max_load_factor))));
+        num_buckets = std::max(num_buckets,
+                               static_cast<uint64_t>(std::ceil(num_elements / static_cast<double>(_max_load_factor))));
         if (num_buckets == 0) {
             reset_to_empty_state();
             return;
@@ -641,13 +575,9 @@ class sherwood_v3_table : private EntryAlloc,
         if (num_buckets == bucket_count())
             return;
         int8_t new_max_lookups = compute_max_lookups(num_buckets);
-        EntryPointer new_buckets(
-            AllocatorTraits::allocate(*this, num_buckets + new_max_lookups));
-        EntryPointer special_end_item =
-            new_buckets +
-            static_cast<ptrdiff_t>(num_buckets + new_max_lookups - 1);
-        for (EntryPointer it = new_buckets; it != special_end_item; ++it)
-            it->distance_from_desired = -1;
+        EntryPointer new_buckets(AllocatorTraits::allocate(*this, num_buckets + new_max_lookups));
+        EntryPointer special_end_item = new_buckets + static_cast<ptrdiff_t>(num_buckets + new_max_lookups - 1);
+        for (EntryPointer it = new_buckets; it != special_end_item; ++it) it->distance_from_desired = -1;
         special_end_item->distance_from_desired = Entry::special_end_value;
         std::swap(entries, new_buckets);
         std::swap(num_slots_minus_one, num_buckets);
@@ -656,10 +586,7 @@ class sherwood_v3_table : private EntryAlloc,
         int8_t old_max_lookups = max_lookups;
         max_lookups = new_max_lookups;
         num_elements = 0;
-        for (EntryPointer it = new_buckets,
-                          end = it + static_cast<ptrdiff_t>(num_buckets +
-                                                            old_max_lookups);
-             it != end;
+        for (EntryPointer it = new_buckets, end = it + static_cast<ptrdiff_t>(num_buckets + old_max_lookups); it != end;
              ++it) {
             if (it->has_value()) {
                 emplace(std::move(it->value));
@@ -685,11 +612,8 @@ class sherwood_v3_table : private EntryAlloc,
         EntryPointer current = to_erase.current;
         current->destroy_value();
         --num_elements;
-        for (EntryPointer next = current + ptrdiff_t(1);
-             !next->is_at_desired_position();
-             ++current, ++next) {
-            current->emplace(next->distance_from_desired - 1,
-                             std::move(next->value));
+        for (EntryPointer next = current + ptrdiff_t(1); !next->is_at_desired_position(); ++current, ++next) {
+            current->emplace(next->distance_from_desired - 1, std::move(next->value));
             next->destroy_value();
         }
         return {to_erase.current};
@@ -699,9 +623,7 @@ class sherwood_v3_table : private EntryAlloc,
     erase(const_iterator begin_it, const_iterator end_it) {
         if (begin_it == end_it)
             return {begin_it.current};
-        for (EntryPointer it = begin_it.current, end = end_it.current;
-             it != end;
-             ++it) {
+        for (EntryPointer it = begin_it.current, end = end_it.current; it != end; ++it) {
             if (it->has_value()) {
                 it->destroy_value();
                 --num_elements;
@@ -709,18 +631,15 @@ class sherwood_v3_table : private EntryAlloc,
         }
         if (end_it == this->end())
             return this->end();
-        ptrdiff_t num_to_move = std::min(
-            static_cast<ptrdiff_t>(end_it.current->distance_from_desired),
-            end_it.current - begin_it.current);
+        ptrdiff_t num_to_move =
+            std::min(static_cast<ptrdiff_t>(end_it.current->distance_from_desired), end_it.current - begin_it.current);
         EntryPointer to_return = end_it.current - num_to_move;
         for (EntryPointer it = end_it.current; !it->is_at_desired_position();) {
             EntryPointer target = it - num_to_move;
-            target->emplace(it->distance_from_desired - num_to_move,
-                            std::move(it->value));
+            target->emplace(it->distance_from_desired - num_to_move, std::move(it->value));
             it->destroy_value();
             ++it;
-            num_to_move = std::min(
-                static_cast<ptrdiff_t>(it->distance_from_desired), num_to_move);
+            num_to_move = std::min(static_cast<ptrdiff_t>(it->distance_from_desired), num_to_move);
         }
         return {to_return};
     }
@@ -738,10 +657,7 @@ class sherwood_v3_table : private EntryAlloc,
 
     void
     clear() {
-        for (EntryPointer it = entries,
-                          end = it + static_cast<ptrdiff_t>(
-                                         num_slots_minus_one + max_lookups);
-             it != end;
+        for (EntryPointer it = entries, end = it + static_cast<ptrdiff_t>(num_slots_minus_one + max_lookups); it != end;
              ++it) {
             if (it->has_value())
                 it->destroy_value();
@@ -758,13 +674,10 @@ class sherwood_v3_table : private EntryAlloc,
     swap(sherwood_v3_table& other) noexcept {
         using std::swap;
         swap_pointers(other);
-        swap(static_cast<ArgumentHash&>(*this),
-             static_cast<ArgumentHash&>(other));
-        swap(static_cast<ArgumentEqual&>(*this),
-             static_cast<ArgumentEqual&>(other));
+        swap(static_cast<ArgumentHash&>(*this), static_cast<ArgumentHash&>(other));
+        swap(static_cast<ArgumentEqual&>(*this), static_cast<ArgumentEqual&>(other));
         if (AllocatorTraits::propagate_on_container_swap::value)
-            swap(static_cast<EntryAlloc&>(*this),
-                 static_cast<EntryAlloc&>(other));
+            swap(static_cast<EntryAlloc&>(*this), static_cast<EntryAlloc&>(other));
     }
 
     uint64_t
@@ -785,8 +698,7 @@ class sherwood_v3_table : private EntryAlloc,
     }
     uint64_t
     bucket(const FindKey& key) const {
-        return hash_policy.index_for_hash(hash_object(key),
-                                          num_slots_minus_one);
+        return hash_policy.index_for_hash(hash_object(key), num_slots_minus_one);
     }
     float
     load_factor() const {
@@ -820,12 +732,9 @@ class sherwood_v3_table : private EntryAlloc,
 
     EntryPointer
     empty_default_table() {
-        EntryPointer result =
-            AllocatorTraits::allocate(*this, detailv3::min_lookups);
-        EntryPointer special_end_item =
-            result + static_cast<ptrdiff_t>(detailv3::min_lookups - 1);
-        for (EntryPointer it = result; it != special_end_item; ++it)
-            it->distance_from_desired = -1;
+        EntryPointer result = AllocatorTraits::allocate(*this, detailv3::min_lookups);
+        EntryPointer special_end_item = result + static_cast<ptrdiff_t>(detailv3::min_lookups - 1);
+        for (EntryPointer it = result; it != special_end_item; ++it) it->distance_from_desired = -1;
         special_end_item->distance_from_desired = Entry::special_end_value;
         return result;
     }
@@ -839,13 +748,11 @@ class sherwood_v3_table : private EntryAlloc,
     uint64_t
     num_buckets_for_reserve(uint64_t num_elements_) const {
         return static_cast<uint64_t>(
-            std::ceil(static_cast<double>(num_elements_) /
-                      std::min(0.5, static_cast<double>(_max_load_factor))));
+            std::ceil(static_cast<double>(num_elements_) / std::min(0.5, static_cast<double>(_max_load_factor))));
     }
     void
     rehash_for_other_container(const sherwood_v3_table& other) {
-        rehash(std::min(num_buckets_for_reserve(other.size()),
-                        other.bucket_count()));
+        rehash(std::min(num_buckets_for_reserve(other.size()), other.bucket_count()));
     }
 
     void
@@ -861,38 +768,28 @@ class sherwood_v3_table : private EntryAlloc,
 
     template <typename Key, typename... Args>
     SKA_NOINLINE(std::pair<iterator, bool>)
-    emplace_new_key(int8_t distance_from_desired,
-                    EntryPointer current_entry,
-                    Key&& key,
-                    Args&&... args) {
+    emplace_new_key(int8_t distance_from_desired, EntryPointer current_entry, Key&& key, Args&&... args) {
         using std::swap;
         if (num_slots_minus_one == 0 || distance_from_desired == max_lookups ||
-            num_elements + 1 > (num_slots_minus_one + 1) *
-                                   static_cast<double>(_max_load_factor)) {
+            num_elements + 1 > (num_slots_minus_one + 1) * static_cast<double>(_max_load_factor)) {
             grow();
             return emplace(std::forward<Key>(key), std::forward<Args>(args)...);
         } else if (current_entry->is_empty()) {
-            current_entry->emplace(distance_from_desired,
-                                   std::forward<Key>(key),
-                                   std::forward<Args>(args)...);
+            current_entry->emplace(distance_from_desired, std::forward<Key>(key), std::forward<Args>(args)...);
             ++num_elements;
             return {{current_entry}, true};
         }
-        value_type to_insert(std::forward<Key>(key),
-                             std::forward<Args>(args)...);
+        value_type to_insert(std::forward<Key>(key), std::forward<Args>(args)...);
         swap(distance_from_desired, current_entry->distance_from_desired);
         swap(to_insert, current_entry->value);
         iterator result = {current_entry};
         for (++distance_from_desired, ++current_entry;; ++current_entry) {
             if (current_entry->is_empty()) {
-                current_entry->emplace(distance_from_desired,
-                                       std::move(to_insert));
+                current_entry->emplace(distance_from_desired, std::move(to_insert));
                 ++num_elements;
                 return {result, true};
-            } else if (current_entry->distance_from_desired <
-                       distance_from_desired) {
-                swap(distance_from_desired,
-                     current_entry->distance_from_desired);
+            } else if (current_entry->distance_from_desired < distance_from_desired) {
+                swap(distance_from_desired, current_entry->distance_from_desired);
                 swap(to_insert, current_entry->value);
                 ++distance_from_desired;
             } else {
@@ -912,11 +809,8 @@ class sherwood_v3_table : private EntryAlloc,
     }
 
     void
-    deallocate_data(EntryPointer begin,
-                    uint64_t num_slots_minus_one_,
-                    int8_t max_lookups_) {
-        AllocatorTraits::deallocate(
-            *this, begin, num_slots_minus_one_ + max_lookups_ + 1);
+    deallocate_data(EntryPointer begin, uint64_t num_slots_minus_one_, int8_t max_lookups_) {
+        AllocatorTraits::deallocate(*this, begin, num_slots_minus_one_ + max_lookups_ + 1);
     }
 
     void
@@ -1729,384 +1623,381 @@ struct prime_number_hash_policy {
         // the gaps
         // 5. get PrevPrime(2^64) and put it at the end
         // NOLINTNEXTLINE(*c-arrays*)
-        static constexpr const uint64_t prime_list[] = {
-            2llu,
-            3llu,
-            5llu,
-            7llu,
-            11llu,
-            13llu,
-            17llu,
-            23llu,
-            29llu,
-            37llu,
-            47llu,
-            59llu,
-            73llu,
-            97llu,
-            127llu,
-            151llu,
-            197llu,
-            251llu,
-            313llu,
-            397llu,
-            499llu,
-            631llu,
-            797llu,
-            1009llu,
-            1259llu,
-            1597llu,
-            2011llu,
-            2539llu,
-            3203llu,
-            4027llu,
-            5087llu,
-            6421llu,
-            8089llu,
-            10193llu,
-            12853llu,
-            16193llu,
-            20399llu,
-            25717llu,
-            32401llu,
-            40823llu,
-            51437llu,
-            64811llu,
-            81649llu,
-            102877llu,
-            129607llu,
-            163307llu,
-            205759llu,
-            259229llu,
-            326617llu,
-            411527llu,
-            518509llu,
-            653267llu,
-            823117llu,
-            1037059llu,
-            1306601llu,
-            1646237llu,
-            2074129llu,
-            2613229llu,
-            3292489llu,
-            4148279llu,
-            5226491llu,
-            6584983llu,
-            8296553llu,
-            10453007llu,
-            13169977llu,
-            16593127llu,
-            20906033llu,
-            26339969llu,
-            33186281llu,
-            41812097llu,
-            52679969llu,
-            66372617llu,
-            83624237llu,
-            105359939llu,
-            132745199llu,
-            167248483llu,
-            210719881llu,
-            265490441llu,
-            334496971llu,
-            421439783llu,
-            530980861llu,
-            668993977llu,
-            842879579llu,
-            1061961721llu,
-            1337987929llu,
-            1685759167llu,
-            2123923447llu,
-            2675975881llu,
-            3371518343llu,
-            4247846927llu,
-            5351951779llu,
-            6743036717llu,
-            8495693897llu,
-            10703903591llu,
-            13486073473llu,
-            16991387857llu,
-            21407807219llu,
-            26972146961llu,
-            33982775741llu,
-            42815614441llu,
-            53944293929llu,
-            67965551447llu,
-            85631228929llu,
-            107888587883llu,
-            135931102921llu,
-            171262457903llu,
-            215777175787llu,
-            271862205833llu,
-            342524915839llu,
-            431554351609llu,
-            543724411781llu,
-            685049831731llu,
-            863108703229llu,
-            1087448823553llu,
-            1370099663459llu,
-            1726217406467llu,
-            2174897647073llu,
-            2740199326961llu,
-            3452434812973llu,
-            4349795294267llu,
-            5480398654009llu,
-            6904869625999llu,
-            8699590588571llu,
-            10960797308051llu,
-            13809739252051llu,
-            17399181177241llu,
-            21921594616111llu,
-            27619478504183llu,
-            34798362354533llu,
-            43843189232363llu,
-            55238957008387llu,
-            69596724709081llu,
-            87686378464759llu,
-            110477914016779llu,
-            139193449418173llu,
-            175372756929481llu,
-            220955828033581llu,
-            278386898836457llu,
-            350745513859007llu,
-            441911656067171llu,
-            556773797672909llu,
-            701491027718027llu,
-            883823312134381llu,
-            1113547595345903llu,
-            1402982055436147llu,
-            1767646624268779llu,
-            2227095190691797llu,
-            2805964110872297llu,
-            3535293248537579llu,
-            4454190381383713llu,
-            5611928221744609llu,
-            7070586497075177llu,
-            8908380762767489llu,
-            11223856443489329llu,
-            14141172994150357llu,
-            17816761525534927llu,
-            22447712886978529llu,
-            28282345988300791llu,
-            35633523051069991llu,
-            44895425773957261llu,
-            56564691976601587llu,
-            71267046102139967llu,
-            89790851547914507llu,
-            113129383953203213llu,
-            142534092204280003llu,
-            179581703095829107llu,
-            226258767906406483llu,
-            285068184408560057llu,
-            359163406191658253llu,
-            452517535812813007llu,
-            570136368817120201llu,
-            718326812383316683llu,
-            905035071625626043llu,
-            1140272737634240411llu,
-            1436653624766633509llu,
-            1810070143251252131llu,
-            2280545475268481167llu,
-            2873307249533267101llu,
-            3620140286502504283llu,
-            4561090950536962147llu,
-            5746614499066534157llu,
-            7240280573005008577llu,
-            9122181901073924329llu,
-            11493228998133068689llu,
-            14480561146010017169llu,
-            18446744073709551557llu};
+        static constexpr const uint64_t prime_list[] = {2llu,
+                                                        3llu,
+                                                        5llu,
+                                                        7llu,
+                                                        11llu,
+                                                        13llu,
+                                                        17llu,
+                                                        23llu,
+                                                        29llu,
+                                                        37llu,
+                                                        47llu,
+                                                        59llu,
+                                                        73llu,
+                                                        97llu,
+                                                        127llu,
+                                                        151llu,
+                                                        197llu,
+                                                        251llu,
+                                                        313llu,
+                                                        397llu,
+                                                        499llu,
+                                                        631llu,
+                                                        797llu,
+                                                        1009llu,
+                                                        1259llu,
+                                                        1597llu,
+                                                        2011llu,
+                                                        2539llu,
+                                                        3203llu,
+                                                        4027llu,
+                                                        5087llu,
+                                                        6421llu,
+                                                        8089llu,
+                                                        10193llu,
+                                                        12853llu,
+                                                        16193llu,
+                                                        20399llu,
+                                                        25717llu,
+                                                        32401llu,
+                                                        40823llu,
+                                                        51437llu,
+                                                        64811llu,
+                                                        81649llu,
+                                                        102877llu,
+                                                        129607llu,
+                                                        163307llu,
+                                                        205759llu,
+                                                        259229llu,
+                                                        326617llu,
+                                                        411527llu,
+                                                        518509llu,
+                                                        653267llu,
+                                                        823117llu,
+                                                        1037059llu,
+                                                        1306601llu,
+                                                        1646237llu,
+                                                        2074129llu,
+                                                        2613229llu,
+                                                        3292489llu,
+                                                        4148279llu,
+                                                        5226491llu,
+                                                        6584983llu,
+                                                        8296553llu,
+                                                        10453007llu,
+                                                        13169977llu,
+                                                        16593127llu,
+                                                        20906033llu,
+                                                        26339969llu,
+                                                        33186281llu,
+                                                        41812097llu,
+                                                        52679969llu,
+                                                        66372617llu,
+                                                        83624237llu,
+                                                        105359939llu,
+                                                        132745199llu,
+                                                        167248483llu,
+                                                        210719881llu,
+                                                        265490441llu,
+                                                        334496971llu,
+                                                        421439783llu,
+                                                        530980861llu,
+                                                        668993977llu,
+                                                        842879579llu,
+                                                        1061961721llu,
+                                                        1337987929llu,
+                                                        1685759167llu,
+                                                        2123923447llu,
+                                                        2675975881llu,
+                                                        3371518343llu,
+                                                        4247846927llu,
+                                                        5351951779llu,
+                                                        6743036717llu,
+                                                        8495693897llu,
+                                                        10703903591llu,
+                                                        13486073473llu,
+                                                        16991387857llu,
+                                                        21407807219llu,
+                                                        26972146961llu,
+                                                        33982775741llu,
+                                                        42815614441llu,
+                                                        53944293929llu,
+                                                        67965551447llu,
+                                                        85631228929llu,
+                                                        107888587883llu,
+                                                        135931102921llu,
+                                                        171262457903llu,
+                                                        215777175787llu,
+                                                        271862205833llu,
+                                                        342524915839llu,
+                                                        431554351609llu,
+                                                        543724411781llu,
+                                                        685049831731llu,
+                                                        863108703229llu,
+                                                        1087448823553llu,
+                                                        1370099663459llu,
+                                                        1726217406467llu,
+                                                        2174897647073llu,
+                                                        2740199326961llu,
+                                                        3452434812973llu,
+                                                        4349795294267llu,
+                                                        5480398654009llu,
+                                                        6904869625999llu,
+                                                        8699590588571llu,
+                                                        10960797308051llu,
+                                                        13809739252051llu,
+                                                        17399181177241llu,
+                                                        21921594616111llu,
+                                                        27619478504183llu,
+                                                        34798362354533llu,
+                                                        43843189232363llu,
+                                                        55238957008387llu,
+                                                        69596724709081llu,
+                                                        87686378464759llu,
+                                                        110477914016779llu,
+                                                        139193449418173llu,
+                                                        175372756929481llu,
+                                                        220955828033581llu,
+                                                        278386898836457llu,
+                                                        350745513859007llu,
+                                                        441911656067171llu,
+                                                        556773797672909llu,
+                                                        701491027718027llu,
+                                                        883823312134381llu,
+                                                        1113547595345903llu,
+                                                        1402982055436147llu,
+                                                        1767646624268779llu,
+                                                        2227095190691797llu,
+                                                        2805964110872297llu,
+                                                        3535293248537579llu,
+                                                        4454190381383713llu,
+                                                        5611928221744609llu,
+                                                        7070586497075177llu,
+                                                        8908380762767489llu,
+                                                        11223856443489329llu,
+                                                        14141172994150357llu,
+                                                        17816761525534927llu,
+                                                        22447712886978529llu,
+                                                        28282345988300791llu,
+                                                        35633523051069991llu,
+                                                        44895425773957261llu,
+                                                        56564691976601587llu,
+                                                        71267046102139967llu,
+                                                        89790851547914507llu,
+                                                        113129383953203213llu,
+                                                        142534092204280003llu,
+                                                        179581703095829107llu,
+                                                        226258767906406483llu,
+                                                        285068184408560057llu,
+                                                        359163406191658253llu,
+                                                        452517535812813007llu,
+                                                        570136368817120201llu,
+                                                        718326812383316683llu,
+                                                        905035071625626043llu,
+                                                        1140272737634240411llu,
+                                                        1436653624766633509llu,
+                                                        1810070143251252131llu,
+                                                        2280545475268481167llu,
+                                                        2873307249533267101llu,
+                                                        3620140286502504283llu,
+                                                        4561090950536962147llu,
+                                                        5746614499066534157llu,
+                                                        7240280573005008577llu,
+                                                        9122181901073924329llu,
+                                                        11493228998133068689llu,
+                                                        14480561146010017169llu,
+                                                        18446744073709551557llu};
         // NOLINTNEXTLINE(*c-arrays*)
-        static constexpr uint64_t (*const mod_functions[])(uint64_t) = {
-            &mod0,
-            &mod2,
-            &mod3,
-            &mod5,
-            &mod7,
-            &mod11,
-            &mod13,
-            &mod17,
-            &mod23,
-            &mod29,
-            &mod37,
-            &mod47,
-            &mod59,
-            &mod73,
-            &mod97,
-            &mod127,
-            &mod151,
-            &mod197,
-            &mod251,
-            &mod313,
-            &mod397,
-            &mod499,
-            &mod631,
-            &mod797,
-            &mod1009,
-            &mod1259,
-            &mod1597,
-            &mod2011,
-            &mod2539,
-            &mod3203,
-            &mod4027,
-            &mod5087,
-            &mod6421,
-            &mod8089,
-            &mod10193,
-            &mod12853,
-            &mod16193,
-            &mod20399,
-            &mod25717,
-            &mod32401,
-            &mod40823,
-            &mod51437,
-            &mod64811,
-            &mod81649,
-            &mod102877,
-            &mod129607,
-            &mod163307,
-            &mod205759,
-            &mod259229,
-            &mod326617,
-            &mod411527,
-            &mod518509,
-            &mod653267,
-            &mod823117,
-            &mod1037059,
-            &mod1306601,
-            &mod1646237,
-            &mod2074129,
-            &mod2613229,
-            &mod3292489,
-            &mod4148279,
-            &mod5226491,
-            &mod6584983,
-            &mod8296553,
-            &mod10453007,
-            &mod13169977,
-            &mod16593127,
-            &mod20906033,
-            &mod26339969,
-            &mod33186281,
-            &mod41812097,
-            &mod52679969,
-            &mod66372617,
-            &mod83624237,
-            &mod105359939,
-            &mod132745199,
-            &mod167248483,
-            &mod210719881,
-            &mod265490441,
-            &mod334496971,
-            &mod421439783,
-            &mod530980861,
-            &mod668993977,
-            &mod842879579,
-            &mod1061961721,
-            &mod1337987929,
-            &mod1685759167,
-            &mod2123923447,
-            &mod2675975881,
-            &mod3371518343,
-            &mod4247846927,
-            &mod5351951779,
-            &mod6743036717,
-            &mod8495693897,
-            &mod10703903591,
-            &mod13486073473,
-            &mod16991387857,
-            &mod21407807219,
-            &mod26972146961,
-            &mod33982775741,
-            &mod42815614441,
-            &mod53944293929,
-            &mod67965551447,
-            &mod85631228929,
-            &mod107888587883,
-            &mod135931102921,
-            &mod171262457903,
-            &mod215777175787,
-            &mod271862205833,
-            &mod342524915839,
-            &mod431554351609,
-            &mod543724411781,
-            &mod685049831731,
-            &mod863108703229,
-            &mod1087448823553,
-            &mod1370099663459,
-            &mod1726217406467,
-            &mod2174897647073,
-            &mod2740199326961,
-            &mod3452434812973,
-            &mod4349795294267,
-            &mod5480398654009,
-            &mod6904869625999,
-            &mod8699590588571,
-            &mod10960797308051,
-            &mod13809739252051,
-            &mod17399181177241,
-            &mod21921594616111,
-            &mod27619478504183,
-            &mod34798362354533,
-            &mod43843189232363,
-            &mod55238957008387,
-            &mod69596724709081,
-            &mod87686378464759,
-            &mod110477914016779,
-            &mod139193449418173,
-            &mod175372756929481,
-            &mod220955828033581,
-            &mod278386898836457,
-            &mod350745513859007,
-            &mod441911656067171,
-            &mod556773797672909,
-            &mod701491027718027,
-            &mod883823312134381,
-            &mod1113547595345903,
-            &mod1402982055436147,
-            &mod1767646624268779,
-            &mod2227095190691797,
-            &mod2805964110872297,
-            &mod3535293248537579,
-            &mod4454190381383713,
-            &mod5611928221744609,
-            &mod7070586497075177,
-            &mod8908380762767489,
-            &mod11223856443489329,
-            &mod14141172994150357,
-            &mod17816761525534927,
-            &mod22447712886978529,
-            &mod28282345988300791,
-            &mod35633523051069991,
-            &mod44895425773957261,
-            &mod56564691976601587,
-            &mod71267046102139967,
-            &mod89790851547914507,
-            &mod113129383953203213,
-            &mod142534092204280003,
-            &mod179581703095829107,
-            &mod226258767906406483,
-            &mod285068184408560057,
-            &mod359163406191658253,
-            &mod452517535812813007,
-            &mod570136368817120201,
-            &mod718326812383316683,
-            &mod905035071625626043,
-            &mod1140272737634240411,
-            &mod1436653624766633509,
-            &mod1810070143251252131,
-            &mod2280545475268481167,
-            &mod2873307249533267101,
-            &mod3620140286502504283,
-            &mod4561090950536962147,
-            &mod5746614499066534157,
-            &mod7240280573005008577,
-            &mod9122181901073924329,
-            &mod11493228998133068689,
-            &mod14480561146010017169,
-            &mod18446744073709551557};
-        const uint64_t* found = std::lower_bound(
-            std::begin(prime_list), std::end(prime_list) - 1, size);
+        static constexpr uint64_t (*const mod_functions[])(uint64_t) = {&mod0,
+                                                                        &mod2,
+                                                                        &mod3,
+                                                                        &mod5,
+                                                                        &mod7,
+                                                                        &mod11,
+                                                                        &mod13,
+                                                                        &mod17,
+                                                                        &mod23,
+                                                                        &mod29,
+                                                                        &mod37,
+                                                                        &mod47,
+                                                                        &mod59,
+                                                                        &mod73,
+                                                                        &mod97,
+                                                                        &mod127,
+                                                                        &mod151,
+                                                                        &mod197,
+                                                                        &mod251,
+                                                                        &mod313,
+                                                                        &mod397,
+                                                                        &mod499,
+                                                                        &mod631,
+                                                                        &mod797,
+                                                                        &mod1009,
+                                                                        &mod1259,
+                                                                        &mod1597,
+                                                                        &mod2011,
+                                                                        &mod2539,
+                                                                        &mod3203,
+                                                                        &mod4027,
+                                                                        &mod5087,
+                                                                        &mod6421,
+                                                                        &mod8089,
+                                                                        &mod10193,
+                                                                        &mod12853,
+                                                                        &mod16193,
+                                                                        &mod20399,
+                                                                        &mod25717,
+                                                                        &mod32401,
+                                                                        &mod40823,
+                                                                        &mod51437,
+                                                                        &mod64811,
+                                                                        &mod81649,
+                                                                        &mod102877,
+                                                                        &mod129607,
+                                                                        &mod163307,
+                                                                        &mod205759,
+                                                                        &mod259229,
+                                                                        &mod326617,
+                                                                        &mod411527,
+                                                                        &mod518509,
+                                                                        &mod653267,
+                                                                        &mod823117,
+                                                                        &mod1037059,
+                                                                        &mod1306601,
+                                                                        &mod1646237,
+                                                                        &mod2074129,
+                                                                        &mod2613229,
+                                                                        &mod3292489,
+                                                                        &mod4148279,
+                                                                        &mod5226491,
+                                                                        &mod6584983,
+                                                                        &mod8296553,
+                                                                        &mod10453007,
+                                                                        &mod13169977,
+                                                                        &mod16593127,
+                                                                        &mod20906033,
+                                                                        &mod26339969,
+                                                                        &mod33186281,
+                                                                        &mod41812097,
+                                                                        &mod52679969,
+                                                                        &mod66372617,
+                                                                        &mod83624237,
+                                                                        &mod105359939,
+                                                                        &mod132745199,
+                                                                        &mod167248483,
+                                                                        &mod210719881,
+                                                                        &mod265490441,
+                                                                        &mod334496971,
+                                                                        &mod421439783,
+                                                                        &mod530980861,
+                                                                        &mod668993977,
+                                                                        &mod842879579,
+                                                                        &mod1061961721,
+                                                                        &mod1337987929,
+                                                                        &mod1685759167,
+                                                                        &mod2123923447,
+                                                                        &mod2675975881,
+                                                                        &mod3371518343,
+                                                                        &mod4247846927,
+                                                                        &mod5351951779,
+                                                                        &mod6743036717,
+                                                                        &mod8495693897,
+                                                                        &mod10703903591,
+                                                                        &mod13486073473,
+                                                                        &mod16991387857,
+                                                                        &mod21407807219,
+                                                                        &mod26972146961,
+                                                                        &mod33982775741,
+                                                                        &mod42815614441,
+                                                                        &mod53944293929,
+                                                                        &mod67965551447,
+                                                                        &mod85631228929,
+                                                                        &mod107888587883,
+                                                                        &mod135931102921,
+                                                                        &mod171262457903,
+                                                                        &mod215777175787,
+                                                                        &mod271862205833,
+                                                                        &mod342524915839,
+                                                                        &mod431554351609,
+                                                                        &mod543724411781,
+                                                                        &mod685049831731,
+                                                                        &mod863108703229,
+                                                                        &mod1087448823553,
+                                                                        &mod1370099663459,
+                                                                        &mod1726217406467,
+                                                                        &mod2174897647073,
+                                                                        &mod2740199326961,
+                                                                        &mod3452434812973,
+                                                                        &mod4349795294267,
+                                                                        &mod5480398654009,
+                                                                        &mod6904869625999,
+                                                                        &mod8699590588571,
+                                                                        &mod10960797308051,
+                                                                        &mod13809739252051,
+                                                                        &mod17399181177241,
+                                                                        &mod21921594616111,
+                                                                        &mod27619478504183,
+                                                                        &mod34798362354533,
+                                                                        &mod43843189232363,
+                                                                        &mod55238957008387,
+                                                                        &mod69596724709081,
+                                                                        &mod87686378464759,
+                                                                        &mod110477914016779,
+                                                                        &mod139193449418173,
+                                                                        &mod175372756929481,
+                                                                        &mod220955828033581,
+                                                                        &mod278386898836457,
+                                                                        &mod350745513859007,
+                                                                        &mod441911656067171,
+                                                                        &mod556773797672909,
+                                                                        &mod701491027718027,
+                                                                        &mod883823312134381,
+                                                                        &mod1113547595345903,
+                                                                        &mod1402982055436147,
+                                                                        &mod1767646624268779,
+                                                                        &mod2227095190691797,
+                                                                        &mod2805964110872297,
+                                                                        &mod3535293248537579,
+                                                                        &mod4454190381383713,
+                                                                        &mod5611928221744609,
+                                                                        &mod7070586497075177,
+                                                                        &mod8908380762767489,
+                                                                        &mod11223856443489329,
+                                                                        &mod14141172994150357,
+                                                                        &mod17816761525534927,
+                                                                        &mod22447712886978529,
+                                                                        &mod28282345988300791,
+                                                                        &mod35633523051069991,
+                                                                        &mod44895425773957261,
+                                                                        &mod56564691976601587,
+                                                                        &mod71267046102139967,
+                                                                        &mod89790851547914507,
+                                                                        &mod113129383953203213,
+                                                                        &mod142534092204280003,
+                                                                        &mod179581703095829107,
+                                                                        &mod226258767906406483,
+                                                                        &mod285068184408560057,
+                                                                        &mod359163406191658253,
+                                                                        &mod452517535812813007,
+                                                                        &mod570136368817120201,
+                                                                        &mod718326812383316683,
+                                                                        &mod905035071625626043,
+                                                                        &mod1140272737634240411,
+                                                                        &mod1436653624766633509,
+                                                                        &mod1810070143251252131,
+                                                                        &mod2280545475268481167,
+                                                                        &mod2873307249533267101,
+                                                                        &mod3620140286502504283,
+                                                                        &mod4561090950536962147,
+                                                                        &mod5746614499066534157,
+                                                                        &mod7240280573005008577,
+                                                                        &mod9122181901073924329,
+                                                                        &mod11493228998133068689,
+                                                                        &mod14480561146010017169,
+                                                                        &mod18446744073709551557};
+        const uint64_t* found = std::lower_bound(std::begin(prime_list), std::end(prime_list) - 1, size);
         size = *found;
         return mod_functions[1 + found - prime_list];
     }
@@ -2125,8 +2016,7 @@ struct prime_number_hash_policy {
     }
     uint64_t
     keep_in_range(uint64_t index, uint64_t num_slots_minus_one) const {
-        return index > num_slots_minus_one ? current_mod_function(index)
-                                           : index;
+        return index > num_slots_minus_one ? current_mod_function(index) : index;
     }
 
  private:
@@ -2183,32 +2073,17 @@ struct fibonacci_hash_policy {
     int8_t shift = 63;
 };
 
-template <typename K,
-          typename V,
-          typename H = std::hash<K>,
-          typename E = std::equal_to<K>,
+template <typename K, typename V, typename H = std::hash<K>, typename E = std::equal_to<K>,
           typename A = std::allocator<std::pair<K, V>>>
 class flat_hash_map
     : public detailv3::sherwood_v3_table<
-          std::pair<K, V>,
-          K,
-          H,
-          detailv3::KeyOrValueHasher<K, std::pair<K, V>, H>,
-          E,
-          detailv3::KeyOrValueEquality<K, std::pair<K, V>, E>,
-          A,
-          typename std::allocator_traits<A>::template rebind_alloc<
-              detailv3::sherwood_v3_entry<std::pair<K, V>>>> {
+          std::pair<K, V>, K, H, detailv3::KeyOrValueHasher<K, std::pair<K, V>, H>, E,
+          detailv3::KeyOrValueEquality<K, std::pair<K, V>, E>, A,
+          typename std::allocator_traits<A>::template rebind_alloc<detailv3::sherwood_v3_entry<std::pair<K, V>>>> {
     using Table = detailv3::sherwood_v3_table<
-        std::pair<K, V>,
-        K,
-        H,
-        detailv3::KeyOrValueHasher<K, std::pair<K, V>, H>,
-        E,
-        detailv3::KeyOrValueEquality<K, std::pair<K, V>, E>,
-        A,
-        typename std::allocator_traits<A>::template rebind_alloc<
-            detailv3::sherwood_v3_entry<std::pair<K, V>>>>;
+        std::pair<K, V>, K, H, detailv3::KeyOrValueHasher<K, std::pair<K, V>, H>, E,
+        detailv3::KeyOrValueEquality<K, std::pair<K, V>, E>, A,
+        typename std::allocator_traits<A>::template rebind_alloc<detailv3::sherwood_v3_entry<std::pair<K, V>>>>;
 
  public:
     using key_type = K;
@@ -2229,16 +2104,14 @@ class flat_hash_map
     at(const K& key) {
         auto found = this->find(key);
         if (found == this->end())
-            throw std::out_of_range(
-                "Argument passed to at() was not in the map.");
+            throw std::out_of_range("Argument passed to at() was not in the map.");
         return found->second;
     }
     const V&
     at(const K& key) const {
         auto found = this->find(key);
         if (found == this->end())
-            throw std::out_of_range(
-                "Argument passed to at() was not in the map.");
+            throw std::out_of_range("Argument passed to at() was not in the map.");
         return found->second;
     }
 
@@ -2265,9 +2138,7 @@ class flat_hash_map
     }
     template <typename M>
     typename Table::iterator
-    insert_or_assign(typename Table::const_iterator,
-                     const key_type& key,
-                     M&& m) {
+    insert_or_assign(typename Table::const_iterator, const key_type& key, M&& m) {
         return insert_or_assign(key, std::forward<M>(m)).first;
     }
     template <typename M>
@@ -2300,31 +2171,13 @@ class flat_hash_map
     };
 };
 
-template <typename T,
-          typename H = std::hash<T>,
-          typename E = std::equal_to<T>,
-          typename A = std::allocator<T>>
-class flat_hash_set
-    : public detailv3::sherwood_v3_table<
-          T,
-          T,
-          H,
-          detailv3::functor_storage<uint64_t, H>,
-          E,
-          detailv3::functor_storage<bool, E>,
-          A,
-          typename std::allocator_traits<A>::template rebind_alloc<
-              detailv3::sherwood_v3_entry<T>>> {
+template <typename T, typename H = std::hash<T>, typename E = std::equal_to<T>, typename A = std::allocator<T>>
+class flat_hash_set : public detailv3::sherwood_v3_table<
+                          T, T, H, detailv3::functor_storage<uint64_t, H>, E, detailv3::functor_storage<bool, E>, A,
+                          typename std::allocator_traits<A>::template rebind_alloc<detailv3::sherwood_v3_entry<T>>> {
     using Table = detailv3::sherwood_v3_table<
-        T,
-        T,
-        H,
-        detailv3::functor_storage<uint64_t, H>,
-        E,
-        detailv3::functor_storage<bool, E>,
-        A,
-        typename std::allocator_traits<A>::template rebind_alloc<
-            detailv3::sherwood_v3_entry<T>>>;
+        T, T, H, detailv3::functor_storage<uint64_t, H>, E, detailv3::functor_storage<bool, E>, A,
+        typename std::allocator_traits<A>::template rebind_alloc<detailv3::sherwood_v3_entry<T>>>;
 
  public:
     using key_type = T;

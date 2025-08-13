@@ -52,4 +52,4 @@ class LocalFileManager : public FileManager {
     std::unordered_set<std::string> files;
 };
 
-}  // namespace knowhere
+}  // namespace milvus

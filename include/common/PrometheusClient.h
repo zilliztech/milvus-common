@@ -46,54 +46,44 @@ class PrometheusClient {
     }
 
  private:
-    std::shared_ptr<prometheus::Registry> registry_ =
-        std::make_shared<prometheus::Registry>();
+    std::shared_ptr<prometheus::Registry> registry_ = std::make_shared<prometheus::Registry>();
 };
 
 /*****************************************************************************/
 // prometheus metrics
-static const std::unique_ptr<PrometheusClient> prometheusClient =
-    std::make_unique<PrometheusClient>();
+static const std::unique_ptr<PrometheusClient> prometheusClient = std::make_unique<PrometheusClient>();
 extern const prometheus::Histogram::BucketBoundaries buckets;
 extern const prometheus::Histogram::BucketBoundaries secondsBuckets;
 extern const prometheus::Histogram::BucketBoundaries bytesBuckets;
 extern const prometheus::Histogram::BucketBoundaries ratioBuckets;
 
-#define DEFINE_PROMETHEUS_GAUGE_FAMILY(name, desc)                \
-    prometheus::Family<prometheus::Gauge>& name##_family =        \
-        prometheus::BuildGauge().Name(#name).Help(desc).Register( \
-            milvus::monitor::prometheusClient->GetRegistry());
-#define DEFINE_PROMETHEUS_GAUGE(alias, name, labels) \
-    prometheus::Gauge& alias = name##_family.Add(labels);
+#define DEFINE_PROMETHEUS_GAUGE_FAMILY(name, desc)         \
+    prometheus::Family<prometheus::Gauge>& name##_family = \
+        prometheus::BuildGauge().Name(#name).Help(desc).Register(milvus::monitor::prometheusClient->GetRegistry());
+#define DEFINE_PROMETHEUS_GAUGE(alias, name, labels) prometheus::Gauge& alias = name##_family.Add(labels);
 
-#define DEFINE_PROMETHEUS_COUNTER_FAMILY(name, desc)                \
-    prometheus::Family<prometheus::Counter>& name##_family =        \
-        prometheus::BuildCounter().Name(#name).Help(desc).Register( \
-            milvus::monitor::prometheusClient->GetRegistry());
-#define DEFINE_PROMETHEUS_COUNTER(alias, name, labels) \
-    prometheus::Counter& alias = name##_family.Add(labels);
+#define DEFINE_PROMETHEUS_COUNTER_FAMILY(name, desc)         \
+    prometheus::Family<prometheus::Counter>& name##_family = \
+        prometheus::BuildCounter().Name(#name).Help(desc).Register(milvus::monitor::prometheusClient->GetRegistry());
+#define DEFINE_PROMETHEUS_COUNTER(alias, name, labels) prometheus::Counter& alias = name##_family.Add(labels);
 
 #define DEFINE_PROMETHEUS_HISTOGRAM_FAMILY(name, desc)                \
     prometheus::Family<prometheus::Histogram>& name##_family =        \
         prometheus::BuildHistogram().Name(#name).Help(desc).Register( \
             milvus::monitor::prometheusClient->GetRegistry());
 #define DEFINE_PROMETHEUS_HISTOGRAM(alias, name, labels) \
-    prometheus::Histogram& alias =                       \
-        name##_family.Add(labels, milvus::monitor::buckets);
+    prometheus::Histogram& alias = name##_family.Add(labels, milvus::monitor::buckets);
 #define DEFINE_PROMETHEUS_HISTOGRAM_WITH_BUCKETS(alias, name, labels, buckets) \
     prometheus::Histogram& alias = name##_family.Add(labels, buckets);
 
 #define DECLARE_PROMETHEUS_GAUGE_FAMILY(name_gauge_family) \
     extern prometheus::Family<prometheus::Gauge>& name_gauge_family;
-#define DECLARE_PROMETHEUS_GAUGE(name_gauge) \
-    extern prometheus::Gauge& name_gauge;
+#define DECLARE_PROMETHEUS_GAUGE(name_gauge) extern prometheus::Gauge& name_gauge;
 #define DECLARE_PROMETHEUS_COUNTER_FAMILY(name_counter_family) \
     extern prometheus::Family<prometheus::Counter>& name_counter_family;
-#define DECLARE_PROMETHEUS_COUNTER(name_counter) \
-    extern prometheus::Counter& name_counter;
+#define DECLARE_PROMETHEUS_COUNTER(name_counter) extern prometheus::Counter& name_counter;
 #define DECLARE_PROMETHEUS_HISTOGRAM_FAMILY(name_histogram_family) \
     extern prometheus::Family<prometheus::Histogram>& name_histogram_family;
-#define DECLARE_PROMETHEUS_HISTOGRAM(name_histogram) \
-    extern prometheus::Histogram& name_histogram;
+#define DECLARE_PROMETHEUS_HISTOGRAM(name_histogram) extern prometheus::Histogram& name_histogram;
 
 }  // namespace milvus::monitor

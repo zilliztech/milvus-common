@@ -21,12 +21,14 @@ add_executable(cachinglayer_test
 )
 
 target_link_libraries(cachinglayer_test
-    gtest 
-    gmock
+    GTest::gtest
+    GTest::gmock
     milvus-common
+    ${COMMON_LINKER_LIBS}
     pthread
     atomic
-    ${CONAN_LIBS}
+    gomp
+    openblas
 )
 
 install(TARGETS cachinglayer_test DESTINATION unittest)

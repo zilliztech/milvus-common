@@ -11,9 +11,9 @@
 
 #pragma once
 
+#include <map>
 #include <memory>
 #include <string>
-#include <map>
 
 #include "opentelemetry/trace/provider.h"
 
@@ -89,12 +89,9 @@ std::map<std::string, std::string>
 parseHeaders(const std::string& headers);
 
 struct AutoSpan {
-    explicit AutoSpan(const std::string& name,
-                      TraceContext* ctx = nullptr,
-                      bool is_root_span = false);
+    explicit AutoSpan(const std::string& name, TraceContext* ctx = nullptr, bool is_root_span = false);
 
-    explicit AutoSpan(const std::string& name,
-                      const std::shared_ptr<trace::Span>& span);
+    explicit AutoSpan(const std::string& name, const std::shared_ptr<trace::Span>& span);
 
     std::shared_ptr<trace::Span>
     GetSpan();

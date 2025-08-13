@@ -11,9 +11,9 @@
 
 #pragma once
 
+#include <memory>
 #include <optional>
 #include <string>
-#include <memory>
 
 #include "filemanager/InputStream.h"
 #include "filemanager/OutputStream.h"

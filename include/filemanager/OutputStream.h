@@ -15,7 +15,7 @@
 
 namespace milvus {
 class OutputStream {
-public:
+ public:
     virtual ~OutputStream() = default;
 
     /**

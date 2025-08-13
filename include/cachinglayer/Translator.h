@@ -12,8 +12,8 @@
 #pragma once
 
 #include <memory>
-#include <vector>
 #include <utility>
+#include <vector>
 
 #include "cachinglayer/Utils.h"
 #include "common/common_type_c.h"
@@ -21,8 +21,7 @@
 namespace milvus::cachinglayer {
 
 enum class CellIdMappingMode : uint8_t {
-    CUSTOMIZED =
-        0,  // the cell id should be parsed from the uid by the translator
+    CUSTOMIZED = 0,   // the cell id should be parsed from the uid by the translator
     IDENTICAL = 1,    // the cell id is identical to the uid
     ALWAYS_ZERO = 2,  // the cell id is always 0
 };
@@ -36,10 +35,8 @@ struct Meta {
     // Whether the translator supports strategy based eviction.
     // Does not affect manual eviction.
     bool support_eviction;
-    explicit Meta(StorageType storage_type,
-                  CellIdMappingMode cell_id_mapping_mode,
-                  CacheWarmupPolicy cache_warmup_policy,
-                  bool support_eviction)
+    explicit Meta(StorageType storage_type, CellIdMappingMode cell_id_mapping_mode,
+                  CacheWarmupPolicy cache_warmup_policy, bool support_eviction)
         : storage_type(storage_type),
           cell_id_mapping_mode(cell_id_mapping_mode),
           cache_warmup_policy(cache_warmup_policy),

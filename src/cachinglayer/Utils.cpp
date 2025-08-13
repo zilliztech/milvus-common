@@ -12,11 +12,11 @@
 #include "cachinglayer/Utils.h"
 
 #include <algorithm>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <string>
 #include <vector>
-#include <cstring>
 
 #include "log/Log.h"
 
@@ -25,8 +25,8 @@
 #endif
 
 #ifdef __APPLE__
-#include <sys/sysctl.h>
 #include <mach/mach.h>
+#include <sys/sysctl.h>
 #endif
 
 namespace milvus::cachinglayer::internal {
@@ -71,8 +71,7 @@ getHostTotalMemory() {
         }
         return 0;
 #else
-        LOG_WARN(
-            "[MCL] Host memory detection not implemented for this platform");
+        LOG_WARN("[MCL] Host memory detection not implemented for this platform");
         return 0;
 #endif
     }();
@@ -92,11 +91,9 @@ getContainerMemLimit() {
         try {
             int64_t env_limit = std::stoll(mem_limit_env);
             limits.push_back(env_limit);
-            LOG_TRACE("[MCL] Found MEM_LIMIT environment variable: {}",
-                      FormatBytes(env_limit));
+            LOG_TRACE("[MCL] Found MEM_LIMIT environment variable: {}", FormatBytes(env_limit));
         } catch (...) {
-            LOG_WARN("[MCL] Invalid MEM_LIMIT environment variable: {}",
-                     mem_limit_env);
+            LOG_WARN("[MCL] Invalid MEM_LIMIT environment variable: {}", mem_limit_env);
         }
     }
 
@@ -146,20 +143,17 @@ getContainerMemLimit() {
         std::string line;
         while (std::getline(proc_cgroup, line)) {
             // Look for memory controller lines
-            if (line.find(":memory:") != std::string::npos ||
-                line.find(":0:") != std::string::npos) {
+            if (line.find(":memory:") != std::string::npos || line.find(":0:") != std::string::npos) {
                 size_t last_colon = line.find_last_of(':');
                 if (last_colon != std::string::npos) {
                     std::string cgroup_path = line.substr(last_colon + 1);
 
                     // Try v2 path
-                    std::string v2_path =
-                        "/sys/fs/cgroup" + cgroup_path + "/memory.max";
+                    std::string v2_path = "/sys/fs/cgroup" + cgroup_path + "/memory.max";
                     std::ifstream proc_v2(v2_path);
                     if (proc_v2.is_open()) {
                         std::string proc_line;
-                        if (std::getline(proc_v2, proc_line) &&
-                            proc_line != "max") {
+                        if (std::getline(proc_v2, proc_line) && proc_line != "max") {
                             try {
                                 int64_t proc_limit = std::stoll(proc_line);
                                 limits.push_back(proc_limit);
@@ -174,9 +168,7 @@ getContainerMemLimit() {
                     }
 
                     // Try v1 path
-                    std::string v1_path = "/sys/fs/cgroup/memory" +
-                                          cgroup_path +
-                                          "/memory.limit_in_bytes";
+                    std::string v1_path = "/sys/fs/cgroup/memory" + cgroup_path + "/memory.limit_in_bytes";
                     std::ifstream proc_v1(v1_path);
                     if (proc_v1.is_open()) {
                         std::string proc_line;
@@ -206,9 +198,7 @@ getContainerMemLimit() {
     // Return the minimum of all found limits
     if (!limits.empty()) {
         int64_t min_limit = *std::min_element(limits.begin(), limits.end());
-        LOG_TRACE("[MCL] Using minimum memory limit: {} from {} sources",
-                  FormatBytes(min_limit),
-                  limits.size());
+        LOG_TRACE("[MCL] Using minimum memory limit: {} from {} sources", FormatBytes(min_limit), limits.size());
         return min_limit;
     }
 
@@ -237,16 +227,14 @@ getSystemMemoryInfo() {
 
     if (container_limit > 0 && container_limit < host_memory) {
         info.total_bytes = container_limit;
-        LOG_DEBUG("[MCL] Using container memory limit: {}",
-                  FormatBytes(container_limit));
+        LOG_DEBUG("[MCL] Using container memory limit: {}", FormatBytes(container_limit));
     } else {
         info.total_bytes = host_memory;
         if (container_limit > host_memory) {
             LOG_WARN(
                 "[MCL] Container limit ({}) exceeds host memory ({}), using "
                 "host memory",
-                FormatBytes(container_limit),
-                FormatBytes(host_memory));
+                FormatBytes(container_limit), FormatBytes(host_memory));
         }
     }
 
@@ -274,11 +262,9 @@ getSystemDiskInfo(const std::string& disk_path) {
         return info;
     }
     // Total bytes = f_blocks * f_frsize
-    info.total_bytes = static_cast<int64_t>(stat.f_blocks) *
-                       static_cast<int64_t>(stat.f_frsize);
+    info.total_bytes = static_cast<int64_t>(stat.f_blocks) * static_cast<int64_t>(stat.f_frsize);
     // Used bytes = (f_blocks - f_bfree) * f_frsize
-    info.used_bytes = (static_cast<int64_t>(stat.f_blocks) -
-                       static_cast<int64_t>(stat.f_bfree)) *
+    info.used_bytes = (static_cast<int64_t>(stat.f_blocks) - static_cast<int64_t>(stat.f_bfree)) *
                       static_cast<int64_t>(stat.f_frsize);
 #else
     LOG_WARN(
@@ -336,16 +322,13 @@ getCurrentProcessMemoryUsage() {
 #elif defined(__APPLE__)
     task_vm_info_data_t vm_info;
     mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
-    if (task_info(
-            mach_task_self(), TASK_VM_INFO, (task_info_t)&vm_info, &count) !=
-        KERN_SUCCESS) {
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm_info, &count) != KERN_SUCCESS) {
         LOG_WARN("[MCL] Failed to get task info for current process");
         return 0;
     }
     return vm_info.internal;
 #else
-    LOG_WARN(
-        "[MCL] Process memory monitoring not implemented for this platform");
+    LOG_WARN("[MCL] Process memory monitoring not implemented for this platform");
     return 0;
 #endif
 }
