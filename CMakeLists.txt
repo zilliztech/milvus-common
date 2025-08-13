@@ -50,9 +50,18 @@ if(__X86_64)
    set_source_files_properties(src/knowhere/thread_pool.cc PROPERTIES
      COMPILE_OPTIONS "-msse4.2"
    )
-else()
-   list(REMOVE_ITEM SRC_FILES src/knowhere/aio_context_pool.cc)
 endif()
+
+# Check for libaio library and conditionally include aio_context_pool.cc
+find_library(LIBAIO_LIBRARY NAMES aio)
+if(NOT LIBAIO_LIBRARY)
+    list(REMOVE_ITEM SRC_FILES src/knowhere/aio_context_pool.cc)
+    message(STATUS "libaio not found, excluding aio_context_pool.cc from build")
+else()
+    message(STATUS "libaio found: ${LIBAIO_LIBRARY}, including aio_context_pool.cc in build")
+    list(APPEND COMMON_LINKER_LIBS ${LIBAIO_LIBRARY})
+endif()
+
 add_library(milvus-common SHARED ${SRC_FILES})
 
 if (WITH_JAEGER)
