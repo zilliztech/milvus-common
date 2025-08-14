@@ -55,7 +55,7 @@ endif()
 # Check for libaio library and conditionally include aio_context_pool.cc
 find_library(LIBAIO_LIBRARY NAMES aio)
 if(NOT LIBAIO_LIBRARY)
-    list(REMOVE_ITEM SRC_FILES src/knowhere/aio_context_pool.cc)
+    list(REMOVE_ITEM SRC_FILES ${CMAKE_CURRENT_SOURCE_DIR}/src/knowhere/aio_context_pool.cc)
     message(STATUS "libaio not found, excluding aio_context_pool.cc from build")
 else()
     message(STATUS "libaio found: ${LIBAIO_LIBRARY}, including aio_context_pool.cc in build")
