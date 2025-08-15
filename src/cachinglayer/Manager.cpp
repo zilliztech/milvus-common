@@ -33,14 +33,8 @@ Manager::ConfigureTieredStorage(CacheWarmupPolicies warmup_policies, CacheLimit 
         manager.evictionEnabled_ = evictionEnabled;
 
         auto policy_str = warmup_policies.ToString();
-
-        if (!evictionEnabled) {
-            LOG_INFO(
-                "[MCL] Tiered Storage manager is configured "
-                "with disabled eviction and warmup policies: {}",
-                policy_str);
-            return;
-        }
+        LOG_INFO("[MCL] Tiered Storage manager is configured with warmup policies: {}, eviction enabled: {}",
+                 policy_str, evictionEnabled);
 
         ResourceUsage max{cache_limit.memory_max_bytes, cache_limit.disk_max_bytes};
         ResourceUsage low_watermark{cache_limit.memory_low_watermark_bytes, cache_limit.disk_low_watermark_bytes};
