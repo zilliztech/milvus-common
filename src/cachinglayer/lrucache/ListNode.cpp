@@ -57,11 +57,14 @@ ListNode::ListNode(DList* dlist, bool evictable)
 ListNode::~ListNode() {
     std::unique_lock<std::shared_mutex> lock(mtx_);
     switch (state_) {
+        case State::CACHED: {
+            dlist_->removeItem(this, loaded_size_);
+            // fall through
+        }
         case State::LOADED: {
-            if (evictable_) {
-                dlist_->removeItem(this, loaded_size_);
-            }
-            dlist_->refundLoadedResource(loaded_size_);
+            auto saved_loaded_size = loaded_size_;
+            unload();
+            dlist_->refundLoadedResource(saved_loaded_size);
             break;
         }
         case State::LOADING: {
@@ -80,6 +83,11 @@ bool
 ListNode::manual_evict() {
     std::unique_lock<std::shared_mutex> lock(mtx_);
     switch (state_) {
+        case State::CACHED: {
+            // even if pin_count_ > 0, removeItem is still ok since it can be readded to dlist_ when pin_count_ == 0.
+            dlist_->removeItem(this, loaded_size_);
+            // fall through
+        }
         case State::LOADED: {
             if (pin_count_.load() > 0) {
                 LOG_ERROR(
@@ -89,11 +97,9 @@ ListNode::manual_evict() {
                     key());
                 return false;
             }
-            clear_data();
-            if (evictable_) {
-                dlist_->removeItem(this, loaded_size_);
-            }
-            dlist_->refundLoadedResource(loaded_size_);
+            auto saved_loaded_size = loaded_size_;
+            unload();
+            dlist_->refundLoadedResource(saved_loaded_size);
             return true;
         }
         case State::LOADING: {
@@ -118,11 +124,14 @@ ListNode::pin() {
         // pin the cell now so that we can avoid taking the lock again in deferValue.
         auto old_pin_count = pin_count_.fetch_add(1);
         switch (state_) {
-            case State::LOADED: {
-                if (old_pin_count == 0 && evictable_) {
+            case State::CACHED: {
+                if (old_pin_count == 0) {
                     // node became inevictable, freeze it if it is in dlist
                     dlist_->freezeItem(this, loaded_size_);
                 }
+                // fall through
+            }
+            case State::LOADED: {
                 auto p = NodePin(this);
                 return std::make_pair(false, std::move(p));
             }
@@ -173,8 +182,9 @@ ListNode::set_error(folly::exception_wrapper error) {
                 }
                 break;
             }
+            case State::CACHED:
             case State::LOADED: {
-                // may be successfully loaded by another thread as a bonus, they will update used memory.
+                // may be successfully loaded/cached by another thread as a bonus, they will update used memory.
                 return;
             }
             default:
@@ -199,6 +209,8 @@ ListNode::state_to_string(State state) {
             return "LOADING";
         case State::LOADED:
             return "LOADED";
+        case State::CACHED:
+            return "CACHED";
     }
     throw std::invalid_argument("Invalid state");
 }
@@ -208,38 +220,37 @@ ListNode::unpin() {
     std::unique_lock<std::shared_mutex> lock(mtx_);
     if (pin_count_.fetch_sub(1) == 1) {
         if (evictable_) {
-            touch(state_ == State::LOADED);
+            touch_to_dlist(state_ == State::LOADED || state_ == State::CACHED);
         }
     }
 }
 
-// ListNode::touch() should only be called when evictable_ is true
+// ListNode::touch_to_dlist() should only be called when evictable_ is true
 void
-ListNode::touch(bool update_evictable_memory) {
-    auto now = std::chrono::steady_clock::now();
-    if (now - last_touch_ > dlist_->eviction_config().cache_touch_window) {
-        std::optional<ResourceUsage> size = std::nullopt;
-        if (update_evictable_memory) {
-            size = loaded_size_;
-        }
-        last_touch_ = dlist_->touchItem(this, size);
+ListNode::touch_to_dlist(bool update_evictable_memory) {
+    std::optional<ResourceUsage> size = std::nullopt;
+    if (update_evictable_memory) {
+        size = loaded_size_;
     }
+    dlist_->touchItem(this, false, size);
+    state_ = State::CACHED;
 }
 
 void
-ListNode::clear_data() {
+ListNode::unload() {
     // if the cell is evicted, loaded, pinned and unpinned within a single refresh window,
     // the cell should be inserted into the cache again.
     if (evictable_) {
         last_touch_ = std::chrono::steady_clock::now() - 2 * dlist_->eviction_config().cache_touch_window;
     }
-    unload();
-    LOG_TRACE("[MCL] ListNode evicted: key={}, size={}", key(), loaded_size_.ToString());
-    state_ = State::NOT_LOADED;
+    clear_data();
+    LOG_TRACE("[MCL] ListNode unloaded: key={}, size={}", key(), loaded_size_.ToString());
+    loaded_size_ = {0, 0};       // reset loaded_size_ to 0,0 to avoid double refund from dlist_
+    state_ = State::NOT_LOADED;  // reset state_ to NOT_LOADED to avoid double refund from dlist_
 }
 
 void
-ListNode::unload() {
+ListNode::clear_data() {
     // Default implementation does nothing
 }
 

@@ -27,13 +27,14 @@ using cl_uid_t = milvus::cachinglayer::uid_t;
 struct TestCell {
     int data;
     cid_t cid;
+    ResourceUsage size;
 
-    TestCell(int d, cid_t id) : data(d), cid(id) {
+    TestCell(int d, cid_t id, ResourceUsage s) : data(d), cid(id), size(s) {
     }
 
-    milvus::cachinglayer::ResourceUsage
+    [[nodiscard]] milvus::cachinglayer::ResourceUsage
     CellByteSize() const {
-        return milvus::cachinglayer::ResourceUsage(sizeof(data) + sizeof(cid), 0);
+        return size;
     }
 };
 
@@ -111,7 +112,8 @@ class MockTranslator : public Translator<TestCell> {
                 std::this_thread::sleep_for(std::chrono::milliseconds(delay_it->second));
             }
 
-            result.emplace_back(cid, std::make_unique<TestCell>(static_cast<int>(cid * 10), cid));
+            result.emplace_back(cid, std::make_unique<TestCell>(static_cast<int>(cid * 10), cid,
+                                                                estimated_byte_size_of_cell(cid).first));
 
             if (auto extra_cids = extra_cids_.find(cid); extra_cids != extra_cids_.end()) {
                 for (cid_t extra_cid : extra_cids->second) {
@@ -122,7 +124,8 @@ class MockTranslator : public Translator<TestCell> {
                             return pair.first == extra_cid;
                         }) == result.end()) {
                         result.emplace_back(extra_cid,
-                                            std::make_unique<TestCell>(static_cast<int>(extra_cid * 10), extra_cid));
+                                            std::make_unique<TestCell>(static_cast<int>(extra_cid * 10), extra_cid,
+                                                                       estimated_byte_size_of_cell(extra_cid).first));
                     }
                 }
             }

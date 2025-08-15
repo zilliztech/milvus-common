@@ -338,8 +338,9 @@ DList::tryEvict(const ResourceUsage& expected_eviction, const ResourceUsage& min
     for (auto* list_node : to_evict) {
         auto size = list_node->loaded_size();
         internal::cache_cell_eviction_count(size.storage_type()).Increment();
-        popItem(list_node);  // must succeed, otherwise the node is not in the list
-        list_node->clear_data();
+        popItem(list_node);   // must succeed, otherwise the node is not in the list
+        list_node->unload();  // NOTE: after unload(), the node's loaded_size() is reset to {0, 0} and state_ is reset
+                              // to NOT_LOADED.
     }
     // Refund logically evicted resources manually, waiting requests notification is left to caller.
     total_loaded_size_ -= size_to_evict;
@@ -430,16 +431,23 @@ DList::releaseLoadingResource(const ResourceUsage& loading_size) {
 }
 
 std::chrono::steady_clock::time_point
-DList::touchItem(ListNode* list_node, std::optional<ResourceUsage> size) {
+DList::touchItem(ListNode* list_node, bool force_touch, std::optional<ResourceUsage> size) {
+    // update evictable_size_ if size is provided
+    if (size.has_value()) {
+        evictable_size_ += size.value();
+    }
+    // check if the node should be moved forward
+    auto now = std::chrono::steady_clock::now();
+    if (now - list_node->last_touch_ <= eviction_config_.cache_touch_window) {
+        return list_node->last_touch_;
+    }
+    // move the node to the head of the list
     std::lock_guard<std::mutex> list_lock(list_mtx_);
     popItem(list_node);
     pushHead(list_node);
-    if (size.has_value()) {
-        evictable_size_ += size.value();
-        // If there are waiters, try to satisfy them
-        if (!waiting_queue_empty_) {
-            notifyWaitingRequests();
-        }
+    // If there are waiters, try to satisfy them
+    if (size.has_value() && !waiting_queue_empty_) {
+        notifyWaitingRequests();
     }
     return std::chrono::steady_clock::now();
 }
@@ -447,7 +455,7 @@ DList::touchItem(ListNode* list_node, std::optional<ResourceUsage> size) {
 void
 DList::removeItem(ListNode* list_node, ResourceUsage size) {
     std::lock_guard<std::mutex> list_lock(list_mtx_);
-    if (popItem(list_node)) {
+    if (popItem(list_node) && list_node->pin_count_ == 0) {
         evictable_size_ -= size;
         AssertInfo(evictable_size_.load().AllGEZero(), "[MCL] evictable_size_ is negative: {}",
                    evictable_size_.load().ToString());
@@ -456,6 +464,8 @@ DList::removeItem(ListNode* list_node, ResourceUsage size) {
 
 void
 DList::freezeItem(ListNode* list_node [[maybe_unused]], ResourceUsage size) {
+    AssertInfo(list_node->pin_count_ > 0, "[MCL] freezeItem should be called on a cell with pin_count_ > 0, but got {}",
+               list_node->pin_count_);
     evictable_size_ -= size;
     AssertInfo(evictable_size_.load().AllGEZero(), "[MCL] evictable_size_ is negative: {}",
                evictable_size_.load().ToString());

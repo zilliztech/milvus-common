@@ -328,7 +328,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
 
      protected:
         void
-        unload() override {
+        clear_data() override {
             if (cell_) {
                 auto storage_type = slot_->translator_->meta()->storage_type;
                 internal::cache_cell_loaded_count(storage_type).Decrement();

@@ -79,16 +79,31 @@ class ListNode {
     bool
     manual_evict();
 
-    // NOT_LOADED <---> LOADING
-    //      ^            |
-    //      |            v
-    //      |------- LOADED
-    enum class State { NOT_LOADED, LOADING, LOADED };
+    // State transition diagram:
+    // +-----------+            +---------+
+    // | NOT_LOAD  | <--------> | LOADING |
+    // +-----------+            +---------+
+    //      ^   ^                   |
+    //      |   |                   v
+    //      |   |               +---------+
+    //      |   +---------------| LOADED  |
+    //      |                   +---------+
+    //      |                        |
+    //      |                        v
+    //      |                 +---------------------------+
+    //      +-----------------| CACHED && pin_count == 0  |
+    //                        +---------------------------+
+    //                               ^        |
+    //                               |        v
+    //                        +---------------------------+
+    //                        | CACHED && pin_count != 0  |
+    //                        +---------------------------+
+    enum class State { NOT_LOADED, LOADING, LOADED, CACHED };
 
  protected:
     // will be called during eviction, implementation should release all resources.
     virtual void
-    unload();
+    clear_data();
 
     virtual std::string
     key() const = 0;
@@ -109,8 +124,9 @@ class ListNode {
                         promise = std::move(load_promise_);
                         break;
                     }
-                    case State::LOADED: {
-                        // This state can only happen when this node is loaded as a bonus.
+                    case State::LOADED:
+                    case State::CACHED: {
+                        // This state can only happen when this node is loaded/cached as a bonus.
                         // touch() has been called by the bonus loading thread.
                         promise = std::move(load_promise_);
                         break;
@@ -131,7 +147,7 @@ class ListNode {
                         state_ = State::LOADED;
                         // memory of this cell is not reserved, touch() to track it.
                         if (evictable_) {
-                            touch(true);
+                            touch_to_dlist(true);
                         }
                         break;
                     }
@@ -142,10 +158,10 @@ class ListNode {
                         state_ = State::LOADED;
                         // the node that marked LOADING has already reserved memory, do not double count.
                         if (evictable_) {
-                            touch(false);
+                            touch_to_dlist(false);
                         }
                     }
-                    default:;  // LOADED: cell has been loaded by another thread, do nothing.
+                    default:;  // LOADED/CACHED: cell has been loaded by another thread, do nothing.
                 }
             }
         }
@@ -177,14 +193,14 @@ class ListNode {
     // called by DList during eviction. must be called under the lock of mtx_.
     // Made virtual for mock testing.
     virtual void
-    clear_data();
+    unload();
 
     void
     unpin();
 
     // must be called under the lock of mtx_.
     void
-    touch(bool update_evictable_size);
+    touch_to_dlist(bool update_evictable_size);
 
     mutable std::shared_mutex mtx_;
     // if a ListNode is in a DList, last_touch_ is the time when the node was lastly pushed
