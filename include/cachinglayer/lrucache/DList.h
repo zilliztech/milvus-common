@@ -114,7 +114,7 @@ class DList {
     // Returns the time point when the item was last touched. This methods always acquires the
     // global list_mtx_, thus the returned time point is guaranteed to be monotonically increasing.
     std::chrono::steady_clock::time_point
-    touchItem(ListNode* list_node, std::optional<ResourceUsage> size = std::nullopt);
+    touchItem(ListNode* list_node, bool force_touch = false, std::optional<ResourceUsage> size = std::nullopt);
 
     // Caller must guarantee that the current thread holds the lock of list_node->mtx_.
     // Removes the node from the list and updates used_resources_.

@@ -28,6 +28,10 @@ namespace cachinglayer::internal {
 class DListTestFriend {
  public:
     static ResourceUsage
+    get_using_memory(const DList& dlist) {
+        return dlist.total_loaded_size_.load() + dlist.total_loading_size_.load();
+    }
+    static ResourceUsage
     get_used_memory(const DList& dlist) {
         return dlist.total_loaded_size_.load();
     }
@@ -65,7 +69,16 @@ class DListTestFriend {
         std::lock_guard lock(dlist->list_mtx_);
         dlist->total_loaded_size_ += size;
     }
-
+    static void
+    test_add_loading_memory(DList* dlist, const ResourceUsage& size) {
+        std::lock_guard lock(dlist->list_mtx_);
+        dlist->total_loading_size_ += size;
+    }
+    static void
+    test_sub_loading_memory(DList* dlist, const ResourceUsage& size) {
+        std::lock_guard lock(dlist->list_mtx_);
+        dlist->total_loading_size_ -= size;
+    }
     static void
     test_add_evictable_memory(DList* dlist, const ResourceUsage& size) {
         dlist->evictable_size_ += size;
