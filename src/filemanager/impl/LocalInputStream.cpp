@@ -55,8 +55,7 @@ LocalInputStream::Read(void* ptr, size_t size) {
 
 size_t
 LocalInputStream::ReadAt(void* ptr, size_t offset, size_t size) {
-    size_t cur = stream_.tellg();
-    if (cur + size > size_) {
+    if (offset + size > size_) {
         throw std::runtime_error("Read out of range");
     }
     std::lock_guard<std::mutex> lock(mutex_);
