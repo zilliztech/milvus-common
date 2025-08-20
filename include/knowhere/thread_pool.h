@@ -171,6 +171,9 @@ class ThreadPool {
     InitGlobalSearchThreadPool(uint32_t num_threads);
 
     static void
+    InitGlobalFetchObjectThreadPool(uint32_t num_threads);
+
+    static void
     SetGlobalBuildThreadPoolSize(uint32_t num_threads);
 
     static size_t
@@ -182,17 +185,29 @@ class ThreadPool {
     static size_t
     GetGlobalSearchThreadPoolSize();
 
+    static void
+    SetGlobalFetchObjectThreadPoolSize(uint32_t num_threads);
+
+    static size_t
+    GetGlobalFetchObjectThreadPoolSize();
+
     static size_t
     GetSearchThreadPoolPendingTaskCount();
 
     static size_t
     GetBuildThreadPoolPendingTaskCount();
 
+    static size_t
+    GetFetchObjectThreadPoolPendingTaskCount();
+
     static std::shared_ptr<ThreadPool>
     GetGlobalBuildThreadPool();
 
     static std::shared_ptr<ThreadPool>
     GetGlobalSearchThreadPool();
+
+    static std::shared_ptr<ThreadPool>
+    GetGlobalFetchObjectThreadPool();
 
     class ScopedBuildOmpSetter {
         int omp_before;
@@ -222,6 +237,9 @@ class ThreadPool {
 
     static std::mutex search_pool_mutex_;
     static std::shared_ptr<ThreadPool> search_pool_;
+
+    static std::mutex fetch_object_pool_mutex_;
+    static std::shared_ptr<ThreadPool> fetch_object_pool_;
 
     constexpr static size_t kTaskQueueFactor = 16;
 };

@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstddef>
 #include <fstream>
+#include <mutex>
 
 #include "filemanager/InputStream.h"
 
@@ -23,6 +25,9 @@ class LocalInputStream : public InputStream {
     size_t
     Read(void* ptr, size_t size) override;
 
+    size_t
+    ReadAt(void* ptr, size_t offset, size_t size) override;
+
     template <typename T>
     size_t
     Read(T& value) {
@@ -39,6 +44,7 @@ class LocalInputStream : public InputStream {
     mutable std::ifstream stream_;
     size_t size_;
     std::string filename_;
+    std::mutex mutex_;
 };
 
 }  // namespace milvus
