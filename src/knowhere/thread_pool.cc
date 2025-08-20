@@ -60,7 +60,7 @@ ThreadPool::InitGlobalSearchThreadPool(uint32_t num_threads) {
 }
 
 void
-ThreadPool::InitGlobalFetchObjectThreadPool(uint32_t num_threads) {
+ThreadPool::InitGlobalFetchThreadPool(uint32_t num_threads) {
     if (num_threads <= 0) {
         LOG_ERROR("num_threads should be bigger than 0");
         return;
@@ -114,9 +114,9 @@ ThreadPool::GetGlobalSearchThreadPoolSize() {
 }
 
 void
-ThreadPool::SetGlobalFetchObjectThreadPoolSize(uint32_t num_threads) {
+ThreadPool::SetGlobalFetchThreadPoolSize(uint32_t num_threads) {
     if (fetch_object_pool_ == nullptr) {
-        InitGlobalFetchObjectThreadPool(num_threads);
+        InitGlobalFetchThreadPool(num_threads);
         return;
     } else {
         fetch_object_pool_->SetNumThreads(num_threads);
@@ -127,7 +127,7 @@ ThreadPool::SetGlobalFetchObjectThreadPoolSize(uint32_t num_threads) {
 }
 
 size_t
-ThreadPool::GetGlobalFetchObjectThreadPoolSize() {
+ThreadPool::GetGlobalFetchThreadPoolSize() {
     return (fetch_object_pool_ == nullptr ? 0 : fetch_object_pool_->size());
 }
 
@@ -142,8 +142,8 @@ ThreadPool::GetBuildThreadPoolPendingTaskCount() {
 }
 
 size_t
-ThreadPool::GetFetchObjectThreadPoolPendingTaskCount() {
-    return ThreadPool::GetGlobalFetchObjectThreadPool()->GetPendingTaskCount();
+ThreadPool::GetFetchThreadPoolPendingTaskCount() {
+    return ThreadPool::GetGlobalFetchThreadPool()->GetPendingTaskCount();
 }
 
 std::shared_ptr<ThreadPool>
@@ -163,9 +163,9 @@ ThreadPool::GetGlobalSearchThreadPool() {
 }
 
 std::shared_ptr<ThreadPool>
-ThreadPool::GetGlobalFetchObjectThreadPool() {
+ThreadPool::GetGlobalFetchThreadPool() {
     if (fetch_object_pool_ == nullptr) {
-        InitGlobalFetchObjectThreadPool(std::thread::hardware_concurrency());
+        InitGlobalFetchThreadPool(std::thread::hardware_concurrency());
     }
     return fetch_object_pool_;
 }
