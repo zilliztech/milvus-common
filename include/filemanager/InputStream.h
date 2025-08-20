@@ -11,8 +11,6 @@
 
 #pragma once
 
-#include <folly/futures/Future.h>
-
 #include <string>
 
 namespace milvus {
