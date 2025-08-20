@@ -7,6 +7,8 @@ std::mutex ThreadPool::build_pool_mutex_;
 std::shared_ptr<ThreadPool> ThreadPool::build_pool_ = nullptr;
 std::mutex ThreadPool::search_pool_mutex_;
 std::shared_ptr<ThreadPool> ThreadPool::search_pool_ = nullptr;
+std::mutex ThreadPool::fetch_object_pool_mutex_;
+std::shared_ptr<ThreadPool> ThreadPool::fetch_object_pool_ = nullptr;
 
 ThreadPool
 ThreadPool::CreateFIFO(uint32_t num_threads, const std::string& thread_name_prefix) {
@@ -58,6 +60,26 @@ ThreadPool::InitGlobalSearchThreadPool(uint32_t num_threads) {
 }
 
 void
+ThreadPool::InitGlobalFetchObjectThreadPool(uint32_t num_threads) {
+    if (num_threads <= 0) {
+        LOG_ERROR("num_threads should be bigger than 0");
+        return;
+    }
+
+    if (fetch_object_pool_ == nullptr) {
+        std::lock_guard<std::mutex> lock(fetch_object_pool_mutex_);
+        if (fetch_object_pool_ == nullptr) {
+            fetch_object_pool_ = std::make_shared<ThreadPool>(num_threads, "knowhere_fetch_object");
+            LOG_INFO(fmt::format("Init global fetch object thread pool with size {}", num_threads));
+            return;
+        }
+    } else {
+        LOG_INFO(fmt::format("Global fetch object thread pool size has already been initialized to {}",
+                             fetch_object_pool_->size()));
+    }
+}
+
+void
 ThreadPool::SetGlobalBuildThreadPoolSize(uint32_t num_threads) {
     if (build_pool_ == nullptr) {
         InitGlobalBuildThreadPool(num_threads);
@@ -91,6 +113,24 @@ ThreadPool::GetGlobalSearchThreadPoolSize() {
     return (search_pool_ == nullptr ? 0 : search_pool_->size());
 }
 
+void
+ThreadPool::SetGlobalFetchObjectThreadPoolSize(uint32_t num_threads) {
+    if (fetch_object_pool_ == nullptr) {
+        InitGlobalFetchObjectThreadPool(num_threads);
+        return;
+    } else {
+        fetch_object_pool_->SetNumThreads(num_threads);
+        LOG_INFO(
+            fmt::format("Global fetch object thread pool size has already been set to {}", fetch_object_pool_->size()));
+        return;
+    }
+}
+
+size_t
+ThreadPool::GetGlobalFetchObjectThreadPoolSize() {
+    return (fetch_object_pool_ == nullptr ? 0 : fetch_object_pool_->size());
+}
+
 size_t
 ThreadPool::GetSearchThreadPoolPendingTaskCount() {
     return ThreadPool::GetGlobalSearchThreadPool()->GetPendingTaskCount();
@@ -99,6 +139,11 @@ ThreadPool::GetSearchThreadPoolPendingTaskCount() {
 size_t
 ThreadPool::GetBuildThreadPoolPendingTaskCount() {
     return ThreadPool::GetGlobalBuildThreadPool()->GetPendingTaskCount();
+}
+
+size_t
+ThreadPool::GetFetchObjectThreadPoolPendingTaskCount() {
+    return ThreadPool::GetGlobalFetchObjectThreadPool()->GetPendingTaskCount();
 }
 
 std::shared_ptr<ThreadPool>
@@ -115,6 +160,14 @@ ThreadPool::GetGlobalSearchThreadPool() {
         InitGlobalSearchThreadPool(std::thread::hardware_concurrency());
     }
     return search_pool_;
+}
+
+std::shared_ptr<ThreadPool>
+ThreadPool::GetGlobalFetchObjectThreadPool() {
+    if (fetch_object_pool_ == nullptr) {
+        InitGlobalFetchObjectThreadPool(std::thread::hardware_concurrency());
+    }
+    return fetch_object_pool_;
 }
 
 ThreadPool::ScopedBuildOmpSetter::ScopedBuildOmpSetter(int num_threads) {
