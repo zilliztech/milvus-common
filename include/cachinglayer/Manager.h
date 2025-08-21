@@ -51,49 +51,49 @@ class Manager {
 
     bool
     ReserveLoadingResourceWithTimeout(const ResourceUsage& size, std::chrono::milliseconds timeout) {
-        return SemiInlineGet(dlist_->reserveLoadingResourceWithTimeout(size, timeout));
+        return SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(size, timeout));
     }
 
     void
     ReleaseLoadingResource(const ResourceUsage& size) {
-        dlist_->releaseLoadingResource(size);
+        dlist_->ReleaseLoadingResource(size);
     }
 
     void
     ChargeLoadedResource(const ResourceUsage& size) {
-        dlist_->chargeLoadedResource(size);
+        dlist_->ChargeLoadedResource(size);
     }
 
     void
     RefundLoadedResource(const ResourceUsage& size) {
-        dlist_->refundLoadedResource(size);
+        dlist_->RefundLoadedResource(size);
     }
 
     // memory overhead for managing all cache slots/cells/translators/policies.
-    size_t
+    [[nodiscard]] size_t
     memory_overhead() const;
 
-    CacheWarmupPolicy
+    [[nodiscard]] CacheWarmupPolicy
     getScalarFieldCacheWarmupPolicy() const {
         return warmup_policies_.scalarFieldCacheWarmupPolicy;
     }
 
-    CacheWarmupPolicy
+    [[nodiscard]] CacheWarmupPolicy
     getVectorFieldCacheWarmupPolicy() const {
         return warmup_policies_.vectorFieldCacheWarmupPolicy;
     }
 
-    CacheWarmupPolicy
+    [[nodiscard]] CacheWarmupPolicy
     getScalarIndexCacheWarmupPolicy() const {
         return warmup_policies_.scalarIndexCacheWarmupPolicy;
     }
 
-    CacheWarmupPolicy
+    [[nodiscard]] CacheWarmupPolicy
     getVectorIndexCacheWarmupPolicy() const {
         return warmup_policies_.vectorIndexCacheWarmupPolicy;
     }
 
-    bool
+    [[nodiscard]] bool
     isEvictionEnabled() const {
         return evictionEnabled_;
     }

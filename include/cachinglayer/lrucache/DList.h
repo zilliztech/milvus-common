@@ -90,19 +90,19 @@ class DList {
 
     // Reserve loading resource with timeout, called before loading a cell.
     folly::SemiFuture<bool>
-    reserveLoadingResourceWithTimeout(const ResourceUsage& size, std::chrono::milliseconds timeout);
+    ReserveLoadingResourceWithTimeout(const ResourceUsage& size, std::chrono::milliseconds timeout);
 
     // Release resource used for loading, called after loading a cell.
     void
-    releaseLoadingResource(const ResourceUsage& loading_size);
+    ReleaseLoadingResource(const ResourceUsage& loading_size);
 
     // Called when a cell is loaded.
     void
-    chargeLoadedResource(const ResourceUsage& size);
+    ChargeLoadedResource(const ResourceUsage& size);
 
     // Called when a cell is evicted or manually released.
     void
-    refundLoadedResource(const ResourceUsage& size);
+    RefundLoadedResource(const ResourceUsage& size);
 
     // Caller must guarantee that the current thread holds the lock of list_node->mtx_.
     // touchItem is used in 2 places:
@@ -110,6 +110,7 @@ class DList {
     //    we don't update used_resources_ here.
     // 2. when a cell is loaded as a bonus, we need to touch it to insert into the LRU and update
     //    used_resources_ to track the memory usage(usage of such cell is not counted during reservation).
+    // force_touch is used to force a DList touch event, mainly for testing.
     //
     // Returns the time point when the item was last touched. This methods always acquires the
     // global list_mtx_, thus the returned time point is guaranteed to be monotonically increasing.
@@ -121,6 +122,7 @@ class DList {
     void
     removeItem(ListNode* list_node, ResourceUsage size);
 
+    // Called when a cell is frozen, i.e. the cell is pinned and will not be evicted.
     void
     freezeItem(ListNode* list_node [[maybe_unused]], ResourceUsage size);
 
@@ -161,9 +163,9 @@ class DList {
         }
     };
 
-    // reserveMemory without taking lock, must be called with lock held.
+    // reserveResource without taking lock, must be called with lock held.
     bool
-    reserveMemoryInternal(const ResourceUsage& size);
+    reserveResourceInternal(const ResourceUsage& size);
 
     void
     evictionLoop();

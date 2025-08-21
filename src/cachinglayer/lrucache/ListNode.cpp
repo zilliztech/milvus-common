@@ -64,7 +64,7 @@ ListNode::~ListNode() {
         case State::LOADED: {
             auto saved_loaded_size = loaded_size_;
             unload();
-            dlist_->refundLoadedResource(saved_loaded_size);
+            dlist_->RefundLoadedResource(saved_loaded_size);
             break;
         }
         case State::LOADING: {
@@ -99,7 +99,7 @@ ListNode::manual_evict() {
             }
             auto saved_loaded_size = loaded_size_;
             unload();
-            dlist_->refundLoadedResource(saved_loaded_size);
+            dlist_->RefundLoadedResource(saved_loaded_size);
             return true;
         }
         case State::LOADING: {

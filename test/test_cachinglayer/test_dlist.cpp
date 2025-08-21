@@ -60,13 +60,13 @@ class DListTest : public ::testing::Test {
     reserveLoadingMemorySync(const ResourceUsage& size,
                              std::chrono::milliseconds timeout = std::chrono::milliseconds(100)) {
         // Use 1 hour timeout for tests
-        auto future = dlist->reserveLoadingResourceWithTimeout(size, timeout);
+        auto future = dlist->ReserveLoadingResourceWithTimeout(size, timeout);
         return std::move(future).get();
     }
 
     void
     releaseLoadingMemory(const ResourceUsage& size) {
-        dlist->releaseLoadingResource(size);
+        dlist->ReleaseLoadingResource(size);
     }
 
     // Helper to create a mock node, simulate loading it, and add it to the list.
@@ -242,13 +242,13 @@ TEST_F(DListTest, UpdateMaxLimitInvalid) {
     EXPECT_THROW(dlist->UpdateMaxLimit({0, -5}), milvus::SegcoreError);
 }
 
-TEST_F(DListTest, ReserveMemorySufficient) {
+TEST_F(DListTest, ReserveResourceSufficient) {
     ResourceUsage size{20, 10};
     EXPECT_TRUE(reserveLoadingMemorySync(size));
     EXPECT_EQ(get_loading_memory(), size);
 }
 
-TEST_F(DListTest, ReserveMemoryRequiresEviction) {
+TEST_F(DListTest, ReserveResourceRequiresEviction) {
     MockListNode* node1 = add_and_load_node({30, 15}, "key1");
     MockListNode* node2 = add_and_load_node({20, 10}, "key2");
     ResourceUsage usage_node1 = node1->loaded_size();
@@ -273,7 +273,7 @@ TEST_F(DListTest, ReserveMemoryRequiresEviction) {
     DLF::verify_list(dlist.get(), {node2});
 }
 
-TEST_F(DListTest, ReserveMemoryEvictPinnedSkipped) {
+TEST_F(DListTest, ReserveResourceEvictPinnedSkipped) {
     MockListNode* node_pinned = add_and_load_node({33, 15}, "key_pinned", 0, 1);
     MockListNode* node_evict = add_and_load_node({20, 10}, "key_evict");
     ResourceUsage usage_pinned = node_pinned->loaded_size();
@@ -293,7 +293,7 @@ TEST_F(DListTest, ReserveMemoryEvictPinnedSkipped) {
     DLF::verify_list(dlist.get(), {node_pinned});
 }
 
-TEST_F(DListTest, ReserveMemoryEvictLockedSkipped) {
+TEST_F(DListTest, ReserveResourceEvictLockedSkipped) {
     MockListNode* node_locked = add_and_load_node({33, 15}, "key_locked");
     MockListNode* node_evict = add_and_load_node({20, 10}, "key_evict");
     ResourceUsage usage_locked = node_locked->loaded_size();
@@ -318,7 +318,7 @@ TEST_F(DListTest, ReserveMemoryEvictLockedSkipped) {
     DLF::verify_list(dlist.get(), {node_locked});
 }
 
-TEST_F(DListTest, ReserveMemoryInsufficientEvenWithEviction) {
+TEST_F(DListTest, ReserveResourceInsufficientEvenWithEviction) {
     MockListNode* node1 = add_and_load_node({10, 5});
     ResourceUsage usage_node1 = node1->loaded_size();
     ASSERT_EQ(get_used_memory(), usage_node1);
@@ -392,13 +392,13 @@ TEST_F(DListTest, ReleaseLoadingResource) {
     // Reserve and then release loading resource
     EXPECT_TRUE(reserveLoadingMemorySync(failed_load_size));
     EXPECT_EQ(get_loading_memory(), failed_load_size);
-    dlist->releaseLoadingResource(failed_load_size);
+    dlist->ReleaseLoadingResource(failed_load_size);
 
     EXPECT_EQ(get_used_memory(), initial_size);
     EXPECT_EQ(get_loading_memory(), ResourceUsage{});
 }
 
-TEST_F(DListTest, ReserveMemoryEvictOnlyMemoryNeeded) {
+TEST_F(DListTest, ReserveResourceEvictOnlyMemoryNeeded) {
     MockListNode* node_disk_only = add_and_load_node({0, 10}, "disk_only");
     MockListNode* node_mixed = add_and_load_node({25, 5}, "mixed");
     ResourceUsage usage_disk = node_disk_only->loaded_size();
@@ -419,7 +419,7 @@ TEST_F(DListTest, ReserveMemoryEvictOnlyMemoryNeeded) {
     DLF::verify_list(dlist.get(), {node_disk_only});
 }
 
-TEST_F(DListTest, ReserveMemoryEvictOnlyDiskNeeded) {
+TEST_F(DListTest, ReserveResourceEvictOnlyDiskNeeded) {
     MockListNode* node_memory_only = add_and_load_node({30, 0}, "memory_only");
     MockListNode* node_mixed = add_and_load_node({20, 15}, "mixed");
     ResourceUsage usage_memory = node_memory_only->loaded_size();
@@ -440,7 +440,7 @@ TEST_F(DListTest, ReserveMemoryEvictOnlyDiskNeeded) {
     DLF::verify_list(dlist.get(), {node_memory_only});
 }
 
-TEST_F(DListTest, ReserveMemoryEvictBothNeeded) {
+TEST_F(DListTest, ReserveResourceEvictBothNeeded) {
     MockListNode* node1 = add_and_load_node({20, 5}, "node1");
     MockListNode* node2 = add_and_load_node({10, 10}, "node2");
     MockListNode* node3 = add_and_load_node({20, 5}, "node3");
@@ -507,7 +507,7 @@ TEST_F(DListTest, ReserveToAboveHighWatermarkNoEvictionThenAutoEviction) {
     DLF::verify_list(dlist.get(), {node2});
 }
 
-TEST_F(DListTest, ReserveMemoryFailsAllPinned) {
+TEST_F(DListTest, ReserveResourceFailsAllPinned) {
     MockListNode* node1 = add_and_load_node({30, 15}, "key1", 0, 1);
     MockListNode* node2 = add_and_load_node({20, 10}, "key2", 0, 1);
     ResourceUsage usage_node1 = node1->loaded_size();
@@ -525,7 +525,7 @@ TEST_F(DListTest, ReserveMemoryFailsAllPinned) {
     DLF::verify_list(dlist.get(), {node1, node2});
 }
 
-TEST_F(DListTest, ReserveMemoryFailsAllLocked) {
+TEST_F(DListTest, ReserveResourceFailsAllLocked) {
     MockListNode* node1 = add_and_load_node({30, 15}, "key1");
     MockListNode* node2 = add_and_load_node({20, 10}, "key2");
     ResourceUsage usage_node1 = node1->loaded_size();
@@ -549,7 +549,7 @@ TEST_F(DListTest, ReserveMemoryFailsAllLocked) {
     DLF::verify_list(dlist.get(), {node1, node2});
 }
 
-TEST_F(DListTest, ReserveMemoryFailsSpecificPinned) {
+TEST_F(DListTest, ReserveResourceFailsSpecificPinned) {
     MockListNode* node_evict = add_and_load_node({30, 15}, "evict_candidate", 0, 1);
     MockListNode* node_small = add_and_load_node({20, 10}, "small");
     ResourceUsage usage_evict = node_evict->loaded_size();
@@ -567,7 +567,7 @@ TEST_F(DListTest, ReserveMemoryFailsSpecificPinned) {
     DLF::verify_list(dlist.get(), {node_evict, node_small});
 }
 
-TEST_F(DListTest, ReserveMemoryFailsSpecificLocked) {
+TEST_F(DListTest, ReserveResourceFailsSpecificLocked) {
     MockListNode* node_evict = add_and_load_node({30, 15}, "evict_candidate");
     MockListNode* node_small = add_and_load_node({20, 10}, "small");
     ResourceUsage usage_evict = node_evict->loaded_size();
@@ -738,7 +738,7 @@ TEST_F(DListTest, UpdateWatermarksInvalid) {
     EXPECT_THROW(dlist->UpdateHighWatermark({0, -5}), milvus::SegcoreError);
 }
 
-TEST_F(DListTest, ReserveMemoryUsesLowWatermark) {
+TEST_F(DListTest, ReserveResourceUsesLowWatermark) {
     // Set up: Limit 100/100, Low 80/80, High 90/90
     initial_limit = {100, 100};
     low_watermark = {80, 80};

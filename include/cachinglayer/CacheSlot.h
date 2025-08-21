@@ -232,10 +232,10 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             }
 
             reservation_success =
-                SemiInlineGet(dlist_->reserveLoadingResourceWithTimeout(resource_needed_for_loading, timeout));
+                SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(resource_needed_for_loading, timeout));
             // defer release resource_needed_for_loading
             auto defer_release = folly::makeGuard(
-                [this, resource_needed_for_loading]() { dlist_->releaseLoadingResource(resource_needed_for_loading); });
+                [this, resource_needed_for_loading]() { dlist_->ReleaseLoadingResource(resource_needed_for_loading); });
             LOG_TRACE(
                 "[MCL] CacheSlot reserveLoadingResourceWithTimeout {} sec "
                 "result: {} time: {} sec, resource_needed: {}, key: {}",
@@ -313,7 +313,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                             key());
                         loaded_size_ = slot_->translator_->estimated_byte_size_of_cell(cid_).first;
                     }
-                    slot_->dlist_->chargeLoadedResource(loaded_size_);
+                    slot_->dlist_->ChargeLoadedResource(loaded_size_);
                     life_start_ = std::chrono::steady_clock::now();
                     milvus::monitor::internal_cache_used_bytes_memory.Increment(loaded_size_.memory_bytes);
                     milvus::monitor::internal_cache_used_bytes_disk.Increment(loaded_size_.file_bytes);
@@ -340,6 +340,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                 milvus::monitor::internal_cache_used_bytes_disk.Decrement(loaded_size_.file_bytes);
             }
         }
+
         std::string
         key() const override {
             return fmt::format("{}:{}", slot_->translator_->key(), cid_);
