@@ -270,8 +270,8 @@ struct EvictionConfig {
           cache_cell_unaccessed_survival_time(std::chrono::seconds(0)),
           overloaded_memory_threshold_percentage(0.9),
           max_disk_usage_percentage(0.95),
-          loading_memory_factor(2.5f),
-          disk_path("") {
+          disk_path(""),
+          loading_memory_factor(2.5f) {
     }
 
     EvictionConfig(int64_t cache_touch_window_ms, int64_t eviction_interval_ms)
@@ -280,8 +280,8 @@ struct EvictionConfig {
           cache_cell_unaccessed_survival_time(std::chrono::seconds(0)),
           overloaded_memory_threshold_percentage(0.9),
           max_disk_usage_percentage(0.95),
-          loading_memory_factor(2.5f),
-          disk_path("") {
+          disk_path(""),
+          loading_memory_factor(2.5f) {
     }
 
     EvictionConfig(int64_t cache_touch_window_ms, int64_t eviction_interval_ms,

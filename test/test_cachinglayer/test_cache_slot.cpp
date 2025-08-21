@@ -43,9 +43,9 @@ class MockTranslator : public Translator<TestCell> {
                    std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map, const std::string& key, StorageType storage_type,
                    bool for_concurrent_test = false)
         : uid_to_cid_map_(std::move(uid_to_cid_map)),
+          num_unique_cids_(cell_sizes.size()),
           key_(key),
           meta_(storage_type, CellIdMappingMode::CUSTOMIZED, CacheWarmupPolicy::CacheWarmupPolicy_Disable, true),
-          num_unique_cids_(cell_sizes.size()),
           for_concurrent_test_(for_concurrent_test) {
         cid_set_.reserve(cell_sizes.size());
         cell_sizes_.reserve(cell_sizes.size());
