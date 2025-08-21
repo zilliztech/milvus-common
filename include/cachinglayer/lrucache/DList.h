@@ -32,9 +32,9 @@ class DList {
  public:
     DList(ResourceUsage max_memory, ResourceUsage low_watermark, ResourceUsage high_watermark,
           EvictionConfig eviction_config)
-        : max_memory_(max_memory),
-          low_watermark_(low_watermark),
+        : low_watermark_(low_watermark),
           high_watermark_(high_watermark),
+          max_memory_(max_memory),
           eviction_config_(eviction_config),
           next_request_id_(1) {
         AssertInfo(low_watermark.AllGEZero(), "[MCL] low watermark must be greater than or equal to 0");

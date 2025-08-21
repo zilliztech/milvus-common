@@ -72,7 +72,7 @@ LocalInputStream::Read(int fd, size_t size) {
         if (read_size != write_size) {
             throw std::runtime_error("Read from stream " + filename_ + " failed");
         }
-        if (::write(fd, buffer.data(), read_size) != read_size) {
+        if (static_cast<size_t>(::write(fd, buffer.data(), read_size)) != read_size) {
             throw std::runtime_error("Write to fd " + std::to_string(fd) + " failed");
         }
         total_read_size += read_size;

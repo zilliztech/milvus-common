@@ -50,11 +50,11 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
 
     CacheSlot(std::unique_ptr<Translator<CellT>> translator, internal::DList* dlist, bool evictable)
         : translator_(std::move(translator)),
-          cell_id_mapping_mode_(translator_->meta()->cell_id_mapping_mode),
           cells_(translator_->num_cells()),
+          cell_id_mapping_mode_(translator_->meta()->cell_id_mapping_mode),
           dlist_(dlist),
           evictable_(evictable) {
-        for (cid_t i = 0; i < translator_->num_cells(); ++i) {
+        for (cid_t i = 0; i < static_cast<cid_t>(translator_->num_cells()); ++i) {
             new (&cells_[i]) CacheCell(this, i, translator_->estimated_byte_size_of_cell(i));
         }
         auto storage_type = translator_->meta()->storage_type;
@@ -181,7 +181,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         need_load_cids.reserve(cids.size());
         auto resource_needed = ResourceUsage{0, 0};
         for (const auto& cid : cids) {
-            if (cid >= cells_.size()) {
+            if (cid >= static_cast<cid_t>(cells_.size())) {
                 ThrowInfo(ErrorCode::OutOfRange, "cid {} out of range, slot has {} cells. key={}", cid, cells_.size(),
                           translator_->key());
             }
