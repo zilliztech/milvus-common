@@ -71,9 +71,11 @@ class Translator {
     meta() = 0;
 
     // Translator may choose to fetch more than requested cells. The default behavior is to not include extra cells.
-    virtual std::vector<cid_t>
+    virtual std::pair<std::vector<cid_t>, std::vector<cid_t>>
     cell_ids_to_be_loaded(const std::vector<cid_t>& cids) {
-        return cids;
+        // the first vector is the cells to be loaded,
+        // the second vector is the cells to be skipped.
+        return {cids, {}};
     }
 
     // extra cells strategy should be added in cell_ids_to_be_loaded(), get_cells() should just a load executor.

@@ -220,19 +220,43 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
 
     void
     RunLoad(std::unordered_set<cid_t>&& cids, std::chrono::milliseconds timeout) {
-        ResourceUsage resource_needed_for_loading{};
+        ResourceUsage essential_loading_resource{};
+        ResourceUsage bonus_loading_resource{};
         try {
             auto start = std::chrono::steady_clock::now();
             bool reservation_success = false;
 
-            auto cids_vec = translator_->cell_ids_to_be_loaded({cids.begin(), cids.end()});
+            auto [cids_vec, bonus_cids_vec] = translator_->cell_ids_to_be_loaded({cids.begin(), cids.end()});
 
             for (auto& cid : cids_vec) {
-                resource_needed_for_loading += translator_->estimated_byte_size_of_cell(cid).second;
+                essential_loading_resource += translator_->estimated_byte_size_of_cell(cid).second;
             }
 
+            for (auto& cid : bonus_cids_vec) {
+                bonus_loading_resource += translator_->estimated_byte_size_of_cell(cid).first;
+            }
+
+            auto resource_needed_for_loading = essential_loading_resource + bonus_loading_resource;
             reservation_success =
                 SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(resource_needed_for_loading, timeout));
+
+            // if the reservation failed, try to reserve only the essential loading resource
+            if (!reservation_success) {
+                resource_needed_for_loading = essential_loading_resource;
+                reservation_success =
+                    SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(resource_needed_for_loading, timeout));
+            }
+
+            if (!reservation_success) {
+                auto error_msg = fmt::format(
+                    "[MCL] CacheSlot failed to reserve resource for "
+                    "cells: key={}, cell_ids=[{}], total "
+                    "resource_needed_for_loading={}",
+                    translator_->key(), fmt::join(cids_vec, ","), resource_needed_for_loading.ToString());
+                LOG_ERROR(error_msg);
+                ThrowInfo(ErrorCode::InsufficientResource, error_msg);
+            }
+
             // defer release resource_needed_for_loading
             auto defer_release = folly::makeGuard(
                 [this, resource_needed_for_loading]() { dlist_->ReleaseLoadingResource(resource_needed_for_loading); });
@@ -244,16 +268,6 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                         .count() *
                     1.0 / 1000,
                 resource_needed_for_loading.ToString(), translator_->key());
-
-            if (!reservation_success) {
-                auto error_msg = fmt::format(
-                    "[MCL] CacheSlot failed to reserve memory for "
-                    "cells: key={}, cell_ids=[{}], total "
-                    "resource_needed_for_loading={}",
-                    translator_->key(), fmt::join(cids_vec, ","), resource_needed_for_loading.ToString());
-                LOG_ERROR(error_msg);
-                ThrowInfo(ErrorCode::InsufficientResource, error_msg);
-            }
 
             start = std::chrono::steady_clock::now();
             auto results = translator_->get_cells(cids_vec);
