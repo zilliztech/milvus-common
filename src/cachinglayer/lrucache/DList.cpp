@@ -340,6 +340,9 @@ DList::tryEvict(const ResourceUsage& expected_eviction, const ResourceUsage& min
         popItem(list_node);   // must succeed, otherwise the node is not in the list
         list_node->unload();  // NOTE: after unload(), the node's loaded_size() is reset to {0, 0} and state_ is reset
                               // to NOT_LOADED.
+        // if this cell is evicted, loaded, pinned and unpinned within a single refresh window,
+        // the cell should be inserted into the LRU list again.
+        list_node->last_touch_ = std::chrono::steady_clock::now() - 2 * eviction_config_.cache_touch_window;
     }
     // Refund logically evicted resources manually, waiting requests notification is left to caller.
     total_loaded_size_ -= size_to_evict;
@@ -429,7 +432,7 @@ DList::ReleaseLoadingResource(const ResourceUsage& loading_size) {
     notifyWaitingRequests();
 }
 
-std::chrono::steady_clock::time_point
+void
 DList::touchItem(ListNode* list_node, bool force_touch, std::optional<ResourceUsage> size) {
     // update evictable_size_ if size is provided
     if (size.has_value()) {
@@ -438,7 +441,7 @@ DList::touchItem(ListNode* list_node, bool force_touch, std::optional<ResourceUs
     // check if the node should be moved forward
     auto now = std::chrono::steady_clock::now();
     if (!force_touch && now - list_node->last_touch_ <= eviction_config_.cache_touch_window) {
-        return list_node->last_touch_;
+        return;
     }
     // move the node to the head of the list
     std::lock_guard<std::mutex> list_lock(list_mtx_);
@@ -448,7 +451,7 @@ DList::touchItem(ListNode* list_node, bool force_touch, std::optional<ResourceUs
     if (size.has_value() && !waiting_queue_empty_) {
         notifyWaitingRequests();
     }
-    return std::chrono::steady_clock::now();
+    list_node->last_touch_ = now;
 }
 
 void
@@ -458,6 +461,9 @@ DList::removeItem(ListNode* list_node, ResourceUsage size) {
         evictable_size_ -= size;
         AssertInfo(evictable_size_.load().AllGEZero(), "[MCL] evictable_size_ should be non-negative but got: {}",
                    evictable_size_.load().ToString());
+        // if the cell is evicted, loaded, pinned and unpinned within a single refresh window,
+        // the cell should be inserted into the LRU list again.
+        list_node->last_touch_ = std::chrono::steady_clock::now() - 2 * eviction_config_.cache_touch_window;
     }
 }
 

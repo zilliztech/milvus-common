@@ -50,7 +50,7 @@ struct TrackingStdAllocator : public std::allocator<T> {
         base_type::deallocate(p, n);
     }
 
-    size_t
+    [[nodiscard]] size_t
     total_allocated() const noexcept {
         return counter_->load(std::memory_order_relaxed);
     }

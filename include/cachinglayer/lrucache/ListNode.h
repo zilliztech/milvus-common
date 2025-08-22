@@ -80,24 +80,28 @@ class ListNode {
     manual_evict();
 
     // State transition diagram:
-    // +-----------+            +---------+
-    // | NOT_LOAD  | <--------> | LOADING |
-    // +-----------+            +---------+
+    // +------------+           +---------+
+    // | NOT_LOADED | <-------> | LOADING |
+    // +------------+           +---------+
     //      ^   ^                   |
     //      |   |                   v
     //      |   |               +---------+
-    //      |   +---------------| LOADED  |
+    //      |   +-------------- | LOADED  |
     //      |                   +---------+
     //      |                        |
     //      |                        v
     //      |                 +---------------------------+
-    //      +-----------------| CACHED && pin_count == 0  |
+    //      +---------------> | CACHED && pin_count == 0  |
     //                        +---------------------------+
     //                               ^        |
     //                               |        v
     //                        +---------------------------+
     //                        | CACHED && pin_count != 0  |
     //                        +---------------------------+
+    // NOT_LOADED: The cell is not loaded.
+    // LOADING: The cell is loading.
+    // LOADED: The cell is loaded but not cached in the LRU list, typically used when the cell is non-evictable.
+    // CACHED: The cell is loaded and cached in the LRU list. `pin_count == 0` means the cell can be evicted.
     enum class State { NOT_LOADED, LOADING, LOADED, CACHED };
 
  protected:
@@ -178,6 +182,7 @@ class ListNode {
     static std::string
     state_to_string(State state);
 
+    // loaded_size_ must be set to the real size of the cell when the state is transferred to LOADED/CACHED.
     ResourceUsage loaded_size_{};
 
  private:
@@ -205,6 +210,7 @@ class ListNode {
     mutable std::shared_mutex mtx_;
     // if a ListNode is in a DList, last_touch_ is the time when the node was lastly pushed
     // to the head of the DList. Thus all ListNodes in a DList are sorted by last_touch_.
+    // last_touch_ should only be updated by DList::touchItem, except for the initialization case.
     std::chrono::steady_clock::time_point last_touch_;
     // a nullptr dlist_ means this node is not in any DList, and is not prone to cache management.
     DList* dlist_;

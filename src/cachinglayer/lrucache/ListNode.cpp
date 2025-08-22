@@ -238,11 +238,6 @@ ListNode::touch_to_dlist(bool update_evictable_memory) {
 
 void
 ListNode::unload() {
-    // if the cell is evicted, loaded, pinned and unpinned within a single refresh window,
-    // the cell should be inserted into the cache again.
-    if (evictable_) {
-        last_touch_ = std::chrono::steady_clock::now() - 2 * dlist_->eviction_config().cache_touch_window;
-    }
     clear_data();
     LOG_TRACE("[MCL] ListNode unloaded: key={}, size={}", key(), loaded_size_.ToString());
     loaded_size_ = {0, 0};       // reset loaded_size_ to 0,0 to avoid double refund from dlist_

@@ -222,17 +222,19 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     RunLoad(std::unordered_set<cid_t>&& cids, std::chrono::milliseconds timeout) {
         ResourceUsage essential_loading_resource{};
         ResourceUsage bonus_loading_resource{};
+        std::vector<cid_t> loading_cids;
         try {
             auto start = std::chrono::steady_clock::now();
             bool reservation_success = false;
 
-            auto [cids_vec, bonus_cids_vec] = translator_->cell_ids_to_be_loaded({cids.begin(), cids.end()});
+            loading_cids = std::vector<cid_t>(cids.begin(), cids.end());
+            auto bonus_cids = translator_->bonus_cells_to_be_loaded(loading_cids);
 
-            for (auto& cid : cids_vec) {
+            for (auto& cid : loading_cids) {
                 essential_loading_resource += translator_->estimated_byte_size_of_cell(cid).second;
             }
 
-            for (auto& cid : bonus_cids_vec) {
+            for (auto& cid : bonus_cids) {
                 bonus_loading_resource += translator_->estimated_byte_size_of_cell(cid).first;
             }
 
@@ -245,6 +247,9 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                 resource_needed_for_loading = essential_loading_resource;
                 reservation_success =
                     SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(resource_needed_for_loading, timeout));
+            } else {
+                // if the reservation succeeded, we can load the bonus cells
+                loading_cids.insert(loading_cids.end(), bonus_cids.begin(), bonus_cids.end());
             }
 
             if (!reservation_success) {
@@ -252,7 +257,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                     "[MCL] CacheSlot failed to reserve resource for "
                     "cells: key={}, cell_ids=[{}], total "
                     "resource_needed_for_loading={}",
-                    translator_->key(), fmt::join(cids_vec, ","), resource_needed_for_loading.ToString());
+                    translator_->key(), fmt::join(loading_cids, ","), resource_needed_for_loading.ToString());
                 LOG_ERROR(error_msg);
                 ThrowInfo(ErrorCode::InsufficientResource, error_msg);
             }
@@ -270,7 +275,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                 resource_needed_for_loading.ToString(), translator_->key());
 
             start = std::chrono::steady_clock::now();
-            auto results = translator_->get_cells(cids_vec);
+            auto results = translator_->get_cells(loading_cids);
             auto latency =
                 std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start);
             auto storage_type = translator_->meta()->storage_type;
@@ -284,8 +289,8 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             auto exception = std::current_exception();
             auto ew = folly::exception_wrapper(exception);
             auto storage_type = translator_->meta()->storage_type;
-            internal::cache_load_count_fail(storage_type).Increment(cids.size());
-            for (auto cid : cids) {
+            internal::cache_load_count_fail(storage_type).Increment(loading_cids.size());
+            for (auto cid : loading_cids) {
                 cells_[cid].set_error(ew);
             }
         }

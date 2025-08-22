@@ -112,9 +112,8 @@ class DList {
     //    used_resources_ to track the memory usage(usage of such cell is not counted during reservation).
     // force_touch is used to force a DList touch event, mainly for testing.
     //
-    // Returns the time point when the item was last touched. This methods always acquires the
-    // global list_mtx_, thus the returned time point is guaranteed to be monotonically increasing.
-    std::chrono::steady_clock::time_point
+    // If the item is really touched by DList, its last_touch_ time will be updated.
+    void
     touchItem(ListNode* list_node, bool force_touch = false, std::optional<ResourceUsage> size = std::nullopt);
 
     // Caller must guarantee that the current thread holds the lock of list_node->mtx_.
