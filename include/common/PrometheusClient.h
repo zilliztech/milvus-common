@@ -51,7 +51,11 @@ class PrometheusClient {
 
 /*****************************************************************************/
 // prometheus metrics
-static const std::unique_ptr<PrometheusClient> prometheusClient = std::make_unique<PrometheusClient>();
+
+// singleton prometheus client
+// cannot use static variable here
+// extern declaration may cause segmentation fault due to initialization order.
+PrometheusClient& getPrometheusClient();
 extern const prometheus::Histogram::BucketBoundaries buckets;
 extern const prometheus::Histogram::BucketBoundaries secondsBuckets;
 extern const prometheus::Histogram::BucketBoundaries bytesBuckets;
@@ -59,18 +63,18 @@ extern const prometheus::Histogram::BucketBoundaries ratioBuckets;
 
 #define DEFINE_PROMETHEUS_GAUGE_FAMILY(name, desc)         \
     prometheus::Family<prometheus::Gauge>& name##_family = \
-        prometheus::BuildGauge().Name(#name).Help(desc).Register(milvus::monitor::prometheusClient->GetRegistry());
+        prometheus::BuildGauge().Name(#name).Help(desc).Register(milvus::monitor::getPrometheusClient().GetRegistry());
 #define DEFINE_PROMETHEUS_GAUGE(alias, name, labels) prometheus::Gauge& alias = name##_family.Add(labels);
 
 #define DEFINE_PROMETHEUS_COUNTER_FAMILY(name, desc)         \
     prometheus::Family<prometheus::Counter>& name##_family = \
-        prometheus::BuildCounter().Name(#name).Help(desc).Register(milvus::monitor::prometheusClient->GetRegistry());
+        prometheus::BuildCounter().Name(#name).Help(desc).Register(milvus::monitor::getPrometheusClient().GetRegistry());
 #define DEFINE_PROMETHEUS_COUNTER(alias, name, labels) prometheus::Counter& alias = name##_family.Add(labels);
 
 #define DEFINE_PROMETHEUS_HISTOGRAM_FAMILY(name, desc)                \
     prometheus::Family<prometheus::Histogram>& name##_family =        \
         prometheus::BuildHistogram().Name(#name).Help(desc).Register( \
-            milvus::monitor::prometheusClient->GetRegistry());
+            milvus::monitor::getPrometheusClient().GetRegistry());
 #define DEFINE_PROMETHEUS_HISTOGRAM(alias, name, labels) \
     prometheus::Histogram& alias = name##_family.Add(labels, milvus::monitor::buckets);
 #define DEFINE_PROMETHEUS_HISTOGRAM_WITH_BUCKETS(alias, name, labels, buckets) \
