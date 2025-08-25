@@ -44,56 +44,37 @@ class Manager {
     std::shared_ptr<CacheSlot<CellT>>
     CreateCacheSlot(std::unique_ptr<Translator<CellT>> translator) {
         auto evictable = translator->meta()->support_eviction && evictionEnabled_;
+        // NOTE: when evictionEnabled_ is false, dlist_ is nullptr.
         auto cache_slot = std::make_shared<CacheSlot<CellT>>(std::move(translator), dlist_.get(), evictable);
         cache_slot->Warmup();
         return cache_slot;
     }
 
-    bool
-    ReserveLoadingResourceWithTimeout(const ResourceUsage& size, std::chrono::milliseconds timeout) {
-        return SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(size, timeout));
-    }
-
-    void
-    ReleaseLoadingResource(const ResourceUsage& size) {
-        dlist_->ReleaseLoadingResource(size);
-    }
-
-    void
-    ChargeLoadedResource(const ResourceUsage& size) {
-        dlist_->ChargeLoadedResource(size);
-    }
-
-    void
-    RefundLoadedResource(const ResourceUsage& size) {
-        dlist_->RefundLoadedResource(size);
-    }
-
     // memory overhead for managing all cache slots/cells/translators/policies.
-    [[nodiscard]] size_t
+    size_t
     memory_overhead() const;
 
-    [[nodiscard]] CacheWarmupPolicy
+    CacheWarmupPolicy
     getScalarFieldCacheWarmupPolicy() const {
         return warmup_policies_.scalarFieldCacheWarmupPolicy;
     }
 
-    [[nodiscard]] CacheWarmupPolicy
+    CacheWarmupPolicy
     getVectorFieldCacheWarmupPolicy() const {
         return warmup_policies_.vectorFieldCacheWarmupPolicy;
     }
 
-    [[nodiscard]] CacheWarmupPolicy
+    CacheWarmupPolicy
     getScalarIndexCacheWarmupPolicy() const {
         return warmup_policies_.scalarIndexCacheWarmupPolicy;
     }
 
-    [[nodiscard]] CacheWarmupPolicy
+    CacheWarmupPolicy
     getVectorIndexCacheWarmupPolicy() const {
         return warmup_policies_.vectorIndexCacheWarmupPolicy;
     }
 
-    [[nodiscard]] bool
+    bool
     isEvictionEnabled() const {
         return evictionEnabled_;
     }

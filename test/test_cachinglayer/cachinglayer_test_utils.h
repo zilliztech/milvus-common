@@ -28,21 +28,13 @@ namespace cachinglayer::internal {
 class DListTestFriend {
  public:
     static ResourceUsage
-    get_using_memory(const DList& dlist) {
-        return dlist.total_loaded_size_.load() + dlist.total_loading_size_.load();
-    }
-    static ResourceUsage
     get_used_memory(const DList& dlist) {
-        return dlist.total_loaded_size_.load();
-    }
-    static ResourceUsage
-    get_loading_memory(const DList& dlist) {
-        return dlist.total_loading_size_.load();
+        return dlist.used_resources_.load();
     }
     static ResourceUsage
     get_max_memory(const DList& dlist) {
         std::lock_guard lock(dlist.list_mtx_);
-        return dlist.max_resource_limit_;
+        return dlist.max_memory_;
     }
     static ListNode*
     get_head(const DList& dlist) {
@@ -67,26 +59,7 @@ class DListTestFriend {
     static void
     test_add_used_memory(DList* dlist, const ResourceUsage& size) {
         std::lock_guard lock(dlist->list_mtx_);
-        dlist->total_loaded_size_ += size;
-    }
-    static void
-    test_add_loading_memory(DList* dlist, const ResourceUsage& size) {
-        std::lock_guard lock(dlist->list_mtx_);
-        dlist->total_loading_size_ += size;
-    }
-    static void
-    test_sub_loading_memory(DList* dlist, const ResourceUsage& size) {
-        std::lock_guard lock(dlist->list_mtx_);
-        dlist->total_loading_size_ -= size;
-    }
-    static void
-    test_add_evictable_memory(DList* dlist, const ResourceUsage& size) {
-        dlist->evictable_size_ += size;
-        // If there are waiters, try to satisfy them
-        if (!dlist->waiting_queue_empty_) {
-            std::unique_lock<std::mutex> lock(dlist->list_mtx_);
-            dlist->notifyWaitingRequests();
-        }
+        dlist->used_resources_ += size;
     }
 
     // nodes are from tail to head
@@ -115,7 +88,7 @@ class DListTestFriend {
 
         while (current != nullptr) {
             EXPECT_EQ(current->prev_, prev);
-            total_size += current->loaded_size();
+            total_size += current->size();
             prev = current;
             current = current->next_;
         }
@@ -123,7 +96,7 @@ class DListTestFriend {
         EXPECT_EQ(prev, dlist->head_);
         EXPECT_EQ(dlist->head_->next_, nullptr);
 
-        EXPECT_EQ(total_size, dlist->total_loaded_size_.load());
+        EXPECT_EQ(total_size, dlist->used_resources_.load());
     }
 };
 }  // namespace cachinglayer::internal
