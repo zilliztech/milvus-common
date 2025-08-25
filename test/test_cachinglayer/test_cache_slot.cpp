@@ -27,13 +27,14 @@ using cl_uid_t = milvus::cachinglayer::uid_t;
 struct TestCell {
     int data;
     cid_t cid;
+    ResourceUsage size;
 
-    TestCell(int d, cid_t id) : data(d), cid(id) {
+    TestCell(int d, cid_t id, ResourceUsage s) : data(d), cid(id), size(s) {
     }
 
-    size_t
+    [[nodiscard]] milvus::cachinglayer::ResourceUsage
     CellByteSize() const {
-        return sizeof(data) + sizeof(cid);
+        return size;
     }
 };
 
@@ -74,13 +75,13 @@ class MockTranslator : public Translator<TestCell> {
         return static_cast<cid_t>(num_unique_cids_);
     }
 
-    ResourceUsage
+    std::pair<ResourceUsage, ResourceUsage>
     estimated_byte_size_of_cell(cid_t cid) const override {
         auto it = cell_sizes_.find(cid);
         if (it != cell_sizes_.end()) {
-            return ResourceUsage{it->second, 0};
+            return {{it->second, 0}, {it->second, 0}};
         }
-        return ResourceUsage{1, 0};
+        return {{1, 0}, {1, 0}};
     }
 
     const std::string&
@@ -111,7 +112,8 @@ class MockTranslator : public Translator<TestCell> {
                 std::this_thread::sleep_for(std::chrono::milliseconds(delay_it->second));
             }
 
-            result.emplace_back(cid, std::make_unique<TestCell>(static_cast<int>(cid * 10), cid));
+            result.emplace_back(cid, std::make_unique<TestCell>(static_cast<int>(cid * 10), cid,
+                                                                estimated_byte_size_of_cell(cid).first));
 
             if (auto extra_cids = extra_cids_.find(cid); extra_cids != extra_cids_.end()) {
                 for (cid_t extra_cid : extra_cids->second) {
@@ -122,7 +124,8 @@ class MockTranslator : public Translator<TestCell> {
                             return pair.first == extra_cid;
                         }) == result.end()) {
                         result.emplace_back(extra_cid,
-                                            std::make_unique<TestCell>(static_cast<int>(extra_cid * 10), extra_cid));
+                                            std::make_unique<TestCell>(static_cast<int>(extra_cid * 10), extra_cid,
+                                                                       estimated_byte_size_of_cell(extra_cid).first));
                     }
                 }
             }
@@ -223,7 +226,7 @@ TEST_F(CacheSlotTest, Initialization) {
 TEST_F(CacheSlotTest, PinSingleCellSuccess) {
     cl_uid_t target_uid = 30;
     cid_t expected_cid = 2;
-    ResourceUsage expected_size = translator_->estimated_byte_size_of_cell(expected_cid);
+    ResourceUsage expected_size = translator_->estimated_byte_size_of_cell(expected_cid).first;
 
     translator_->ResetCounters();
     auto future = cache_slot_->PinCells({target_uid});
@@ -251,7 +254,7 @@ TEST_F(CacheSlotTest, PinMultipleCellsSuccess) {
     std::sort(expected_cids.begin(), expected_cids.end());
     ResourceUsage expected_total_size;
     for (cid_t cid : expected_cids) {
-        expected_total_size += translator_->estimated_byte_size_of_cell(cid);
+        expected_total_size += translator_->estimated_byte_size_of_cell(cid).first;
     }
 
     translator_->ResetCounters();
@@ -282,7 +285,7 @@ TEST_F(CacheSlotTest, PinMultipleUidsMappingToSameCid) {
     std::sort(expected_unique_cids.begin(), expected_unique_cids.end());
     ResourceUsage expected_total_size;
     for (cid_t cid : expected_unique_cids) {
-        expected_total_size += translator_->estimated_byte_size_of_cell(cid);
+        expected_total_size += translator_->estimated_byte_size_of_cell(cid).first;
     }
 
     translator_->ResetCounters();
@@ -367,7 +370,7 @@ TEST_F(CacheSlotTest, LoadFailure) {
 TEST_F(CacheSlotTest, PinAlreadyLoadedCell) {
     cl_uid_t target_uid = 40;
     cid_t expected_cid = 3;
-    ResourceUsage expected_size = translator_->estimated_byte_size_of_cell(expected_cid);
+    ResourceUsage expected_size = translator_->estimated_byte_size_of_cell(expected_cid).first;
 
     translator_->ResetCounters();
 
@@ -404,7 +407,7 @@ TEST_F(CacheSlotTest, PinAlreadyLoadedCellViaDifferentUid) {
     cl_uid_t uid1 = 30;
     cl_uid_t uid2 = 31;
     cid_t expected_cid = 2;
-    ResourceUsage expected_size = translator_->estimated_byte_size_of_cell(expected_cid);
+    ResourceUsage expected_size = translator_->estimated_byte_size_of_cell(expected_cid).first;
 
     translator_->ResetCounters();
 
@@ -448,8 +451,8 @@ TEST_F(CacheSlotTest, TranslatorReturnsExtraCells) {
     cid_t extra_cid = 1;
     cl_uid_t extra_uid = 20;
 
-    ResourceUsage expected_size =
-        translator_->estimated_byte_size_of_cell(requested_cid) + translator_->estimated_byte_size_of_cell(extra_cid);
+    ResourceUsage expected_size = translator_->estimated_byte_size_of_cell(requested_cid).first +
+                                  translator_->estimated_byte_size_of_cell(extra_cid).first;
 
     translator_->ResetCounters();
     translator_->SetExtraReturnCids({{requested_cid, {extra_cid}}});
@@ -487,13 +490,14 @@ TEST_F(CacheSlotTest, EvictionTest) {
     ResourceUsage new_low_watermark = ResourceUsage(200, 0);
     dlist_->UpdateLowWatermark(new_low_watermark);
     dlist_->UpdateHighWatermark(new_high_watermark);
-    EXPECT_TRUE(dlist_->UpdateLimit(new_limit));
+    EXPECT_TRUE(dlist_->UpdateMaxLimit(new_limit));
     EXPECT_EQ(DListTestFriend::get_max_memory(*dlist_), new_limit);
 
     std::vector<cl_uid_t> uids_012 = {10, 20, 30};
     std::vector<cid_t> cids_012 = {0, 1, 2};
-    ResourceUsage size_012 = translator_->estimated_byte_size_of_cell(0) + translator_->estimated_byte_size_of_cell(1) +
-                             translator_->estimated_byte_size_of_cell(2);
+    ResourceUsage size_012 = translator_->estimated_byte_size_of_cell(0).first +
+                             translator_->estimated_byte_size_of_cell(1).first +
+                             translator_->estimated_byte_size_of_cell(2).first;
     ASSERT_EQ(size_012, ResourceUsage(50 + 150 + 100, 0));
 
     // 1. Load cells 0, 1, 2
@@ -515,7 +519,7 @@ TEST_F(CacheSlotTest, EvictionTest) {
     // 3. Load cell 3 (size 200), requires eviction
     cl_uid_t uid_3 = 40;
     cid_t cid_3 = 3;
-    ResourceUsage size_3 = translator_->estimated_byte_size_of_cell(cid_3);
+    ResourceUsage size_3 = translator_->estimated_byte_size_of_cell(cid_3).first;
     ASSERT_EQ(size_3, ResourceUsage(200, 0));
 
     translator_->ResetCounters();
@@ -548,7 +552,7 @@ TEST_P(CacheSlotConcurrentTest, ConcurrentAccessMultipleSlots) {
     ResourceUsage new_low_watermark = ResourceUsage(600, 0);
     dlist_->UpdateLowWatermark(new_low_watermark);
     dlist_->UpdateHighWatermark(new_high_watermark);
-    ASSERT_TRUE(dlist_->UpdateLimit(new_limit));
+    ASSERT_TRUE(dlist_->UpdateMaxLimit(new_limit));
     EXPECT_EQ(DListTestFriend::get_max_memory(*dlist_).memory_bytes, new_limit.memory_bytes);
 
     // 1. Setup CacheSlots sharing dlist_

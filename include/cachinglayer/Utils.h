@@ -63,14 +63,13 @@ struct ResourceUsage {
     int64_t memory_bytes{0};
     int64_t file_bytes{0};
 
-    ResourceUsage() noexcept : memory_bytes(0), file_bytes(0) {
-    }
+    ResourceUsage() noexcept = default;
     ResourceUsage(int64_t mem, int64_t file) noexcept : memory_bytes(mem), file_bytes(file) {
     }
 
     ResourceUsage
     operator+(const ResourceUsage& rhs) const {
-        return ResourceUsage(memory_bytes + rhs.memory_bytes, file_bytes + rhs.file_bytes);
+        return {memory_bytes + rhs.memory_bytes, file_bytes + rhs.file_bytes};
     }
 
     void
@@ -81,13 +80,13 @@ struct ResourceUsage {
 
     ResourceUsage
     operator-(const ResourceUsage& rhs) const {
-        return ResourceUsage(memory_bytes - rhs.memory_bytes, file_bytes - rhs.file_bytes);
+        return {memory_bytes - rhs.memory_bytes, file_bytes - rhs.file_bytes};
     }
 
     ResourceUsage
     operator*(double factor) const {
-        return ResourceUsage(static_cast<int64_t>(std::round(memory_bytes * factor)),
-                             static_cast<int64_t>(std::round(file_bytes * factor)));
+        return {static_cast<int64_t>(std::round(memory_bytes * factor)),
+                static_cast<int64_t>(std::round(file_bytes * factor))};
     }
 
     friend ResourceUsage
@@ -111,22 +110,22 @@ struct ResourceUsage {
         return !(*this == rhs);
     }
 
-    bool
+    [[nodiscard]] bool
     AnyGTZero() const {
         return memory_bytes > 0 || file_bytes > 0;
     }
 
-    bool
+    [[nodiscard]] bool
     AllGEZero() const {
         return memory_bytes >= 0 && file_bytes >= 0;
     }
 
-    bool
+    [[nodiscard]] bool
     CanHold(const ResourceUsage& rhs) const {
         return memory_bytes >= rhs.memory_bytes && file_bytes >= rhs.file_bytes;
     }
 
-    StorageType
+    [[nodiscard]] StorageType
     storage_type() const {
         if (memory_bytes > 0 && file_bytes > 0) {
             return StorageType::MIXED;
@@ -134,7 +133,7 @@ struct ResourceUsage {
         return memory_bytes > 0 ? StorageType::MEMORY : StorageType::DISK;
     }
 
-    std::string
+    [[nodiscard]] std::string
     ToString() const {
         if (memory_bytes == 0 && file_bytes == 0) {
             return "EMPTY";
@@ -202,7 +201,7 @@ struct CacheWarmupPolicies {
           vectorIndexCacheWarmupPolicy(vectorIndexCacheWarmupPolicy) {
     }
 
-    std::string
+    [[nodiscard]] std::string
     ToString() const {
         auto policyToString = [](CacheWarmupPolicy policy) -> std::string {
             switch (policy) {

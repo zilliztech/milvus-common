@@ -37,97 +37,128 @@ ListNode::NodePin::~NodePin() {
     }
 }
 
-ListNode::NodePin::NodePin(NodePin&& other) : NodePin(nullptr) {
+ListNode::NodePin::NodePin(NodePin&& other) noexcept : NodePin(nullptr) {
     std::swap(node_, other.node_);
 }
 
 ListNode::NodePin&
-ListNode::NodePin::operator=(NodePin&& other) {
+ListNode::NodePin::operator=(NodePin&& other) noexcept {
     std::swap(node_, other.node_);
     return *this;
 }
 
-ListNode::ListNode(DList* dlist, ResourceUsage size, bool evictable)
-    : last_touch_(dlist ? (std::chrono::high_resolution_clock::now() - 2 * dlist->eviction_config().cache_touch_window)
-                        : std::chrono::high_resolution_clock::now()),
+ListNode::ListNode(DList* dlist, bool evictable)
+    : last_touch_(dlist ? (std::chrono::steady_clock::now() - 2 * dlist->eviction_config().cache_touch_window)
+                        : std::chrono::steady_clock::now()),
       dlist_(dlist),
-      size_(size),
       evictable_(evictable) {
 }
 
 ListNode::~ListNode() {
-    if (dlist_) {
-        if (evictable_) {
-            std::unique_lock<std::shared_mutex> lock(mtx_);
-            dlist_->removeItem(this, size_);
-        } else {
-            dlist_->removeLoadedResource(size_);
+    std::unique_lock<std::shared_mutex> lock(mtx_);
+    switch (state_) {
+        case State::CACHED: {
+            dlist_->removeItem(this, loaded_size_);
+            // fall through
         }
+        case State::LOADED: {
+            auto saved_loaded_size = loaded_size_;
+            unload();
+            dlist_->RefundLoadedResource(saved_loaded_size);
+            break;
+        }
+        case State::LOADING: {
+            // NOTE:
+            // The LOADING state occurs during pin() and set_cell(), while LoadingResource +/- is handled in RunLoad().
+            // We believe RunLoad() will handle all situations, including exceptions, so there's no need to handle
+            // LoadingResource here.
+            // If that edge case actually occurs, it shouldn't be the fault of ~ListNode() - the system must have bugs.
+            break;
+        }
+        default:;  // do nothing
     }
 }
 
 bool
 ListNode::manual_evict() {
     std::unique_lock<std::shared_mutex> lock(mtx_);
-    if (state_ == State::LOADING) {
-        LOG_ERROR("[MCL] manual_evict() called on a {} cell {}", state_to_string(state_), key());
-        return false;
+    switch (state_) {
+        case State::CACHED: {
+            // even if pin_count_ > 0, removeItem is still ok since it can be readded to dlist_ when pin_count_ == 0.
+            dlist_->removeItem(this, loaded_size_);
+            // fall through
+        }
+        case State::LOADED: {
+            if (pin_count_.load() > 0) {
+                LOG_ERROR(
+                    "[MCL] manual_evict() called on a LOADED and pinned cell "
+                    "{}, "
+                    "aborting eviction.",
+                    key());
+                return false;
+            }
+            auto saved_loaded_size = loaded_size_;
+            unload();
+            dlist_->RefundLoadedResource(saved_loaded_size);
+            return true;
+        }
+        case State::LOADING: {
+            LOG_ERROR("[MCL] manual_evict() called on a {} cell {}", state_to_string(state_), key());
+            return false;
+        }
+        default: {
+            return false;
+        }
     }
-    if (state_ == State::NOT_LOADED) {
-        return false;
-    }
-    if (pin_count_.load() > 0) {
-        LOG_ERROR(
-            "[MCL] manual_evict() called on a LOADED and pinned cell {}, "
-            "aborting eviction.",
-            key());
-        return false;
-    }
-    // cell is LOADED
-    clear_data();
-    if (dlist_) {
-        dlist_->removeItem(this, size_);
-    }
-    return true;
 }
 
 const ResourceUsage&
-ListNode::size() const {
-    return size_;
+ListNode::loaded_size() const {
+    return loaded_size_;
 }
 
 std::pair<bool, folly::SemiFuture<ListNode::NodePin>>
 ListNode::pin() {
     // must be called with lock acquired, and state must not be NOT_LOADED.
     auto read_op = [this]() -> std::pair<bool, folly::SemiFuture<NodePin>> {
-        AssertInfo(state_ != State::NOT_LOADED, "Programming error: read_op called on a {} cell",
-                   state_to_string(state_));
         // pin the cell now so that we can avoid taking the lock again in deferValue.
-        if (pin_count_.fetch_add(1) == 0 && state_ == State::LOADED && dlist_ && evictable_) {
-            // node became inevictable, decrease evictable size
-            dlist_->decreaseEvictableSize(size_);
+        auto old_pin_count = pin_count_.fetch_add(1);
+        switch (state_) {
+            case State::CACHED: {
+                if (old_pin_count == 0) {
+                    // node became inevictable, freeze it if it is in dlist
+                    dlist_->freezeItem(this, loaded_size_);
+                }
+                // fall through
+            }
+            case State::LOADED: {
+                auto p = NodePin(this);
+                return std::make_pair(false, std::move(p));
+            }
+            case State::LOADING: {
+                auto p = NodePin(this);
+                return std::make_pair(false, load_promise_->getSemiFuture().deferValue(
+                                                 [this, p = std::move(p)](auto&&) mutable { return std::move(p); }));
+            }
+            default:
+                ThrowInfo(ErrorCode::UnexpectedError, "Programming error: read_op called on a {} cell",
+                          state_to_string(state_));
         }
-        auto p = NodePin(this);
-        if (state_ == State::LOADED) {
-            internal::cache_op_result_count_hit(size_.storage_type()).Increment();
-            return std::make_pair(false, std::move(p));
-        }
-        internal::cache_op_result_count_miss(size_.storage_type()).Increment();
-        return std::make_pair(false, load_promise_->getSemiFuture().deferValue(
-                                         [this, p = std::move(p)](auto&&) mutable { return std::move(p); }));
     };
+
     {
         std::shared_lock<std::shared_mutex> lock(mtx_);
         if (state_ != State::NOT_LOADED) {
             return read_op();
         }
     }
+
     std::unique_lock<std::shared_mutex> lock(mtx_);
     if (state_ != State::NOT_LOADED) {
         return read_op();
     }
-    // need to load.
-    internal::cache_op_result_count_miss(size_.storage_type()).Increment();
+
+    // need to load. state_ == State::NOT_LOADED
     load_promise_ = std::make_unique<folly::SharedPromise<folly::Unit>>();
     state_ = State::LOADING;
 
@@ -143,16 +174,22 @@ ListNode::set_error(folly::exception_wrapper error) {
     std::unique_ptr<folly::SharedPromise<folly::Unit>> promise = nullptr;
     {
         std::unique_lock<std::shared_mutex> lock(mtx_);
-        AssertInfo(state_ != State::NOT_LOADED, "Programming error: set_error() called on a {} cell",
-                   state_to_string(state_));
-        // may be successfully loaded by another thread as a bonus, they will update used memory.
-        if (state_ == State::LOADED) {
-            return;
-        }
-        // else: state_ is LOADING, reset to NOT_LOADED
-        state_ = State::NOT_LOADED;
-        if (load_promise_) {
-            promise = std::move(load_promise_);
+        switch (state_) {
+            case State::LOADING: {
+                state_ = State::NOT_LOADED;
+                if (load_promise_) {
+                    promise = std::move(load_promise_);
+                }
+                break;
+            }
+            case State::CACHED:
+            case State::LOADED: {
+                // may be successfully loaded/cached by another thread as a bonus, they will update used memory.
+                return;
+            }
+            default:
+                ThrowInfo(ErrorCode::UnexpectedError, "Programming error: set_error() called on a {} cell",
+                          state_to_string(state_));
         }
     }
     // Notify waiting threads about the error
@@ -172,6 +209,8 @@ ListNode::state_to_string(State state) {
             return "LOADING";
         case State::LOADED:
             return "LOADED";
+        case State::CACHED:
+            return "CACHED";
     }
     throw std::invalid_argument("Invalid state");
 }
@@ -181,49 +220,33 @@ ListNode::unpin() {
     std::unique_lock<std::shared_mutex> lock(mtx_);
     if (pin_count_.fetch_sub(1) == 1) {
         if (evictable_) {
-            touch(false);
-        }
-        // Notify DList that this node became evictable
-        if (dlist_ && evictable_ && state_ == State::LOADED) {
-            dlist_->increaseEvictableSize(size_);
+            touch_to_dlist(state_ == State::LOADED || state_ == State::CACHED);
         }
     }
 }
 
+// ListNode::touch_to_dlist() should only be called when evictable_ is true
 void
-ListNode::touch(bool update_used_memory) {
-    auto now = std::chrono::high_resolution_clock::now();
-    if (dlist_ && now - last_touch_ > dlist_->eviction_config().cache_touch_window) {
-        std::optional<ResourceUsage> size = std::nullopt;
-        if (update_used_memory) {
-            size = size_;
-        }
-        last_touch_ = dlist_->touchItem(this, size);
+ListNode::touch_to_dlist(bool update_evictable_memory) {
+    std::optional<ResourceUsage> size = std::nullopt;
+    if (update_evictable_memory) {
+        size = loaded_size_;
     }
-}
-
-void
-ListNode::clear_data() {
-    // if the cell is evicted, loaded, pinned and unpinned within a single refresh window,
-    // the cell should be inserted into the cache again.
-    if (dlist_) {
-        last_touch_ = std::chrono::high_resolution_clock::now() - 2 * dlist_->eviction_config().cache_touch_window;
-    }
-    unload();
-    LOG_TRACE("[MCL] ListNode evicted: key={}, size={}", key(), size_.ToString());
-    state_ = State::NOT_LOADED;
+    dlist_->touchItem(this, false, size);
+    state_ = State::CACHED;
 }
 
 void
 ListNode::unload() {
-    // Default implementation does nothing
+    clear_data();
+    LOG_TRACE("[MCL] ListNode unloaded: key={}, size={}", key(), loaded_size_.ToString());
+    loaded_size_ = {0, 0};       // reset loaded_size_ to 0,0 to avoid double refund from dlist_
+    state_ = State::NOT_LOADED;  // reset state_ to NOT_LOADED to avoid double refund from dlist_
 }
 
 void
-ListNode::remove_self_from_loading_resource() {
-    if (dlist_) {
-        dlist_->removeLoadingResource(size_);
-    }
+ListNode::clear_data() {
+    // Default implementation does nothing
 }
 
 }  // namespace milvus::cachinglayer::internal
