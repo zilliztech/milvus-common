@@ -21,19 +21,15 @@ namespace milvus::cachinglayer::internal {
 
 class MockListNode : public ListNode {
  public:
-    MockListNode(DList* dlist, const std::string& key = "mock_key", cid_t cid = 0)
-        : ListNode(dlist, true), mock_key_(fmt::format("{}:{}", key, cid)) {
-        ON_CALL(*this, unload).WillByDefault([this]() {
-            clear_data();
-            loaded_size_ = {0, 0};
+    MockListNode(DList* dlist, ResourceUsage size, const std::string& key = "mock_key", cid_t cid = 0)
+        : ListNode(dlist, size, true), mock_key_(fmt::format("{}:{}", key, cid)) {
+        ON_CALL(*this, clear_data).WillByDefault([this]() {
+            unload();
             state_ = State::NOT_LOADED;
         });
     }
 
-    ~MockListNode() override {
-    }
-
-    MOCK_METHOD(void, unload, (), (override));
+    MOCK_METHOD(void, clear_data, (), (override));
 
     std::string
     key() const override {
@@ -46,16 +42,10 @@ class MockListNode : public ListNode {
         std::unique_lock lock(mtx_);
         state_ = new_state;
     }
-
     State
     test_get_state() {
         std::shared_lock lock(mtx_);
         return state_;
-    }
-
-    void
-    test_set_loaded_size(const ResourceUsage& size) {
-        loaded_size_ = size;
     }
 
     void
