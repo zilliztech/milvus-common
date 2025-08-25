@@ -32,9 +32,9 @@ class ListNode {
     class NodePin {
      public:
         // NodePin is movable but not copyable.
-        NodePin(NodePin&&);
+        NodePin(NodePin&&) noexcept;
         NodePin&
-        operator=(NodePin&&);
+        operator=(NodePin&&) noexcept;
         NodePin(const NodePin&) = delete;
         NodePin&
         operator=(const NodePin&) = delete;
@@ -46,7 +46,7 @@ class ListNode {
         ListNode* node_;
     };
     ListNode() = default;
-    ListNode(DList* dlist, ResourceUsage size, bool evictable);
+    ListNode(DList* dlist, bool evictable);
     virtual ~ListNode();
 
     // ListNode is not movable/copyable because it contains a shared_mutex.
@@ -72,23 +72,42 @@ class ListNode {
     pin();
 
     const ResourceUsage&
-    size() const;
+    loaded_size() const;
 
     // Manually evicts the cell if it is not pinned.
     // Returns true if the cell ends up in a state other than LOADED.
     bool
     manual_evict();
 
-    // NOT_LOADED <---> LOADING
-    //      ^            |
-    //      |            v
-    //      |------- LOADED
-    enum class State { NOT_LOADED, LOADING, LOADED };
+    // State transition diagram:
+    // +------------+           +---------+
+    // | NOT_LOADED | <-------> | LOADING |
+    // +------------+           +---------+
+    //      ^   ^                   |
+    //      |   |                   v
+    //      |   |               +---------+
+    //      |   +-------------- | LOADED  |
+    //      |                   +---------+
+    //      |                        |
+    //      |                        v
+    //      |                 +---------------------------+
+    //      +---------------> | CACHED && pin_count == 0  |
+    //                        +---------------------------+
+    //                               ^        |
+    //                               |        v
+    //                        +---------------------------+
+    //                        | CACHED && pin_count != 0  |
+    //                        +---------------------------+
+    // NOT_LOADED: The cell is not loaded.
+    // LOADING: The cell is loading.
+    // LOADED: The cell is loaded but not cached in the LRU list, typically used when the cell is non-evictable.
+    // CACHED: The cell is loaded and cached in the LRU list. `pin_count == 0` means the cell can be evicted.
+    enum class State { NOT_LOADED, LOADING, LOADED, CACHED };
 
  protected:
     // will be called during eviction, implementation should release all resources.
     virtual void
-    unload();
+    clear_data();
 
     virtual std::string
     key() const = 0;
@@ -100,45 +119,53 @@ class ListNode {
         {
             std::unique_lock<std::shared_mutex> lock(mtx_);
             if (requesting_thread) {
-                AssertInfo(state_ != State::NOT_LOADED,
-                           "Programming error: mark_loaded(requesting_thread=true) "
-                           "called on a {} cell",
-                           state_to_string(state_));
-                // no need to touch() here: node is pinned thus not eligible for eviction.
-                // we can delay touch() to when unpin() is called.
-                if (state_ == State::LOADING) {
-                    cb();
-                    state_ = State::LOADED;
-                    promise = std::move(load_promise_);
-                    remove_self_from_loading_resource();
-                } else {
-                    // LOADED: cell has been loaded by another thread, do nothing.
-                    return;
+                switch (state_) {
+                    case State::LOADING: {
+                        // no need to touch() here: node is pinned thus not eligible for eviction.
+                        // we can delay touch() to when unpin() is called.
+                        cb();
+                        state_ = State::LOADED;
+                        promise = std::move(load_promise_);
+                        break;
+                    }
+                    case State::LOADED:
+                    case State::CACHED: {
+                        // This state can only happen when this node is loaded/cached as a bonus.
+                        // touch() has been called by the bonus loading thread.
+                        promise = std::move(load_promise_);
+                        break;
+                    }
+                    default:
+                        ThrowInfo(ErrorCode::UnexpectedError,
+                                  "Programming error: "
+                                  "mark_loaded(requesting_thread=true) "
+                                  "called on a {} cell",
+                                  state_to_string(state_));
                 }
             } else {
-                // Even though this thread did not request loading this cell, translator still
-                // decided to download it because the adjacent cells are requested.
-                if (state_ == State::NOT_LOADED) {
-                    state_ = State::LOADED;
-                    cb();
-                    // memory of this cell is not reserved, touch() to track it.
-                    if (evictable_) {
-                        touch(true);
+                switch (state_) {
+                    case State::NOT_LOADED: {
+                        // Even though this thread did not request loading this cell, translator still
+                        // decided to download it because the adjacent cells are requested.
+                        cb();
+                        state_ = State::LOADED;
+                        // memory of this cell is not reserved, touch() to track it.
+                        if (evictable_) {
+                            touch_to_dlist(true);
+                        }
+                        break;
                     }
-                } else if (state_ == State::LOADING) {
-                    // another thread has explicitly requested loading this cell, we did it first
-                    // thus we set up the state first.
-                    cb();
-                    state_ = State::LOADED;
-                    promise = std::move(load_promise_);
-                    // the node that marked LOADING has already reserved memory, do not double count.
-                    if (evictable_) {
-                        touch(false);
+                    case State::LOADING: {
+                        // another thread has explicitly requested loading this cell, we did it first
+                        // thus we set up the state first.
+                        cb();
+                        state_ = State::LOADED;
+                        // the node that marked LOADING has already reserved memory, do not double count.
+                        if (evictable_) {
+                            touch_to_dlist(false);
+                        }
                     }
-                    remove_self_from_loading_resource();
-                } else {
-                    // LOADED: cell has been loaded by another thread, do nothing.
-                    return;
+                    default:;  // LOADED/CACHED: cell has been loaded by another thread, do nothing.
                 }
             }
         }
@@ -150,15 +177,13 @@ class ListNode {
     void
     set_error(folly::exception_wrapper error);
 
-    void
-    remove_self_from_loading_resource();
-
     State state_{State::NOT_LOADED};
 
     static std::string
     state_to_string(State state);
 
-    ResourceUsage size_{};
+    // loaded_size_ must be set to the real size of the cell when the state is transferred to LOADED/CACHED.
+    ResourceUsage loaded_size_{};
 
  private:
     friend class DList;
@@ -173,19 +198,20 @@ class ListNode {
     // called by DList during eviction. must be called under the lock of mtx_.
     // Made virtual for mock testing.
     virtual void
-    clear_data();
+    unload();
 
     void
     unpin();
 
     // must be called under the lock of mtx_.
     void
-    touch(bool update_used_memory = true);
+    touch_to_dlist(bool update_evictable_size);
 
     mutable std::shared_mutex mtx_;
     // if a ListNode is in a DList, last_touch_ is the time when the node was lastly pushed
     // to the head of the DList. Thus all ListNodes in a DList are sorted by last_touch_.
-    std::chrono::high_resolution_clock::time_point last_touch_;
+    // last_touch_ should only be updated by DList::touchItem, except for the initialization case.
+    std::chrono::steady_clock::time_point last_touch_;
     // a nullptr dlist_ means this node is not in any DList, and is not prone to cache management.
     DList* dlist_;
     ListNode* prev_ = nullptr;
