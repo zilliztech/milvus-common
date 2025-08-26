@@ -48,12 +48,13 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                   "CellT must have a CellByteSize() method that returns a ResourceUsage "
                   "representing the memory consumption of the cell");
 
-    CacheSlot(std::unique_ptr<Translator<CellT>> translator, internal::DList* dlist, bool evictable)
+    CacheSlot(std::unique_ptr<Translator<CellT>> translator, internal::DList* dlist, bool evictable, bool self_reserve)
         : translator_(std::move(translator)),
           cells_(translator_->num_cells()),
           cell_id_mapping_mode_(translator_->meta()->cell_id_mapping_mode),
           dlist_(dlist),
-          evictable_(evictable) {
+          evictable_(evictable),
+          self_reserve_(self_reserve) {
         for (cid_t i = 0; i < static_cast<cid_t>(translator_->num_cells()); ++i) {
             new (&cells_[i]) CacheCell(this, i);
         }
@@ -228,6 +229,27 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             bool reservation_success = false;
 
             loading_cids = std::vector<cid_t>(cids.begin(), cids.end());
+
+            auto run_load_internal = [&]() {
+                start = std::chrono::steady_clock::now();
+                auto results = translator_->get_cells(loading_cids);
+                auto latency =
+                    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start);
+                auto storage_type = translator_->meta()->storage_type;
+                for (auto& result : results) {
+                    cells_[result.first].set_cell(std::move(result.second), cids.count(result.first) > 0);
+                    internal::cache_load_latency(storage_type).Observe(latency.count());
+                }
+                internal::cache_cell_loaded_count(storage_type).Increment(results.size());
+                internal::cache_load_count_success(storage_type).Increment(results.size());
+            };
+
+            if (!self_reserve_) {
+                run_load_internal();
+                return;
+            }
+
+            // bonus cells should be empty if self_reserve_ is false.
             auto bonus_cids = translator_->bonus_cells_to_be_loaded(loading_cids);
 
             for (auto& cid : loading_cids) {
@@ -274,17 +296,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                     1.0 / 1000,
                 resource_needed_for_loading.ToString(), translator_->key());
 
-            start = std::chrono::steady_clock::now();
-            auto results = translator_->get_cells(loading_cids);
-            auto latency =
-                std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start);
-            auto storage_type = translator_->meta()->storage_type;
-            for (auto& result : results) {
-                cells_[result.first].set_cell(std::move(result.second), cids.count(result.first) > 0);
-                internal::cache_load_latency(storage_type).Observe(latency.count());
-            }
-            internal::cache_cell_loaded_count(storage_type).Increment(results.size());
-            internal::cache_load_count_success(storage_type).Increment(results.size());
+            run_load_internal();
         } catch (...) {
             auto exception = std::current_exception();
             auto ew = folly::exception_wrapper(exception);
@@ -384,6 +396,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     CellIdMappingMode cell_id_mapping_mode_;
     internal::DList* dlist_;
     const bool evictable_;
+    const bool self_reserve_;
 };
 
 // - A thin wrapper for accessing cells in a CacheSlot.

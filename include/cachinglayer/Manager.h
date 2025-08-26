@@ -44,7 +44,9 @@ class Manager {
     std::shared_ptr<CacheSlot<CellT>>
     CreateCacheSlot(std::unique_ptr<Translator<CellT>> translator) {
         auto evictable = translator->meta()->support_eviction && evictionEnabled_;
-        auto cache_slot = std::make_shared<CacheSlot<CellT>>(std::move(translator), dlist_.get(), evictable);
+        auto self_reserve = evictionEnabled_;
+        auto cache_slot =
+            std::make_shared<CacheSlot<CellT>>(std::move(translator), dlist_.get(), evictable, self_reserve);
         cache_slot->Warmup();
         return cache_slot;
     }

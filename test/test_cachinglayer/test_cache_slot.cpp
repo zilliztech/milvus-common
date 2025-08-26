@@ -209,7 +209,7 @@ class CacheSlotTest : public ::testing::Test {
         auto temp_translator_uptr =
             std::make_unique<MockTranslator>(cell_sizes_, uid_to_cid_map_, SLOT_KEY, StorageType::MEMORY);
         translator_ = temp_translator_uptr.get();
-        cache_slot_ = std::make_shared<CacheSlot<TestCell>>(std::move(temp_translator_uptr), dlist_.get(), true);
+        cache_slot_ = std::make_shared<CacheSlot<TestCell>>(std::move(temp_translator_uptr), dlist_.get(), true, true);
     }
 
     void
@@ -561,14 +561,14 @@ TEST_P(CacheSlotConcurrentTest, ConcurrentAccessMultipleSlots) {
     auto translator_1_ptr = std::make_unique<MockTranslator>(cell_sizes_1, uid_map_1, "slot1", StorageType::MEMORY,
                                                              /*for_concurrent_test*/ true);
     MockTranslator* translator_1 = translator_1_ptr.get();
-    auto slot1 = std::make_shared<CacheSlot<TestCell>>(std::move(translator_1_ptr), dlist_.get(), true);
+    auto slot1 = std::make_shared<CacheSlot<TestCell>>(std::move(translator_1_ptr), dlist_.get(), true, true);
 
     std::vector<std::pair<cid_t, int64_t>> cell_sizes_2 = {{0, 55}, {1, 65}, {2, 75}, {3, 85}, {4, 95}};
     std::unordered_map<cl_uid_t, cid_t> uid_map_2 = {{2000, 0}, {2001, 1}, {2002, 2}, {2003, 3}, {2004, 4}};
     auto translator_2_ptr = std::make_unique<MockTranslator>(cell_sizes_2, uid_map_2, "slot2", StorageType::MEMORY,
                                                              /*for_concurrent_test*/ true);
     MockTranslator* translator_2 = translator_2_ptr.get();
-    auto slot2 = std::make_shared<CacheSlot<TestCell>>(std::move(translator_2_ptr), dlist_.get(), true);
+    auto slot2 = std::make_shared<CacheSlot<TestCell>>(std::move(translator_2_ptr), dlist_.get(), true, true);
 
     bool with_bonus_cells = GetParam();
     if (with_bonus_cells) {
@@ -675,7 +675,8 @@ TEST_P(CacheSlotConcurrentTest, ConcurrentAccessMultipleSlots) {
     auto create_new_slot3 = [&]() {
         auto translator_3_ptr = std::make_unique<MockTranslator>(cell_sizes_3, uid_map_3, "slot3", StorageType::MEMORY,
                                                                  /*for_concurrent_test*/ true);
-        auto sl = std::make_shared<CacheSlot<TestCell>>(std::move(translator_3_ptr), dlist_ptr, dlist_ptr != nullptr);
+        auto sl = std::make_shared<CacheSlot<TestCell>>(std::move(translator_3_ptr), dlist_ptr, dlist_ptr != nullptr,
+                                                        dlist_ptr != nullptr);
         return sl;
     };
     std::shared_ptr<CacheSlot<TestCell>> slot3 = create_new_slot3();
