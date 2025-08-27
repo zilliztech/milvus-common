@@ -25,7 +25,11 @@
 namespace milvus::cachinglayer::internal {
 
 folly::SemiFuture<bool>
-DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& size, std::chrono::milliseconds timeout) {
+DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std::chrono::milliseconds timeout) {
+    // NOTE: we can reserve more loading resources than the original request size by adjusting the
+    // loading_resource_factor to avoid potential problems from bad resource estimation.
+    auto size = original_size * eviction_config_.loading_resource_factor;
+
     // First try immediate reservation
     {
         std::unique_lock<std::mutex> list_lock(list_mtx_);
