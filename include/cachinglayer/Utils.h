@@ -260,8 +260,9 @@ struct EvictionConfig {
     // Max disk usage percentage - limits disk cache usage to this percentage of total disk space (not used yet)
     float max_disk_usage_percentage;
     std::string disk_path;
-    // Loading memory factor for estimating memory during loading
-    float loading_memory_factor;
+    // Loading resource factor to reserve more resources, preventing poor resource estimation during the loading
+    // process.
+    float loading_resource_factor;
 
     EvictionConfig()
         : cache_touch_window(std::chrono::milliseconds(0)),
@@ -270,7 +271,7 @@ struct EvictionConfig {
           overloaded_memory_threshold_percentage(0.9),
           max_disk_usage_percentage(0.95),
           disk_path(""),
-          loading_memory_factor(2.5f) {
+          loading_resource_factor(1.0f) {
     }
 
     EvictionConfig(int64_t cache_touch_window_ms, int64_t eviction_interval_ms)
@@ -280,19 +281,19 @@ struct EvictionConfig {
           overloaded_memory_threshold_percentage(0.9),
           max_disk_usage_percentage(0.95),
           disk_path(""),
-          loading_memory_factor(2.5f) {
+          loading_resource_factor(1.0f) {
     }
 
     EvictionConfig(int64_t cache_touch_window_ms, int64_t eviction_interval_ms,
                    int64_t cache_cell_unaccessed_survival_time, float overloaded_memory_threshold_percentage,
-                   float max_disk_usage_percentage, const std::string& disk_path, float loading_memory_factor)
+                   float max_disk_usage_percentage, const std::string& disk_path, float loading_resource_factor)
         : cache_touch_window(std::chrono::milliseconds(cache_touch_window_ms)),
           eviction_interval(std::chrono::milliseconds(eviction_interval_ms)),
           cache_cell_unaccessed_survival_time(std::chrono::seconds(cache_cell_unaccessed_survival_time)),
           overloaded_memory_threshold_percentage(overloaded_memory_threshold_percentage),
           max_disk_usage_percentage(max_disk_usage_percentage),
           disk_path(disk_path),
-          loading_memory_factor(loading_memory_factor) {
+          loading_resource_factor(loading_resource_factor) {
     }
 };
 
