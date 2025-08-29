@@ -278,11 +278,11 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                 LOG_ERROR("[MCL] CacheSlot failed to reserve resource for "
                     "cells: key={}, cell_ids=[{}], total "
                     "resource_needed_for_loading={}",
-                    translator_->key(), fmt::join(loading_cids, ","), resource_needed_for_loading.ToString()));
+                    translator_->key(), fmt::join(loading_cids, ","), resource_needed_for_loading.ToString());
                 ThrowInfo(ErrorCode::InsufficientResource, "[MCL] CacheSlot failed to reserve resource for "
                     "cells: key={}, cell_ids=[{}], total "
                     "resource_needed_for_loading={}",
-                    translator_->key(), fmt::join(loading_cids, ","), resource_needed_for_loading.ToString()));
+                    translator_->key(), fmt::join(loading_cids, ","), resource_needed_for_loading.ToString());
             }
 
             // defer release resource_needed_for_loading
