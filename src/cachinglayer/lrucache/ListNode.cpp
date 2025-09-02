@@ -73,6 +73,7 @@ ListNode::~ListNode() {
             // We believe RunLoad() will handle all situations, including exceptions, so there's no need to handle
             // LoadingResource here.
             // If that edge case actually occurs, it shouldn't be the fault of ~ListNode() - the system must have bugs.
+            LOG_ERROR("[MCL] ListNode destroyed while loading");
             break;
         }
         default:;  // do nothing
@@ -238,15 +239,7 @@ ListNode::touch_to_dlist(bool update_evictable_memory) {
 
 void
 ListNode::unload() {
-    clear_data();
-    LOG_TRACE("[MCL] ListNode unloaded: key={}, size={}", key(), loaded_size_.ToString());
-    loaded_size_ = {0, 0};       // reset loaded_size_ to 0,0 to avoid double refund from dlist_
     state_ = State::NOT_LOADED;  // reset state_ to NOT_LOADED to avoid double refund from dlist_
-}
-
-void
-ListNode::clear_data() {
-    // Default implementation does nothing
 }
 
 }  // namespace milvus::cachinglayer::internal

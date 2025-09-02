@@ -50,6 +50,7 @@ class DList {
             event_base_->loopForever();
         });
 
+        LOG_INFO("[MCL] Starting eviction loop thread");
         eviction_thread_ = std::thread(&DList::evictionLoop, this);
     }
 
@@ -222,9 +223,9 @@ class DList {
 
     // TODO(tiered storage 3): benchmark folly::DistributedMutex for this usecase.
     mutable std::mutex list_mtx_;
-    ResourceUsage max_resource_limit_;
-    ResourceUsage low_watermark_;
-    ResourceUsage high_watermark_;
+    std::atomic<ResourceUsage> max_resource_limit_;
+    std::atomic<ResourceUsage> low_watermark_;
+    std::atomic<ResourceUsage> high_watermark_;
     const EvictionConfig eviction_config_;
 
     std::thread eviction_thread_;

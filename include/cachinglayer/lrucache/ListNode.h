@@ -105,9 +105,10 @@ class ListNode {
     enum class State { NOT_LOADED, LOADING, LOADED, CACHED };
 
  protected:
-    // will be called during eviction, implementation should release all resources.
+    // called by DList during eviction. must be called under the lock of mtx_.
+    // Made virtual for mock testing.
     virtual void
-    clear_data();
+    unload();
 
     virtual std::string
     key() const = 0;
@@ -194,11 +195,6 @@ class ListNode {
     friend class DListTestFriend;
     friend class ListNodeTestFriend;
     friend class ListNodeTest;
-
-    // called by DList during eviction. must be called under the lock of mtx_.
-    // Made virtual for mock testing.
-    virtual void
-    unload();
 
     void
     unpin();

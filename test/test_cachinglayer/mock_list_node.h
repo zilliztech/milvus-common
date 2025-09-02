@@ -24,9 +24,8 @@ class MockListNode : public ListNode {
     MockListNode(DList* dlist, const std::string& key = "mock_key", cid_t cid = 0)
         : ListNode(dlist, true), mock_key_(fmt::format("{}:{}", key, cid)) {
         ON_CALL(*this, unload).WillByDefault([this]() {
-            clear_data();
             loaded_size_ = {0, 0};
-            state_ = State::NOT_LOADED;
+            ListNode::unload();
         });
     }
 
