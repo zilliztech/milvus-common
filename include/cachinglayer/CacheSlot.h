@@ -239,7 +239,6 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                     cells_[result.first].set_cell(std::move(result.second), cids.count(result.first) > 0);
                 }
                 monitor::cache_load_latency_microseconds(cell_data_type_, storage_type_).Observe(latency.count());
-                monitor::cache_load_event_success_total(cell_data_type_, storage_type_).Increment();
             };
 
             if (!self_reserve_) {
@@ -315,7 +314,6 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             auto exception = std::current_exception();
             auto ew = folly::exception_wrapper(exception);
             monitor::cache_load_event_fail_total(cell_data_type_, storage_type_).Increment();
-            monitor::cache_cell_load_fail_total(cell_data_type_, storage_type_).Increment(loading_cids.size());
             for (auto cid : loading_cids) {
                 cells_[cid].set_error(ew);
             }
@@ -357,7 +355,6 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                     }
                     slot_->dlist_->ChargeLoadedResource(loaded_size_);
                     life_start_ = std::chrono::steady_clock::now();
-                    monitor::cache_cell_load_success_total(slot_->cell_data_type_, slot_->storage_type_).Increment();
                     monitor::cache_loaded_bytes(slot_->cell_data_type_, StorageType::MEMORY)
                         .Increment(loaded_size_.memory_bytes);
                     monitor::cache_loaded_bytes(slot_->cell_data_type_, StorageType::DISK)
@@ -393,7 +390,6 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                     .Decrement(loaded_size_.memory_bytes);
                 monitor::cache_loaded_bytes(slot_->cell_data_type_, StorageType::DISK)
                     .Decrement(loaded_size_.file_bytes);
-                monitor::cache_cell_evicted_total(slot_->cell_data_type_, slot_->storage_type_).Increment();
                 loaded_size_ = {0, 0};  // reset loaded_size_ to 0,0 to avoid double refund from dlist_
             }
         }

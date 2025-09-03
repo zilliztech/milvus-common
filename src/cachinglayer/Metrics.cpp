@@ -42,22 +42,14 @@ DEFINE_PROMETHEUS_COUNTER_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_cell
                                                              "[cpp]cache cell access miss total");
 
 /* Metrics for Cache Cell Loading */
-DEFINE_PROMETHEUS_COUNTER_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_load_event_success_total,
-                                                             "[cpp]cache load event success total");
 DEFINE_PROMETHEUS_COUNTER_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_load_event_fail_total,
                                                              "[cpp]cache load event fail total");
 DEFINE_PROMETHEUS_HISTOGRAM_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_load_latency_microseconds,
                                                                milvus::monitor::secondsBuckets,
                                                                "[cpp]cache load latency microseconds");
-DEFINE_PROMETHEUS_COUNTER_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_cell_load_success_total,
-                                                             "[cpp]cache cell load success total");
-DEFINE_PROMETHEUS_COUNTER_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_cell_load_fail_total,
-                                                             "[cpp]cache cell load fail total");
 
 /* Metrics for Cache Cell Eviction */
 DEFINE_PROMETHEUS_COUNTER_METRIC_WITH_LOCATION(internal_cache_eviction_event_total, "[cpp]cache eviction event total");
-DEFINE_PROMETHEUS_COUNTER_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_cell_evicted_total,
-                                                             "[cpp]cache cell evicted total");
 DEFINE_PROMETHEUS_COUNTER_METRIC_WITH_LOCATION(internal_cache_evicted_bytes_total, "[cpp]cache evicted bytes total");
 DEFINE_PROMETHEUS_HISTOGRAM_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_cell_lifetime_seconds,
                                                                milvus::monitor::secondsBuckets,
