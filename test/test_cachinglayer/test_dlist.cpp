@@ -30,6 +30,7 @@ class DListTest : public ::testing::Test {
     ResourceUsage high_watermark{90, 45};  // 90%
     // Use a very long interval to disable background eviction for most tests
     EvictionConfig eviction_config_{10,    // cache_touch_window (10 ms)
+                                    true,  // enable background eviction
                                     100};  // eviction_interval (100 ms)
 
     std::unique_ptr<DList> dlist;
