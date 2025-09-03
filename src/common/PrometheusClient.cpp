@@ -33,6 +33,10 @@ const prometheus::Histogram::BucketBoundaries secondsBuckets = {
     std::chrono::duration<float>(std::chrono::seconds(2)).count(),
     std::chrono::duration<float>(std::chrono::seconds(5)).count(),
     std::chrono::duration<float>(std::chrono::seconds(10)).count(),
+    std::chrono::duration<float>(std::chrono::seconds(20)).count(),
+    std::chrono::duration<float>(std::chrono::seconds(50)).count(),
+    std::chrono::duration<float>(std::chrono::seconds(100)).count(),
+    std::chrono::duration<float>(std::chrono::seconds(200)).count(),
 };
 
 const prometheus::Histogram::BucketBoundaries buckets = {1,   2,    4,    8,    16,   32,    64,    128,  256,
