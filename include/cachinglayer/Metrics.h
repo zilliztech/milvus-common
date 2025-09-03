@@ -232,6 +232,8 @@ namespace milvus::cachinglayer::monitor {
 
 /* Metrics for Cache Resource Usage */
 DECLARE_PROMETHEUS_GAUGE_METRIC_WITH_LOCATION(internal_cache_capacity_bytes);
+DECLARE_PROMETHEUS_GAUGE_METRIC_WITH_LOCATION(internal_cache_high_watermark_bytes);
+DECLARE_PROMETHEUS_GAUGE_METRIC_WITH_LOCATION(internal_cache_low_watermark_bytes);
 DECLARE_PROMETHEUS_GAUGE_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_slot_count);
 DECLARE_PROMETHEUS_GAUGE_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_cell_count);
 DECLARE_PROMETHEUS_GAUGE_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_loaded_bytes);
@@ -254,6 +256,8 @@ DECLARE_PROMETHEUS_COUNTER_METRIC_WITH_LOCATION(internal_cache_evicted_bytes_tot
 DECLARE_PROMETHEUS_HISTOGRAM_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_cell_lifetime_seconds);
 
 DEFINE_METRIC_HELPER_WITH_LOCATION(prometheus::Gauge, cache_capacity_bytes);
+DEFINE_METRIC_HELPER_WITH_LOCATION(prometheus::Gauge, cache_high_watermark_bytes);
+DEFINE_METRIC_HELPER_WITH_LOCATION(prometheus::Gauge, cache_low_watermark_bytes);
 DEFINE_METRIC_HELPER_WITH_DATA_TYPE_AND_LOCATION(prometheus::Gauge, cache_slot_count);
 DEFINE_METRIC_HELPER_WITH_DATA_TYPE_AND_LOCATION(prometheus::Gauge, cache_cell_count);
 DEFINE_METRIC_HELPER_WITH_DATA_TYPE_AND_LOCATION(prometheus::Gauge, cache_loading_bytes);

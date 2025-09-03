@@ -414,6 +414,8 @@ DList::UpdateLowWatermark(const ResourceUsage& new_low_watermark) {
                new_low_watermark.ToString(), high_watermark_.load().ToString());
     LOG_INFO("[MCL] UpdateLowWatermark: from {} to {}", low_watermark_.load().ToString(), new_low_watermark.ToString());
     low_watermark_ = new_low_watermark;
+    cachinglayer::monitor::cache_low_watermark_bytes(StorageType::MEMORY).Set(low_watermark_.load().memory_bytes);
+    cachinglayer::monitor::cache_low_watermark_bytes(StorageType::DISK).Set(low_watermark_.load().file_bytes);
 }
 
 void
@@ -430,6 +432,8 @@ DList::UpdateHighWatermark(const ResourceUsage& new_high_watermark) {
     LOG_INFO("[MCL] UpdateHighWatermark: from {} to {}", high_watermark_.load().ToString(),
              new_high_watermark.ToString());
     high_watermark_ = new_high_watermark;
+    cachinglayer::monitor::cache_high_watermark_bytes(StorageType::MEMORY).Set(high_watermark_.load().memory_bytes);
+    cachinglayer::monitor::cache_high_watermark_bytes(StorageType::DISK).Set(high_watermark_.load().file_bytes);
 }
 
 void
