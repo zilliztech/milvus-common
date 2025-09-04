@@ -24,8 +24,8 @@ namespace milvus {
 struct OpContext {
     // Storage Usage tracking
     struct {
-        std::atomic<int64_t> cold_bytes{0};
-        std::atomic<int64_t> used_bytes{0};
+        std::atomic<int64_t> scanned_cold_bytes{0};
+        std::atomic<int64_t> scanned_total_bytes{0};
     } storage_usage;
 
     // TODO: OpenTelemetry Tracing integration
