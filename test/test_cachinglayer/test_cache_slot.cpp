@@ -205,7 +205,7 @@ class CacheSlotTest : public ::testing::Test {
     void
     SetUp() override {
         auto limit = ResourceUsage{MEMORY_LIMIT, DISK_LIMIT};
-        dlist_ = std::make_unique<DList>(limit, limit, limit, EvictionConfig{10, 600});
+        dlist_ = std::make_unique<DList>(limit, limit, limit, EvictionConfig{10, true, 600});
 
         auto temp_translator_uptr =
             std::make_unique<MockTranslator>(cell_sizes_, uid_to_cid_map_, SLOT_KEY, StorageType::MEMORY);

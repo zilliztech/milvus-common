@@ -58,8 +58,10 @@ class DList {
             event_base_->loopForever();
         });
 
-        LOG_INFO("[MCL] Starting eviction loop thread");
-        eviction_thread_ = std::thread(&DList::evictionLoop, this);
+        if (eviction_config_.background_eviction_enabled) {
+            LOG_INFO("[MCL] Starting periodic background eviction loop thread");
+            eviction_thread_ = std::thread(&DList::evictionLoop, this);
+        }
     }
 
     ~DList() {
