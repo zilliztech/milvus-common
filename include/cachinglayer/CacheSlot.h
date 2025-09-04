@@ -25,11 +25,11 @@
 #include <utility>
 #include <vector>
 
+#include "cachinglayer/Metrics.h"
 #include "cachinglayer/Translator.h"
 #include "cachinglayer/Utils.h"
 #include "cachinglayer/lrucache/DList.h"
 #include "cachinglayer/lrucache/ListNode.h"
-#include "common/CommonMonitor.h"
 #include "log/Log.h"
 
 namespace milvus::cachinglayer {
@@ -52,16 +52,16 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         : translator_(std::move(translator)),
           cells_(translator_->num_cells()),
           cell_id_mapping_mode_(translator_->meta()->cell_id_mapping_mode),
+          cell_data_type_(translator_->meta()->cell_data_type),
+          storage_type_(translator_->meta()->storage_type),
           dlist_(dlist),
           evictable_(evictable),
           self_reserve_(self_reserve) {
         for (cid_t i = 0; i < static_cast<cid_t>(translator_->num_cells()); ++i) {
             new (&cells_[i]) CacheCell(this, i);
         }
-        auto storage_type = translator_->meta()->storage_type;
-        internal::cache_slot_count(storage_type).Increment();
-        internal::cache_cell_count(storage_type).Increment(translator_->num_cells());
-        internal::cache_memory_overhead_bytes(storage_type).Increment(memory_overhead());
+        monitor::cache_slot_count(cell_data_type_, storage_type_).Increment();
+        monitor::cache_cell_count(cell_data_type_, storage_type_).Increment(translator_->num_cells());
     }
 
     CacheSlot(const CacheSlot&) = delete;
@@ -99,6 +99,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
 
     folly::SemiFuture<std::shared_ptr<CellAccessor<CellT>>>
     PinCells(const std::vector<uid_t>& uids, std::chrono::milliseconds timeout = std::chrono::milliseconds(100000)) {
+        monitor::cache_access_event_total(cell_data_type_, storage_type_).Increment();
         return folly::makeSemiFuture().deferValue(
             [this, uids = std::vector<uid_t>(uids), timeout](auto&&) -> std::shared_ptr<CellAccessor<CellT>> {
                 auto count = std::min(uids.size(), cells_.size());
@@ -164,10 +165,8 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     }
 
     ~CacheSlot() {
-        auto storage_type = translator_->meta()->storage_type;
-        internal::cache_slot_count(storage_type).Decrement();
-        internal::cache_cell_count(storage_type).Decrement(translator_->num_cells());
-        internal::cache_memory_overhead_bytes(storage_type).Decrement(memory_overhead());
+        monitor::cache_slot_count(cell_data_type_, storage_type_).Decrement();
+        monitor::cache_cell_count(cell_data_type_, storage_type_).Decrement(translator_->num_cells());
     }
 
  private:
@@ -190,15 +189,16 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             auto [need_load, future] = cells_[cid].pin();
             // this statistic is not accurate but acceptable.
             if (future.isReady()) {
-                internal::cache_op_result_count_hit(translator_->meta()->storage_type).Increment();
+                monitor::cache_cell_access_hit_total(cell_data_type_, storage_type_).Increment();
             } else {
-                internal::cache_op_result_count_miss(translator_->meta()->storage_type).Increment();
+                monitor::cache_cell_access_miss_total(cell_data_type_, storage_type_).Increment();
             }
             futures.push_back(std::move(future));
             if (need_load) {
                 need_load_cids.insert(cid);
             }
         }
+
         if (!need_load_cids.empty()) {
             RunLoad(std::move(need_load_cids), timeout);
         }
@@ -235,13 +235,10 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                 auto results = translator_->get_cells(loading_cids);
                 auto latency =
                     std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start);
-                auto storage_type = translator_->meta()->storage_type;
                 for (auto& result : results) {
                     cells_[result.first].set_cell(std::move(result.second), cids.count(result.first) > 0);
-                    internal::cache_load_latency(storage_type).Observe(latency.count());
                 }
-                internal::cache_cell_loaded_count(storage_type).Increment(results.size());
-                internal::cache_load_count_success(storage_type).Increment(results.size());
+                monitor::cache_load_latency_microseconds(cell_data_type_, storage_type_).Observe(latency.count());
             };
 
             if (!self_reserve_) {
@@ -287,9 +284,22 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                           translator_->key(), fmt::join(loading_cids, ","), resource_needed_for_loading.ToString());
             }
 
+            monitor::cache_loading_bytes(cell_data_type_, StorageType::MEMORY)
+                .Increment(resource_needed_for_loading.memory_bytes);
+            monitor::cache_loading_bytes(cell_data_type_, StorageType::DISK)
+                .Increment(resource_needed_for_loading.file_bytes);
+            monitor::cache_cell_loading_count(cell_data_type_, storage_type_).Increment(loading_cids.size());
+
             // defer release resource_needed_for_loading
-            auto defer_release = folly::makeGuard(
-                [this, resource_needed_for_loading]() { dlist_->ReleaseLoadingResource(resource_needed_for_loading); });
+            auto defer_release = folly::makeGuard([this, resource_needed_for_loading, loading_cids]() {
+                monitor::cache_cell_loading_count(cell_data_type_, storage_type_).Decrement(loading_cids.size());
+                monitor::cache_loading_bytes(cell_data_type_, StorageType::MEMORY)
+                    .Decrement(resource_needed_for_loading.memory_bytes);
+                monitor::cache_loading_bytes(cell_data_type_, StorageType::DISK)
+                    .Decrement(resource_needed_for_loading.file_bytes);
+                dlist_->ReleaseLoadingResource(resource_needed_for_loading);
+            });
+
             LOG_TRACE(
                 "[MCL] CacheSlot reserveLoadingResourceWithTimeout {} sec "
                 "result: {} time: {} sec, resource_needed: {}, key: {}",
@@ -303,8 +313,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         } catch (...) {
             auto exception = std::current_exception();
             auto ew = folly::exception_wrapper(exception);
-            auto storage_type = translator_->meta()->storage_type;
-            internal::cache_load_count_fail(storage_type).Increment(loading_cids.size());
+            monitor::cache_load_event_fail_total(cell_data_type_, storage_type_).Increment();
             for (auto cid : loading_cids) {
                 cells_[cid].set_error(ew);
             }
@@ -318,12 +327,8 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             : internal::ListNode(slot->dlist_, slot->evictable_), slot_(slot), cid_(cid) {
         }
 
-        ~CacheCell() override {
-            if (state_ == State::LOADING) {
-                LOG_ERROR("[MCL] CacheSlot Cell {} destroyed while loading", key());
-            }
-            clear_data();
-        }
+        // use the default destructor
+        ~CacheCell() override = default;
 
         CellT*
         cell() {
@@ -350,10 +355,14 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                     }
                     slot_->dlist_->ChargeLoadedResource(loaded_size_);
                     life_start_ = std::chrono::steady_clock::now();
-                    milvus::monitor::internal_cache_used_bytes_memory.Increment(loaded_size_.memory_bytes);
-                    milvus::monitor::internal_cache_used_bytes_disk.Increment(loaded_size_.file_bytes);
+                    monitor::cache_loaded_bytes(slot_->cell_data_type_, StorageType::MEMORY)
+                        .Increment(loaded_size_.memory_bytes);
+                    monitor::cache_loaded_bytes(slot_->cell_data_type_, StorageType::DISK)
+                        .Increment(loaded_size_.file_bytes);
+                    monitor::cache_cell_loaded_count(slot_->cell_data_type_, slot_->storage_type_).Increment();
                 },
                 requesting_thread);
+            LOG_TRACE("CacheSlot Cell loaded: key={}, size={}", key(), loaded_size_.ToString());
         }
 
         void
@@ -361,18 +370,27 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             internal::ListNode::set_error(std::move(error));
         }
 
+        void
+        unload() override {
+            LOG_TRACE("CacheSlot Cell unloaded: key={}, size={}", key(), loaded_size_.ToString());
+            clear_data();
+            internal::ListNode::unload();
+        }
+
      protected:
         void
-        clear_data() override {
+        clear_data() {
             if (cell_) {
-                auto storage_type = slot_->translator_->meta()->storage_type;
-                internal::cache_cell_loaded_count(storage_type).Decrement();
                 auto life_time = std::chrono::steady_clock::now() - life_start_;
                 auto seconds = std::chrono::duration_cast<std::chrono::seconds>(life_time).count();
-                internal::cache_item_lifetime_seconds(storage_type).Observe(seconds);
+                monitor::cache_cell_lifetime_seconds(slot_->cell_data_type_, slot_->storage_type_).Observe(seconds);
                 cell_ = nullptr;
-                milvus::monitor::internal_cache_used_bytes_memory.Decrement(loaded_size_.memory_bytes);
-                milvus::monitor::internal_cache_used_bytes_disk.Decrement(loaded_size_.file_bytes);
+                monitor::cache_cell_loaded_count(slot_->cell_data_type_, slot_->storage_type_).Decrement();
+                monitor::cache_loaded_bytes(slot_->cell_data_type_, StorageType::MEMORY)
+                    .Decrement(loaded_size_.memory_bytes);
+                monitor::cache_loaded_bytes(slot_->cell_data_type_, StorageType::DISK)
+                    .Decrement(loaded_size_.file_bytes);
+                loaded_size_ = {0, 0};  // reset loaded_size_ to 0,0 to avoid double refund from dlist_
             }
         }
 
@@ -388,16 +406,13 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         std::chrono::steady_clock::time_point life_start_{};
     };
 
-    [[nodiscard]] size_t
-    memory_overhead() const {
-        return sizeof(*this) + cells_.size() * sizeof(CacheCell);
-    }
-
     const std::unique_ptr<Translator<CellT>> translator_;
     // Each CacheCell's cid_t is its index in vector
     // Once initialized, cells_ should never be resized.
     std::vector<CacheCell> cells_;
     CellIdMappingMode cell_id_mapping_mode_;
+    CellDataType cell_data_type_;
+    StorageType storage_type_;
     internal::DList* dlist_;
     const bool evictable_;
     const bool self_reserve_;

@@ -22,6 +22,7 @@
 #include <queue>
 #include <unordered_map>
 
+#include "cachinglayer/Metrics.h"
 #include "cachinglayer/Utils.h"
 #include "cachinglayer/lrucache/ListNode.h"
 #include "log/Log.h"
@@ -42,6 +43,13 @@ class DList {
                    "[MCL] high watermark must be greater than low watermark");
         AssertInfo((max_memory - high_watermark).AllGEZero(), "[MCL] max memory must be greater than high watermark");
 
+        monitor::cache_capacity_bytes(StorageType::MEMORY).Set(max_memory.memory_bytes);
+        monitor::cache_capacity_bytes(StorageType::DISK).Set(max_memory.file_bytes);
+        monitor::cache_high_watermark_bytes(StorageType::MEMORY).Set(high_watermark.memory_bytes);
+        monitor::cache_high_watermark_bytes(StorageType::DISK).Set(high_watermark.file_bytes);
+        monitor::cache_low_watermark_bytes(StorageType::MEMORY).Set(low_watermark.memory_bytes);
+        monitor::cache_low_watermark_bytes(StorageType::DISK).Set(low_watermark.file_bytes);
+
         // Initialize event base and thread
         event_base_ = std::make_unique<folly::EventBase>();
         event_base_thread_ = std::make_unique<std::thread>([this] {
@@ -50,6 +58,7 @@ class DList {
             event_base_->loopForever();
         });
 
+        LOG_INFO("[MCL] Starting eviction loop thread");
         eviction_thread_ = std::thread(&DList::evictionLoop, this);
     }
 
@@ -222,9 +231,9 @@ class DList {
 
     // TODO(tiered storage 3): benchmark folly::DistributedMutex for this usecase.
     mutable std::mutex list_mtx_;
-    ResourceUsage max_resource_limit_;
-    ResourceUsage low_watermark_;
-    ResourceUsage high_watermark_;
+    std::atomic<ResourceUsage> max_resource_limit_;
+    std::atomic<ResourceUsage> low_watermark_;
+    std::atomic<ResourceUsage> high_watermark_;
     const EvictionConfig eviction_config_;
 
     std::thread eviction_thread_;

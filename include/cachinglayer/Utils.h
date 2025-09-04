@@ -34,6 +34,20 @@ enum class StorageType {
     MIXED,
 };
 
+enum class CellDataType {
+    VECTOR_FIELD,
+    VECTOR_INDEX,
+    SCALAR_FIELD,
+    SCALAR_INDEX,
+    OTHER,  // e.g. InsertRecord and DeleteRecord
+};
+
+enum class CellIdMappingMode : uint8_t {
+    CUSTOMIZED = 0,   // the cell id should be parsed from the uid by the translator
+    IDENTICAL = 1,    // the cell id is identical to the uid
+    ALWAYS_ZERO = 2,  // the cell id is always 0
+};
+
 // TODO(tiered storage 4): this is a temporary function to get the result of a future
 // by running it on the inline executor. We don't need this once we are fully async.
 template <typename T>
@@ -298,165 +312,6 @@ struct EvictionConfig {
 };
 
 namespace internal {
-
-inline prometheus::Gauge&
-cache_slot_count(StorageType storage_type) {
-    switch (storage_type) {
-        case StorageType::MEMORY:
-            return monitor::internal_cache_slot_count_memory;
-        case StorageType::DISK:
-            return monitor::internal_cache_slot_count_disk;
-        case StorageType::MIXED:
-            return monitor::internal_cache_slot_count_mixed;
-        default:
-            ThrowInfo(ErrorCode::UnexpectedError, "Unknown StorageType");
-    }
-}
-
-inline prometheus::Gauge&
-cache_cell_count(StorageType storage_type) {
-    switch (storage_type) {
-        case StorageType::MEMORY:
-            return monitor::internal_cache_cell_count_memory;
-        case StorageType::DISK:
-            return monitor::internal_cache_cell_count_disk;
-        case StorageType::MIXED:
-            return monitor::internal_cache_cell_count_mixed;
-        default:
-            ThrowInfo(ErrorCode::UnexpectedError, "Unknown StorageType");
-    }
-}
-
-inline prometheus::Gauge&
-cache_cell_loaded_count(StorageType storage_type) {
-    switch (storage_type) {
-        case StorageType::MEMORY:
-            return monitor::internal_cache_cell_loaded_count_memory;
-        case StorageType::DISK:
-            return monitor::internal_cache_cell_loaded_count_disk;
-        case StorageType::MIXED:
-            return monitor::internal_cache_cell_loaded_count_mixed;
-        default:
-            ThrowInfo(ErrorCode::UnexpectedError, "Unknown StorageType");
-    }
-}
-
-inline prometheus::Histogram&
-cache_load_latency(StorageType storage_type) {
-    switch (storage_type) {
-        case StorageType::MEMORY:
-            return monitor::internal_cache_load_latency_memory;
-        case StorageType::DISK:
-            return monitor::internal_cache_load_latency_disk;
-        case StorageType::MIXED:
-            return monitor::internal_cache_load_latency_mixed;
-        default:
-            ThrowInfo(ErrorCode::UnexpectedError, "Unknown StorageType");
-    }
-}
-
-inline prometheus::Counter&
-cache_op_result_count_hit(StorageType storage_type) {
-    switch (storage_type) {
-        case StorageType::MEMORY:
-            return monitor::internal_cache_op_result_count_hit_memory;
-        case StorageType::DISK:
-            return monitor::internal_cache_op_result_count_hit_disk;
-        case StorageType::MIXED:
-            return monitor::internal_cache_op_result_count_hit_mixed;
-        default:
-            ThrowInfo(ErrorCode::UnexpectedError, "Unknown StorageType");
-    }
-}
-
-inline prometheus::Counter&
-cache_op_result_count_miss(StorageType storage_type) {
-    switch (storage_type) {
-        case StorageType::MEMORY:
-            return monitor::internal_cache_op_result_count_miss_memory;
-        case StorageType::DISK:
-            return monitor::internal_cache_op_result_count_miss_disk;
-        case StorageType::MIXED:
-            return monitor::internal_cache_op_result_count_miss_mixed;
-        default:
-            ThrowInfo(ErrorCode::UnexpectedError, "Unknown StorageType");
-    }
-}
-
-inline prometheus::Counter&
-cache_cell_eviction_count(StorageType storage_type) {
-    switch (storage_type) {
-        case StorageType::MEMORY:
-            return monitor::internal_cache_cell_eviction_count_memory;
-        case StorageType::DISK:
-            return monitor::internal_cache_cell_eviction_count_disk;
-        case StorageType::MIXED:
-            return monitor::internal_cache_cell_eviction_count_mixed;
-        default:
-            ThrowInfo(ErrorCode::UnexpectedError, "Unknown StorageType");
-    }
-}
-
-inline prometheus::Counter&
-cache_eviction_event_count() {
-    return monitor::internal_cache_eviction_event_count_all;
-}
-
-inline prometheus::Histogram&
-cache_item_lifetime_seconds(StorageType storage_type) {
-    switch (storage_type) {
-        case StorageType::MEMORY:
-            return monitor::internal_cache_item_lifetime_seconds_memory;
-        case StorageType::DISK:
-            return monitor::internal_cache_item_lifetime_seconds_disk;
-        case StorageType::MIXED:
-            return monitor::internal_cache_item_lifetime_seconds_mixed;
-        default:
-            ThrowInfo(ErrorCode::UnexpectedError, "Unknown StorageType");
-    }
-}
-
-inline prometheus::Counter&
-cache_load_count_success(StorageType storage_type) {
-    switch (storage_type) {
-        case StorageType::MEMORY:
-            return monitor::internal_cache_load_count_success_memory;
-        case StorageType::DISK:
-            return monitor::internal_cache_load_count_success_disk;
-        case StorageType::MIXED:
-            return monitor::internal_cache_load_count_success_mixed;
-        default:
-            ThrowInfo(ErrorCode::UnexpectedError, "Unknown StorageType");
-    }
-}
-
-inline prometheus::Counter&
-cache_load_count_fail(StorageType storage_type) {
-    switch (storage_type) {
-        case StorageType::MEMORY:
-            return monitor::internal_cache_load_count_fail_memory;
-        case StorageType::DISK:
-            return monitor::internal_cache_load_count_fail_disk;
-        case StorageType::MIXED:
-            return monitor::internal_cache_load_count_fail_mixed;
-        default:
-            ThrowInfo(ErrorCode::UnexpectedError, "Unknown StorageType");
-    }
-}
-
-inline prometheus::Gauge&
-cache_memory_overhead_bytes(StorageType storage_type) {
-    switch (storage_type) {
-        case StorageType::MEMORY:
-            return monitor::internal_cache_memory_overhead_bytes_memory;
-        case StorageType::DISK:
-            return monitor::internal_cache_memory_overhead_bytes_disk;
-        case StorageType::MIXED:
-            return monitor::internal_cache_memory_overhead_bytes_mixed;
-        default:
-            ThrowInfo(ErrorCode::UnexpectedError, "Unknown StorageType");
-    }
-}
 
 struct SystemResourceInfo {
     int64_t total_bytes{0};

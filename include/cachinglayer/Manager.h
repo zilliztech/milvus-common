@@ -53,22 +53,30 @@ class Manager {
 
     bool
     ReserveLoadingResourceWithTimeout(const ResourceUsage& size, std::chrono::milliseconds timeout) {
+        monitor::cache_loading_bytes(CellDataType::OTHER, StorageType::MEMORY).Increment(size.memory_bytes);
+        monitor::cache_loading_bytes(CellDataType::OTHER, StorageType::DISK).Increment(size.file_bytes);
         return SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(size, timeout));
     }
 
     void
     ReleaseLoadingResource(const ResourceUsage& size) {
         dlist_->ReleaseLoadingResource(size);
+        monitor::cache_loading_bytes(CellDataType::OTHER, StorageType::MEMORY).Decrement(size.memory_bytes);
+        monitor::cache_loading_bytes(CellDataType::OTHER, StorageType::DISK).Decrement(size.file_bytes);
     }
 
     void
     ChargeLoadedResource(const ResourceUsage& size) {
+        monitor::cache_loaded_bytes(CellDataType::OTHER, StorageType::MEMORY).Increment(size.memory_bytes);
+        monitor::cache_loaded_bytes(CellDataType::OTHER, StorageType::DISK).Increment(size.file_bytes);
         dlist_->ChargeLoadedResource(size);
     }
 
     void
     RefundLoadedResource(const ResourceUsage& size) {
         dlist_->RefundLoadedResource(size);
+        monitor::cache_loaded_bytes(CellDataType::OTHER, StorageType::MEMORY).Decrement(size.memory_bytes);
+        monitor::cache_loaded_bytes(CellDataType::OTHER, StorageType::DISK).Decrement(size.file_bytes);
     }
 
     // memory overhead for managing all cache slots/cells/translators/policies.

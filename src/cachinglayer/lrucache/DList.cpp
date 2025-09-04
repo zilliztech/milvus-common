@@ -17,9 +17,9 @@
 #include <mutex>
 #include <vector>
 
+#include "cachinglayer/Metrics.h"
 #include "cachinglayer/Utils.h"
 #include "cachinglayer/lrucache/ListNode.h"
-#include "common/CommonMonitor.h"
 #include "log/Log.h"
 
 namespace milvus::cachinglayer::internal {
@@ -33,9 +33,9 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std
     // First try immediate reservation
     {
         std::unique_lock<std::mutex> list_lock(list_mtx_);
-        if (!max_resource_limit_.CanHold(size)) {
+        if (!max_resource_limit_.load().CanHold(size)) {
             LOG_ERROR("[MCL] Failed to reserve size={} as it exceeds max_memory_={}.", size.ToString(),
-                      max_resource_limit_.ToString());
+                      max_resource_limit_.load().ToString());
             return folly::makeSemiFuture(false);
         }
         if (reserveResourceInternal(size)) {
@@ -87,7 +87,7 @@ DList::reserveResourceInternal(const ResourceUsage& size) {
     auto using_resources = total_loaded_size_.load() + total_loading_size_.load();
 
     // Combined logical and physical memory limit check
-    bool logical_limit_exceeded = !max_resource_limit_.CanHold(using_resources + size);
+    bool logical_limit_exceeded = !max_resource_limit_.load().CanHold(using_resources + size);
     auto physical_eviction_needed = checkPhysicalResourceLimit(size);
 
     // If either limit is exceeded, attempt unified eviction
@@ -100,7 +100,7 @@ DList::reserveResourceInternal(const ResourceUsage& size) {
         if (logical_limit_exceeded) {
             // Calculate logical eviction requirements
             eviction_target = using_resources + size - low_watermark_;
-            min_eviction = using_resources + size - max_resource_limit_;
+            min_eviction = using_resources + size - max_resource_limit_.load();
 
             // Ensure non-negative values
             if (eviction_target.memory_bytes < 0) {
@@ -132,7 +132,7 @@ DList::reserveResourceInternal(const ResourceUsage& size) {
             LOG_WARN(
                 "[MCL] reserve resource with size={} failed due to all zero evicted_size, "
                 "eviction_target={}, min_eviction={}",
-                size.ToString(), evicted_size.ToString(), eviction_target.ToString(), min_eviction.ToString());
+                size.ToString(), eviction_target.ToString(), min_eviction.ToString());
             return false;
         }
         // logical limit is accurate, thus we can guarantee after one successful eviction, logical limit is satisfied.
@@ -155,8 +155,8 @@ DList::reserveResourceInternal(const ResourceUsage& size) {
     }
 
     total_loading_size_ += size;
-    LOG_TRACE("[MCL] reserve resource with size={} success, total_loading_size={}", size.ToString(),
-              total_loading_size_.load().ToString());
+    LOG_TRACE("[MCL] reserve resource with size={} success, total_loading_size={}, total_loaded_size={}",
+              size.ToString(), total_loading_size_.load().ToString(), total_loaded_size_.load().ToString());
 
     return true;
 }
@@ -171,17 +171,18 @@ DList::evictionLoop() {
         }
         auto using_resources = total_loaded_size_.load() + total_loading_size_.load();
         // if usage is above high watermark, evict until low watermark is reached.
-        tryEvict(
-            {
-                using_resources.memory_bytes >= high_watermark_.memory_bytes
-                    ? using_resources.memory_bytes - low_watermark_.memory_bytes
-                    : 0,
-                using_resources.file_bytes >= high_watermark_.file_bytes
-                    ? using_resources.file_bytes - low_watermark_.file_bytes
-                    : 0,
-            },
-            // in eviction loop, we always evict as much as possible until low watermark.
-            {0, 0}, eviction_config_.cache_cell_unaccessed_survival_time.count() > 0);
+        auto eviction_target = ResourceUsage{
+            using_resources.memory_bytes >= high_watermark_.load().memory_bytes
+                ? using_resources.memory_bytes - low_watermark_.load().memory_bytes
+                : 0,
+            using_resources.file_bytes >= high_watermark_.load().file_bytes
+                ? using_resources.file_bytes - low_watermark_.load().file_bytes
+                : 0,
+        };
+        const auto min_eviction = ResourceUsage{0, 0};
+        if (eviction_target.AnyGTZero()) {
+            tryEvict(eviction_target, min_eviction, eviction_config_.cache_cell_unaccessed_survival_time.count() > 0);
+        }
         notifyWaitingRequests();
     }
 }
@@ -189,25 +190,28 @@ DList::evictionLoop() {
 std::string
 DList::usageInfo() const {
     auto using_resources = total_loaded_size_.load() + total_loading_size_.load();
-    static double precision = 100.0;
+    auto curr_max_resource_limit = max_resource_limit_.load();
+    auto curr_high_watermark = high_watermark_.load();
+    auto curr_low_watermark = low_watermark_.load();
+    constexpr double precision = 100.0;
     std::string info = fmt::format(
         "low_watermark_: {}; high_watermark_: {}; "
         "max_resource_limit_: {}; using_resources_: {} (",
-        low_watermark_.ToString(), high_watermark_.ToString(), max_resource_limit_.ToString(),
+        curr_low_watermark.ToString(), curr_high_watermark.ToString(), curr_max_resource_limit.ToString(),
         using_resources.ToString());
 
     if (using_resources.memory_bytes > 0) {
         info += fmt::format(
             ", {:.2}% of max, {:.2}% of high_watermark memory",
-            static_cast<double>(using_resources.memory_bytes) / max_resource_limit_.memory_bytes * precision,
-            static_cast<double>(using_resources.memory_bytes) / high_watermark_.memory_bytes * precision);
+            static_cast<double>(using_resources.memory_bytes) / curr_max_resource_limit.memory_bytes * precision,
+            static_cast<double>(using_resources.memory_bytes) / curr_high_watermark.memory_bytes * precision);
     }
 
     if (using_resources.file_bytes > 0) {
-        info +=
-            fmt::format(", {:.2}% of max, {:.2}% of high_watermark disk",
-                        static_cast<double>(using_resources.file_bytes) / max_resource_limit_.file_bytes * precision,
-                        static_cast<double>(using_resources.file_bytes) / high_watermark_.file_bytes * precision);
+        info += fmt::format(
+            ", {:.2}% of max, {:.2}% of high_watermark disk",
+            static_cast<double>(using_resources.file_bytes) / curr_max_resource_limit.file_bytes * precision,
+            static_cast<double>(using_resources.file_bytes) / curr_high_watermark.file_bytes * precision);
     }
 
     info += fmt::format("); evictable_size_: {}; total_loaded_size_: {}; total_loading_size_: {}; ",
@@ -337,10 +341,8 @@ DList::tryEvict(const ResourceUsage& expected_eviction, const ResourceUsage& min
             expected_eviction.ToString(), min_eviction.ToString(), size_to_evict.ToString(), usageInfo());
     }
 
-    internal::cache_eviction_event_count().Increment();
+    cachinglayer::monitor::cache_eviction_event_total(size_to_evict.storage_type()).Increment();
     for (auto* list_node : to_evict) {
-        auto size = list_node->loaded_size();
-        internal::cache_cell_eviction_count(size.storage_type()).Increment();
         popItem(list_node);   // must succeed, otherwise the node is not in the list
         list_node->unload();  // NOTE: after unload(), the node's loaded_size() is reset to {0, 0} and state_ is reset
                               // to NOT_LOADED.
@@ -360,14 +362,14 @@ DList::tryEvict(const ResourceUsage& expected_eviction, const ResourceUsage& min
 
     switch (size_to_evict.storage_type()) {
         case StorageType::MEMORY:
-            milvus::monitor::internal_cache_evicted_bytes_memory.Increment(size_to_evict.memory_bytes);
+            cachinglayer::monitor::cache_evicted_bytes_total(StorageType::MEMORY).Increment(size_to_evict.memory_bytes);
             break;
         case StorageType::DISK:
-            milvus::monitor::internal_cache_evicted_bytes_disk.Increment(size_to_evict.file_bytes);
+            cachinglayer::monitor::cache_evicted_bytes_total(StorageType::DISK).Increment(size_to_evict.file_bytes);
             break;
         case StorageType::MIXED:
-            milvus::monitor::internal_cache_evicted_bytes_memory.Increment(size_to_evict.memory_bytes);
-            milvus::monitor::internal_cache_evicted_bytes_disk.Increment(size_to_evict.file_bytes);
+            cachinglayer::monitor::cache_evicted_bytes_total(StorageType::MEMORY).Increment(size_to_evict.memory_bytes);
+            cachinglayer::monitor::cache_evicted_bytes_total(StorageType::DISK).Increment(size_to_evict.file_bytes);
             break;
         default:
             ThrowInfo(ErrorCode::UnexpectedError, "Unknown StorageType");
@@ -377,10 +379,10 @@ DList::tryEvict(const ResourceUsage& expected_eviction, const ResourceUsage& min
 
 bool
 DList::UpdateMaxLimit(const ResourceUsage& new_limit) {
-    AssertInfo((new_limit - high_watermark_).AllGEZero(),
+    AssertInfo((new_limit - high_watermark_.load()).AllGEZero(),
                "[MCL] limit must be greater than high watermark. new_limit: "
                "{}, high_watermark: {}",
-               new_limit.ToString(), high_watermark_.ToString());
+               new_limit.ToString(), high_watermark_.load().ToString());
     std::unique_lock<std::mutex> list_lock(list_mtx_);
     auto using_resources = total_loaded_size_.load() + total_loading_size_.load();
     if (!new_limit.CanHold(using_resources)) {
@@ -392,9 +394,10 @@ DList::UpdateMaxLimit(const ResourceUsage& new_limit) {
             return false;
         }
     }
+    LOG_INFO("[MCL] UpdateMaxLimit: from {} to {}", max_resource_limit_.load().ToString(), new_limit.ToString());
     max_resource_limit_ = new_limit;
-    milvus::monitor::internal_cache_capacity_bytes_memory.Set(max_resource_limit_.memory_bytes);
-    milvus::monitor::internal_cache_capacity_bytes_disk.Set(max_resource_limit_.file_bytes);
+    cachinglayer::monitor::cache_capacity_bytes(StorageType::MEMORY).Set(max_resource_limit_.load().memory_bytes);
+    cachinglayer::monitor::cache_capacity_bytes(StorageType::DISK).Set(max_resource_limit_.load().file_bytes);
     return true;
 }
 
@@ -405,25 +408,32 @@ DList::UpdateLowWatermark(const ResourceUsage& new_low_watermark) {
                "[MCL] low watermark must be greater than or "
                "equal to 0. new_low_watermark: {}",
                new_low_watermark.ToString());
-    AssertInfo((high_watermark_ - new_low_watermark).AllGEZero(),
+    AssertInfo((high_watermark_.load() - new_low_watermark).AllGEZero(),
                "[MCL] low watermark must be less than or equal to high "
                "watermark. new_low_watermark: {}, high_watermark: {}",
-               new_low_watermark.ToString(), high_watermark_.ToString());
+               new_low_watermark.ToString(), high_watermark_.load().ToString());
+    LOG_INFO("[MCL] UpdateLowWatermark: from {} to {}", low_watermark_.load().ToString(), new_low_watermark.ToString());
     low_watermark_ = new_low_watermark;
+    cachinglayer::monitor::cache_low_watermark_bytes(StorageType::MEMORY).Set(low_watermark_.load().memory_bytes);
+    cachinglayer::monitor::cache_low_watermark_bytes(StorageType::DISK).Set(low_watermark_.load().file_bytes);
 }
 
 void
 DList::UpdateHighWatermark(const ResourceUsage& new_high_watermark) {
     std::unique_lock<std::mutex> list_lock(list_mtx_);
-    AssertInfo((new_high_watermark - low_watermark_).AllGEZero(),
+    AssertInfo((new_high_watermark - low_watermark_.load()).AllGEZero(),
                "[MCL] high watermark must be greater than or "
                "equal to low watermark. new_high_watermark: {}, low_watermark: {}",
-               new_high_watermark.ToString(), low_watermark_.ToString());
-    AssertInfo((max_resource_limit_ - new_high_watermark).AllGEZero(),
+               new_high_watermark.ToString(), low_watermark_.load().ToString());
+    AssertInfo((max_resource_limit_.load() - new_high_watermark).AllGEZero(),
                "[MCL] high watermark must be less than or equal to max "
                "resource limit. new_high_watermark: {}, max_resource_limit: {}",
-               new_high_watermark.ToString(), max_resource_limit_.ToString());
+               new_high_watermark.ToString(), max_resource_limit_.load().ToString());
+    LOG_INFO("[MCL] UpdateHighWatermark: from {} to {}", high_watermark_.load().ToString(),
+             new_high_watermark.ToString());
     high_watermark_ = new_high_watermark;
+    cachinglayer::monitor::cache_high_watermark_bytes(StorageType::MEMORY).Set(high_watermark_.load().memory_bytes);
+    cachinglayer::monitor::cache_high_watermark_bytes(StorageType::DISK).Set(high_watermark_.load().file_bytes);
 }
 
 void
