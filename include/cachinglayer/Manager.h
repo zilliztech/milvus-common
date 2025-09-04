@@ -47,7 +47,9 @@ class Manager {
         auto self_reserve = evictionEnabled_;
         auto cache_slot =
             std::make_shared<CacheSlot<CellT>>(std::move(translator), dlist_.get(), evictable, self_reserve);
-        cache_slot->Warmup();
+        // TODO: Warmup is not tracked for now
+        auto ignored_op_ctx = OpContext();
+        cache_slot->Warmup(ignored_op_ctx);
         return cache_slot;
     }
 
