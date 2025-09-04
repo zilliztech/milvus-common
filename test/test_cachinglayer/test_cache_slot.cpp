@@ -253,8 +253,8 @@ TEST_F(CacheSlotTest, PinSingleCellSuccess) {
     ASSERT_EQ(translator_->GetRequestedCids()[0].size(), 1);
     EXPECT_EQ(translator_->GetRequestedCids()[0][0], expected_cid);
     EXPECT_EQ(DListTestFriend::get_used_memory(*dlist_), expected_size);
-    EXPECT_EQ(op_ctx.storage_usage.used_bytes, expected_size.memory_bytes);
-    EXPECT_EQ(op_ctx.storage_usage.cold_bytes, expected_size.memory_bytes);
+    EXPECT_EQ(op_ctx.storage_usage.scanned_total_bytes, expected_size.memory_bytes);
+    EXPECT_EQ(op_ctx.storage_usage.scanned_cold_bytes, expected_size.memory_bytes);
 
     TestCell* cell = accessor->get_cell_of(target_uid);
     ASSERT_NE(cell, nullptr);
@@ -287,8 +287,8 @@ TEST_F(CacheSlotTest, PinMultipleCellsSuccess) {
     ASSERT_EQ(requested.size(), expected_cids.size());
     EXPECT_EQ(requested, expected_cids);
     EXPECT_EQ(DListTestFriend::get_used_memory(*dlist_), expected_total_size);
-    EXPECT_EQ(op_ctx.storage_usage.cold_bytes, expected_total_size.memory_bytes);
-    EXPECT_EQ(op_ctx.storage_usage.used_bytes, expected_total_size.memory_bytes);
+    EXPECT_EQ(op_ctx.storage_usage.scanned_cold_bytes, expected_total_size.memory_bytes);
+    EXPECT_EQ(op_ctx.storage_usage.scanned_total_bytes, expected_total_size.memory_bytes);
 
     for (cl_uid_t uid : target_uids) {
         cid_t cid = uid_to_cid_map_.at(uid);
@@ -321,8 +321,8 @@ TEST_F(CacheSlotTest, PinMultipleUidsMappingToSameCid) {
     ASSERT_EQ(requested.size(), expected_unique_cids.size());
     EXPECT_EQ(requested, expected_unique_cids);
     EXPECT_EQ(DListTestFriend::get_used_memory(*dlist_), expected_total_size);
-    EXPECT_EQ(op_ctx.storage_usage.cold_bytes, expected_total_size.memory_bytes);
-    EXPECT_EQ(op_ctx.storage_usage.used_bytes, expected_total_size.memory_bytes);
+    EXPECT_EQ(op_ctx.storage_usage.scanned_cold_bytes, expected_total_size.memory_bytes);
+    EXPECT_EQ(op_ctx.storage_usage.scanned_total_bytes, expected_total_size.memory_bytes);
 
     TestCell* cell2_uid30 = accessor->get_cell_of(30);
     TestCell* cell2_uid31 = accessor->get_cell_of(31);
@@ -359,8 +359,8 @@ TEST_F(CacheSlotTest, PinInvalidUid) {
         milvus::SegcoreError);
 
     EXPECT_EQ(translator_->GetCellsCallCount(), 0);
-    EXPECT_EQ(op_ctx.storage_usage.cold_bytes, 0);
-    EXPECT_EQ(op_ctx.storage_usage.used_bytes, 0);
+    EXPECT_EQ(op_ctx.storage_usage.scanned_cold_bytes, 0);
+    EXPECT_EQ(op_ctx.storage_usage.scanned_total_bytes, 0);
 }
 
 TEST_F(CacheSlotTest, LoadFailure) {
@@ -392,8 +392,8 @@ TEST_F(CacheSlotTest, LoadFailure) {
     ASSERT_EQ(translator_->GetRequestedCids()[0].size(), 1);
     EXPECT_EQ(translator_->GetRequestedCids()[0][0], expected_cid);
     EXPECT_EQ(DListTestFriend::get_used_memory(*dlist_), ResourceUsage{});
-    EXPECT_EQ(op_ctx.storage_usage.cold_bytes, 0);
-    EXPECT_EQ(op_ctx.storage_usage.used_bytes, 0);
+    EXPECT_EQ(op_ctx.storage_usage.scanned_cold_bytes, 0);
+    EXPECT_EQ(op_ctx.storage_usage.scanned_total_bytes, 0);
 }
 
 TEST_F(CacheSlotTest, PinAlreadyLoadedCell) {
@@ -412,8 +412,8 @@ TEST_F(CacheSlotTest, PinAlreadyLoadedCell) {
     ASSERT_EQ(translator_->GetRequestedCids().size(), 1);
     ASSERT_EQ(translator_->GetRequestedCids()[0][0], expected_cid);
     EXPECT_EQ(DListTestFriend::get_used_memory(*dlist_), expected_size);
-    EXPECT_EQ(op_ctx.storage_usage.cold_bytes, expected_size.memory_bytes);
-    EXPECT_EQ(op_ctx.storage_usage.used_bytes, expected_size.memory_bytes);
+    EXPECT_EQ(op_ctx.storage_usage.scanned_cold_bytes, expected_size.memory_bytes);
+    EXPECT_EQ(op_ctx.storage_usage.scanned_total_bytes, expected_size.memory_bytes);
     TestCell* cell1 = accessor1->get_cell_of(target_uid);
     ASSERT_NE(cell1, nullptr);
 
@@ -424,8 +424,8 @@ TEST_F(CacheSlotTest, PinAlreadyLoadedCell) {
 
     EXPECT_EQ(translator_->GetCellsCallCount(), 0);
     EXPECT_EQ(DListTestFriend::get_used_memory(*dlist_), expected_size);
-    EXPECT_EQ(op_ctx.storage_usage.cold_bytes, expected_size.memory_bytes);
-    EXPECT_EQ(op_ctx.storage_usage.used_bytes, expected_size.memory_bytes * 2);
+    EXPECT_EQ(op_ctx.storage_usage.scanned_cold_bytes, expected_size.memory_bytes);
+    EXPECT_EQ(op_ctx.storage_usage.scanned_total_bytes, expected_size.memory_bytes * 2);
 
     TestCell* cell2 = accessor2->get_cell_of(target_uid);
     ASSERT_NE(cell2, nullptr);
@@ -454,8 +454,8 @@ TEST_F(CacheSlotTest, PinAlreadyLoadedCellViaDifferentUid) {
     ASSERT_EQ(translator_->GetRequestedCids().size(), 1);
     ASSERT_EQ(translator_->GetRequestedCids()[0][0], expected_cid);
     EXPECT_EQ(DListTestFriend::get_used_memory(*dlist_), expected_size);
-    EXPECT_EQ(op_ctx.storage_usage.cold_bytes, expected_size.memory_bytes);
-    EXPECT_EQ(op_ctx.storage_usage.used_bytes, expected_size.memory_bytes);
+    EXPECT_EQ(op_ctx.storage_usage.scanned_cold_bytes, expected_size.memory_bytes);
+    EXPECT_EQ(op_ctx.storage_usage.scanned_total_bytes, expected_size.memory_bytes);
     TestCell* cell1 = accessor1->get_cell_of(uid1);
     ASSERT_NE(cell1, nullptr);
     EXPECT_EQ(cell1->cid, expected_cid);
@@ -467,8 +467,8 @@ TEST_F(CacheSlotTest, PinAlreadyLoadedCellViaDifferentUid) {
 
     EXPECT_EQ(translator_->GetCellsCallCount(), 0);
     EXPECT_EQ(DListTestFriend::get_used_memory(*dlist_), expected_size);
-    EXPECT_EQ(op_ctx.storage_usage.cold_bytes, expected_size.memory_bytes);
-    EXPECT_EQ(op_ctx.storage_usage.used_bytes, expected_size.memory_bytes * 2);
+    EXPECT_EQ(op_ctx.storage_usage.scanned_cold_bytes, expected_size.memory_bytes);
+    EXPECT_EQ(op_ctx.storage_usage.scanned_total_bytes, expected_size.memory_bytes * 2);
 
     TestCell* cell2 = accessor2->get_cell_of(uid2);
     ASSERT_NE(cell2, nullptr);
@@ -511,8 +511,8 @@ TEST_F(CacheSlotTest, TranslatorReturnsExtraCells) {
     EXPECT_TRUE(std::find(requested_cids.begin(), requested_cids.end(), extra_cid) != requested_cids.end());
     EXPECT_EQ(DListTestFriend::get_used_memory(*dlist_), expected_size);
     // bonus cell should also be tracked
-    EXPECT_EQ(op_ctx.storage_usage.cold_bytes, expected_size.memory_bytes);
-    EXPECT_EQ(op_ctx.storage_usage.used_bytes, expected_size.memory_bytes);
+    EXPECT_EQ(op_ctx.storage_usage.scanned_cold_bytes, expected_size.memory_bytes);
+    EXPECT_EQ(op_ctx.storage_usage.scanned_total_bytes, expected_size.memory_bytes);
 
     TestCell* requested_cell = accessor->get_cell_of(requested_uid);
     ASSERT_NE(requested_cell, nullptr);
@@ -526,8 +526,8 @@ TEST_F(CacheSlotTest, TranslatorReturnsExtraCells) {
     EXPECT_EQ(translator_->GetCellsCallCount(), 0);
     EXPECT_EQ(DListTestFriend::get_used_memory(*dlist_), expected_size);
     // bonus cell is not cold anymore
-    EXPECT_EQ(op_ctx.storage_usage.cold_bytes, expected_size.memory_bytes);
-    EXPECT_EQ(op_ctx.storage_usage.used_bytes, expected_size.memory_bytes + extra_size.memory_bytes);
+    EXPECT_EQ(op_ctx.storage_usage.scanned_cold_bytes, expected_size.memory_bytes);
+    EXPECT_EQ(op_ctx.storage_usage.scanned_total_bytes, expected_size.memory_bytes + extra_size.memory_bytes);
 
     TestCell* extra_cell = accessor_extra->get_cell_of(extra_uid);
     ASSERT_NE(extra_cell, nullptr);
@@ -563,8 +563,8 @@ TEST_F(CacheSlotTest, EvictionTest) {
     std::sort(requested1.begin(), requested1.end());
     EXPECT_EQ(requested1, cids_012);
     EXPECT_EQ(DListTestFriend::get_used_memory(*dlist_), size_012);
-    EXPECT_EQ(op_ctx.storage_usage.cold_bytes, size_012.memory_bytes);
-    EXPECT_EQ(op_ctx.storage_usage.used_bytes, size_012.memory_bytes);
+    EXPECT_EQ(op_ctx.storage_usage.scanned_cold_bytes, size_012.memory_bytes);
+    EXPECT_EQ(op_ctx.storage_usage.scanned_total_bytes, size_012.memory_bytes);
 
     // 2. Unpin 0, 1, 2
     accessor1.reset();
@@ -586,8 +586,8 @@ TEST_F(CacheSlotTest, EvictionTest) {
               1);  // Load was called for cell 3
     ASSERT_EQ(translator_->GetRequestedCids().size(), 1);
     EXPECT_EQ(translator_->GetRequestedCids()[0], std::vector<cid_t>{cid_3});
-    EXPECT_EQ(op_ctx.storage_usage.cold_bytes, size_012.memory_bytes + size_3.memory_bytes);
-    EXPECT_EQ(op_ctx.storage_usage.used_bytes, size_012.memory_bytes + size_3.memory_bytes);
+    EXPECT_EQ(op_ctx.storage_usage.scanned_cold_bytes, size_012.memory_bytes + size_3.memory_bytes);
+    EXPECT_EQ(op_ctx.storage_usage.scanned_total_bytes, size_012.memory_bytes + size_3.memory_bytes);
 
     // Verify eviction happened
     ResourceUsage used_after_evict1 = DListTestFriend::get_used_memory(*dlist_);
