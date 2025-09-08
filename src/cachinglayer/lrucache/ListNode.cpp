@@ -62,9 +62,8 @@ ListNode::~ListNode() {
             // fall through
         }
         case State::LOADED: {
-            auto saved_loaded_size = loaded_size_;
-            unload();
-            dlist_->RefundLoadedResource(saved_loaded_size);
+            // data cleanup should be handled in child class, e.g. CacheCell::~CacheCell()
+            state_ = State::NOT_LOADED;
             break;
         }
         case State::LOADING: {
@@ -98,9 +97,7 @@ ListNode::manual_evict() {
                     key());
                 return false;
             }
-            auto saved_loaded_size = loaded_size_;
             unload();
-            dlist_->RefundLoadedResource(saved_loaded_size);
             return true;
         }
         case State::LOADING: {
