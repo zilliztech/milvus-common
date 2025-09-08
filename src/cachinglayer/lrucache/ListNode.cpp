@@ -97,7 +97,9 @@ ListNode::manual_evict() {
                     key());
                 return false;
             }
+            auto saved_loaded_size = loaded_size_;
             unload();
+            dlist_->RefundLoadedResource(saved_loaded_size);
             return true;
         }
         case State::LOADING: {

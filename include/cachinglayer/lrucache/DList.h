@@ -111,7 +111,7 @@ class DList {
     void
     ChargeLoadedResource(const ResourceUsage& size);
 
-    // Called when a cell is evicted or manually released.
+    // Called only when a cell is manually released, eviction handle it internally, so it should not call this.
     void
     RefundLoadedResource(const ResourceUsage& size);
 

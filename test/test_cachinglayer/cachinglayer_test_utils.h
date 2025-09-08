@@ -70,6 +70,11 @@ class DListTestFriend {
         dlist->total_loaded_size_ += size;
     }
     static void
+    test_sub_used_memory(DList* dlist, const ResourceUsage& size) {
+        std::lock_guard lock(dlist->list_mtx_);
+        dlist->total_loaded_size_ -= size;
+    }
+    static void
     test_add_loading_memory(DList* dlist, const ResourceUsage& size) {
         std::lock_guard lock(dlist->list_mtx_);
         dlist->total_loading_size_ += size;
