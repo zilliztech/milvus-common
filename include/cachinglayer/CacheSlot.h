@@ -328,7 +328,13 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         }
 
         // use the default destructor
-        ~CacheCell() override = default;
+        ~CacheCell() override {
+            if (cell_) {
+                auto saved_loaded_size = loaded_size_;
+                clear_data();
+                slot_->dlist_->RefundLoadedResource(saved_loaded_size);
+            }
+        }
 
         CellT*
         cell() {
@@ -370,9 +376,9 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             internal::ListNode::set_error(std::move(error));
         }
 
+        // Note: must be called under the lock of mtx_ and should only be called by eviction.
         void
         unload() override {
-            LOG_TRACE("CacheSlot Cell unloaded: key={}, size={}", key(), loaded_size_.ToString());
             clear_data();
             internal::ListNode::unload();
         }
@@ -390,6 +396,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                     .Decrement(loaded_size_.memory_bytes);
                 monitor::cache_loaded_bytes(slot_->cell_data_type_, StorageType::DISK)
                     .Decrement(loaded_size_.file_bytes);
+                LOG_TRACE("CacheSlot Cell unloaded: key={}, size={}", key(), loaded_size_.ToString());
                 loaded_size_ = {0, 0};  // reset loaded_size_ to 0,0 to avoid double refund from dlist_
             }
         }
