@@ -46,17 +46,18 @@ Manager::ConfigureTieredStorage(CacheWarmupPolicies warmup_policies, CacheLimit 
             "[MCL] Configured Tiered Storage manager with "
             "memory watermark: low {}, high {}, max {}, "
             "disk watermark: low {}, high {}, max {}, "
-            "cache touch window: {} ms, eviction interval: {} ms, "
+            "cache touch window: {} ms, "
+            "background eviction enabled: {}, eviction interval: {} ms, "
             "physical memory max ratio: {}, max disk usage percentage: {}, "
             "loading resource factor: {}, cache cell unaccessed survival time: "
             "{} ms, warmup policies: {}",
             FormatBytes(low_watermark.memory_bytes), FormatBytes(high_watermark.memory_bytes),
             FormatBytes(max.memory_bytes), FormatBytes(low_watermark.file_bytes),
             FormatBytes(high_watermark.file_bytes), FormatBytes(max.file_bytes),
-            eviction_config.cache_touch_window.count(), eviction_config.eviction_interval.count(),
-            eviction_config.overloaded_memory_threshold_percentage, eviction_config.max_disk_usage_percentage,
-            eviction_config.loading_resource_factor, eviction_config.cache_cell_unaccessed_survival_time.count(),
-            policy_str);
+            eviction_config.cache_touch_window.count(), eviction_config.background_eviction_enabled,
+            eviction_config.eviction_interval.count(), eviction_config.overloaded_memory_threshold_percentage,
+            eviction_config.max_disk_usage_percentage, eviction_config.loading_resource_factor,
+            eviction_config.cache_cell_unaccessed_survival_time.count(), policy_str);
     });
 }
 

@@ -266,6 +266,7 @@ struct EvictionConfig {
     // Touch a node means to move it to the head of the list, which requires locking the entire list.
     // Use cache_touch_window_ms to reduce the frequency of touching and reduce contention.
     std::chrono::milliseconds cache_touch_window;
+    bool background_eviction_enabled;
     std::chrono::milliseconds eviction_interval;
     // Time after which an unaccessed cache cell will be evicted
     std::chrono::seconds cache_cell_unaccessed_survival_time;
@@ -280,6 +281,7 @@ struct EvictionConfig {
 
     EvictionConfig()
         : cache_touch_window(std::chrono::milliseconds(0)),
+          background_eviction_enabled(false),
           eviction_interval(std::chrono::milliseconds(0)),
           cache_cell_unaccessed_survival_time(std::chrono::seconds(0)),
           overloaded_memory_threshold_percentage(0.9),
@@ -288,8 +290,9 @@ struct EvictionConfig {
           loading_resource_factor(1.0f) {
     }
 
-    EvictionConfig(int64_t cache_touch_window_ms, int64_t eviction_interval_ms)
+    EvictionConfig(int64_t cache_touch_window_ms, bool background_eviction_enabled, int64_t eviction_interval_ms)
         : cache_touch_window(std::chrono::milliseconds(cache_touch_window_ms)),
+          background_eviction_enabled(background_eviction_enabled),
           eviction_interval(std::chrono::milliseconds(eviction_interval_ms)),
           cache_cell_unaccessed_survival_time(std::chrono::seconds(0)),
           overloaded_memory_threshold_percentage(0.9),
@@ -298,10 +301,11 @@ struct EvictionConfig {
           loading_resource_factor(1.0f) {
     }
 
-    EvictionConfig(int64_t cache_touch_window_ms, int64_t eviction_interval_ms,
+    EvictionConfig(int64_t cache_touch_window_ms, bool background_eviction_enabled, int64_t eviction_interval_ms,
                    int64_t cache_cell_unaccessed_survival_time, float overloaded_memory_threshold_percentage,
                    float max_disk_usage_percentage, const std::string& disk_path, float loading_resource_factor)
         : cache_touch_window(std::chrono::milliseconds(cache_touch_window_ms)),
+          background_eviction_enabled(background_eviction_enabled),
           eviction_interval(std::chrono::milliseconds(eviction_interval_ms)),
           cache_cell_unaccessed_survival_time(std::chrono::seconds(cache_cell_unaccessed_survival_time)),
           overloaded_memory_threshold_percentage(overloaded_memory_threshold_percentage),
