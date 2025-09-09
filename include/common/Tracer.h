@@ -89,7 +89,10 @@ parseHeaders(const std::string& headers);
 struct AutoSpan {
     explicit AutoSpan(const std::string& name, TraceContext* ctx = nullptr, bool is_root_span = false);
 
-    explicit AutoSpan(const std::string& name, const std::shared_ptr<trace::Span>& span, bool temporary_root = false);
+    // If `save_current_root` is true, the current root span will be saved and this span will become the new root span.
+    // The previous root will be restored when this AutoSpan is destroyed.
+    explicit AutoSpan(const std::string& name, const std::shared_ptr<trace::Span>& span,
+                      bool save_current_root = false);
 
     std::shared_ptr<trace::Span>
     GetSpan();
@@ -99,7 +102,7 @@ struct AutoSpan {
  private:
     std::shared_ptr<trace::Span> span_;
     bool is_root_span_;
-    bool is_temporary_root_ = false;
+    bool save_current_root_ = false;
     std::shared_ptr<trace::Span> previous_root_;
 };
 
