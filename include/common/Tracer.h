@@ -89,7 +89,10 @@ parseHeaders(const std::string& headers);
 struct AutoSpan {
     explicit AutoSpan(const std::string& name, TraceContext* ctx = nullptr, bool is_root_span = false);
 
-    explicit AutoSpan(const std::string& name, const std::shared_ptr<trace::Span>& span);
+    // Creates a span with a parent span. If set_as_temp_root is true, this span will temporarily
+    // replace the current thread-local root span. The original root span will be saved and restored
+    // when this AutoSpan is destroyed.
+    explicit AutoSpan(const std::string& name, const std::shared_ptr<trace::Span>& span, bool set_as_temp_root = false);
 
     std::shared_ptr<trace::Span>
     GetSpan();
@@ -99,6 +102,8 @@ struct AutoSpan {
  private:
     std::shared_ptr<trace::Span> span_;
     bool is_root_span_;
+    bool set_as_temp_root_ = false;
+    std::shared_ptr<trace::Span> previous_root_;
 };
 
 }  // namespace milvus::tracer
