@@ -271,10 +271,10 @@ AutoSpan::AutoSpan(const std::string& name, TraceContext* ctx, bool is_root_span
     }
 }
 
-AutoSpan::AutoSpan(const std::string& name, const std::shared_ptr<trace::Span>& parent, bool save_current_root)
-    : is_root_span_(false), save_current_root_(save_current_root) {
+AutoSpan::AutoSpan(const std::string& name, const std::shared_ptr<trace::Span>& parent, bool set_as_temp_root)
+    : is_root_span_(false), set_as_temp_root_(set_as_temp_root) {
     span_ = StartSpan(name, parent);
-    if (save_current_root_ && enable_trace.load()) {
+    if (set_as_temp_root_ && enable_trace.load()) {
         previous_root_ = GetRootSpan();
         SetRootSpan(span_);
     }
@@ -291,7 +291,7 @@ AutoSpan::~AutoSpan() {
     }
     if (is_root_span_) {
         CloseRootSpan();
-    } else if (save_current_root_ && enable_trace.load()) {
+    } else if (set_as_temp_root_ && enable_trace.load()) {
         SetRootSpan(previous_root_);
     }
 }
