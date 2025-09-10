@@ -366,6 +366,16 @@ TEST_F(CacheSlotTest, LoadFailure) {
     ASSERT_EQ(translator_->GetRequestedCids()[0].size(), 1);
     EXPECT_EQ(translator_->GetRequestedCids()[0][0], expected_cid);
     EXPECT_EQ(DListTestFriend::get_used_memory(*dlist_), ResourceUsage{});
+
+    // recover the translator and try again
+    translator_->SetShouldThrow(false);
+    auto expected_size = translator_->estimated_byte_size_of_cell(expected_cid).first;
+    auto future2 = cache_slot_->PinCells({target_uid});
+    auto accessor = SemiInlineGet(std::move(future2));
+    ASSERT_NE(accessor, nullptr);
+    TestCell* cell = accessor->get_cell_of(target_uid);
+    ASSERT_NE(cell, nullptr);
+    EXPECT_EQ(DListTestFriend::get_used_memory(*dlist_), expected_size);
 }
 
 TEST_F(CacheSlotTest, PinAlreadyLoadedCell) {
