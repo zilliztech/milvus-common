@@ -14,6 +14,7 @@
 #include <folly/futures/Future.h>
 #include <folly/futures/SharedPromise.h>
 
+#include <algorithm>
 #include <any>
 #include <chrono>
 #include <cstddef>
@@ -30,6 +31,7 @@
 #include "cachinglayer/Utils.h"
 #include "cachinglayer/lrucache/DList.h"
 #include "cachinglayer/lrucache/ListNode.h"
+#include "common/OpContext.h"
 #include "log/Log.h"
 
 namespace milvus::cachinglayer {
@@ -72,7 +74,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     operator=(CacheSlot&&) = delete;
 
     void
-    Warmup() {
+    Warmup(OpContext& ctx) {
         auto warmup_policy = translator_->meta()->cache_warmup_policy;
 
         if (warmup_policy == CacheWarmupPolicy::CacheWarmupPolicy_Disable) {
@@ -84,48 +86,52 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         for (cid_t i = 0; i < translator_->num_cells(); ++i) {
             cids.push_back(i);
         }
-        SemiInlineGet(PinCells(cids));
+        SemiInlineGet(PinCells(ctx, cids));
     }
 
     folly::SemiFuture<std::shared_ptr<CellAccessor<CellT>>>
-    PinAllCells(std::chrono::milliseconds timeout = std::chrono::milliseconds(100000)) {
-        return folly::makeSemiFuture().deferValue([this, timeout](auto&&) {
+    PinAllCells(OpContext& ctx, std::chrono::milliseconds timeout = std::chrono::milliseconds(100000)) {
+        return folly::makeSemiFuture().deferValue([this, &ctx, timeout](auto&&) {
             std::vector<cid_t> cids;
             cids.resize(cells_.size());
             std::iota(cids.begin(), cids.end(), 0);
-            return PinInternal(cids, timeout);
+            return PinInternal(ctx, cids, timeout);
         });
     }
 
     folly::SemiFuture<std::shared_ptr<CellAccessor<CellT>>>
-    PinCells(const std::vector<uid_t>& uids, std::chrono::milliseconds timeout = std::chrono::milliseconds(100000)) {
+    PinCells(OpContext& ctx, const std::vector<uid_t>& uids,
+             std::chrono::milliseconds timeout = std::chrono::milliseconds(100000)) {
         monitor::cache_access_event_total(cell_data_type_, storage_type_).Increment();
         return folly::makeSemiFuture().deferValue(
-            [this, uids = std::vector<uid_t>(uids), timeout](auto&&) -> std::shared_ptr<CellAccessor<CellT>> {
+            [this, uids = std::vector<uid_t>(uids), &ctx, timeout](auto&&) -> std::shared_ptr<CellAccessor<CellT>> {
                 auto count = std::min(uids.size(), cells_.size());
-                ska::flat_hash_set<cid_t> involved_cids;
-                involved_cids.reserve(count);
+                ska::flat_hash_set<cid_t> involved_cids_set;
+                involved_cids_set.reserve(count);
                 switch (cell_id_mapping_mode_) {
                     case CellIdMappingMode::IDENTICAL: {
                         for (auto& uid : uids) {
-                            involved_cids.insert(uid);
+                            involved_cids_set.insert(uid);
                         }
                         break;
                     }
                     case CellIdMappingMode::ALWAYS_ZERO: {
                         if (uids.size() > 0) {
-                            involved_cids.insert(0);
+                            involved_cids_set.insert(0);
                         }
                         break;
                     }
                     default: {
                         for (auto& uid : uids) {
                             auto cid = cell_id_of(uid);
-                            involved_cids.insert(cid);
+                            involved_cids_set.insert(cid);
                         }
                     }
                 }
-                return PinInternal(involved_cids, timeout);
+                std::vector<cid_t> involved_cids_vec;
+                involved_cids_vec.reserve(involved_cids_set.size());
+                std::copy(involved_cids_set.begin(), involved_cids_set.end(), std::back_inserter(involved_cids_vec));
+                return PinInternal(ctx, involved_cids_vec, timeout);
             });
     }
 
@@ -172,9 +178,8 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
  private:
     friend class CellAccessor<CellT>;
 
-    template <typename CidsT>
     std::shared_ptr<CellAccessor<CellT>>
-    PinInternal(const CidsT& cids, std::chrono::milliseconds timeout) {
+    PinInternal(OpContext& ctx, const std::vector<cid_t>& cids, std::chrono::milliseconds timeout) {
         std::vector<folly::SemiFuture<internal::ListNode::NodePin>> futures;
         std::unordered_set<cid_t> need_load_cids;
         futures.reserve(cids.size());
@@ -185,6 +190,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                           translator_->key());
             }
         }
+
         for (const auto& cid : cids) {
             auto [need_load, future] = cells_[cid].pin();
             // this statistic is not accurate but acceptable.
@@ -200,10 +206,11 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         }
 
         if (!need_load_cids.empty()) {
-            RunLoad(std::move(need_load_cids), timeout);
+            RunLoad(ctx, std::move(need_load_cids), timeout);
         }
 
         auto pins = SemiInlineGet(folly::collect(futures));
+        ctx.storage_usage.used_bytes.fetch_add(translator_->cells_storage_bytes(cids));
         return std::make_shared<CellAccessor<CellT>>(this->shared_from_this(), std::move(pins));
     }
 
@@ -220,7 +227,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     }
 
     void
-    RunLoad(std::unordered_set<cid_t>&& cids, std::chrono::milliseconds timeout) {
+    RunLoad(OpContext& ctx, std::unordered_set<cid_t>&& cids, std::chrono::milliseconds timeout) {
         ResourceUsage essential_loading_resource{};
         ResourceUsage bonus_loading_resource{};
         std::vector<cid_t> loading_cids;
@@ -239,6 +246,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                     cells_[result.first].set_cell(std::move(result.second), cids.count(result.first) > 0);
                 }
                 monitor::cache_load_latency_microseconds(cell_data_type_, storage_type_).Observe(latency.count());
+                ctx.storage_usage.cold_bytes.fetch_add(translator_->cells_storage_bytes(loading_cids));
             };
 
             if (!self_reserve_) {
@@ -327,6 +335,8 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                 resource_needed_for_loading.ToString(), translator_->key());
 
             run_load_internal();
+            // bonus loading should also be considered for storage_usage.used_bytes tracking
+            ctx.storage_usage.used_bytes.fetch_add(translator_->cells_storage_bytes(bonus_cids));
         } catch (...) {
             auto exception = std::current_exception();
             auto ew = folly::exception_wrapper(exception);

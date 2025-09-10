@@ -72,6 +72,10 @@ class Translator {
         return {};
     }
 
+    // this method is used to get the byte size of a specific cell in persistent storage
+    virtual int64_t
+    cells_storage_bytes(const std::vector<cid_t>& cids) const = 0;
+
     // extra cells strategy should be added in cell_ids_to_be_loaded(), get_cells() should just a load executor.
     virtual std::vector<std::pair<cid_t, std::unique_ptr<CellT>>>
     get_cells(const std::vector<cid_t>& cids) = 0;
