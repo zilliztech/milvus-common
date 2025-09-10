@@ -314,7 +314,8 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             auto exception = std::current_exception();
             auto ew = folly::exception_wrapper(exception);
             monitor::cache_load_event_fail_total(cell_data_type_, storage_type_).Increment();
-            for (auto cid : loading_cids) {
+            // set_error should only be called on the cells that are actually loaded, bonus cells are not considered.
+            for (auto cid : cids) {
                 cells_[cid].set_error(ew);
             }
         }
