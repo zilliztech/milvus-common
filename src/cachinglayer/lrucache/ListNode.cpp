@@ -218,10 +218,8 @@ ListNode::state_to_string(State state) {
 void
 ListNode::unpin() {
     std::unique_lock<std::shared_mutex> lock(mtx_);
-    if (pin_count_.fetch_sub(1) == 1) {
-        if (evictable_) {
-            touch_to_dlist(state_ == State::LOADED || state_ == State::CACHED);
-        }
+    if (pin_count_.fetch_sub(1) == 1 && evictable_ && (state_ == State::LOADED || state_ == State::CACHED)) {
+        touch_to_dlist(true);
     }
 }
 
@@ -238,7 +236,19 @@ ListNode::touch_to_dlist(bool update_evictable_memory) {
 
 void
 ListNode::unload() {
-    state_ = State::NOT_LOADED;  // reset state_ to NOT_LOADED to avoid double refund from dlist_
+    switch (state_) {
+        case State::CACHED:
+        case State::LOADED: {
+            // data cleanup should be handled in child class's unload() method, e.g. CacheCell::unload()
+            state_ = State::NOT_LOADED;
+            break;
+        }
+        // dlist_ should not call unload() while a node is loading or not_loaded, something must be wrong
+        default: {
+            ThrowInfo(ErrorCode::UnexpectedError, "[MCL] ListNode unloaded in unexpected state: {}",
+                      state_to_string(state_));
+        }
+    }
 }
 
 }  // namespace milvus::cachinglayer::internal
