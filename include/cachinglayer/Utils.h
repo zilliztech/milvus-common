@@ -156,12 +156,21 @@ struct ResourceUsage {
         std::string result;
         if (memory_bytes > 0) {
             result += fmt::format("memory {}", FormatBytes(memory_bytes));
+        } else if (memory_bytes < 0) {
+            // it should never happen
+            result += fmt::format("memory -{}", FormatBytes(-memory_bytes));
         }
         if (file_bytes > 0) {
             if (!result.empty()) {
                 result += ", ";
             }
             result += fmt::format("disk {}", FormatBytes(file_bytes));
+        } else if (file_bytes < 0) {
+            // it should never happen
+            if (!result.empty()) {
+                result += ", ";
+            }
+            result += fmt::format("disk -{}", FormatBytes(-file_bytes));
         }
         return result;
     }

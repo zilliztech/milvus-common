@@ -24,6 +24,17 @@
 
 namespace milvus::cachinglayer::internal {
 
+// Helper to clamp an atomic<ResourceUsage> to non-negative with custom logging.
+template <typename LogFn>
+inline void
+ClampNonNegative(std::atomic<ResourceUsage>& counter, LogFn&& log_fn) {
+    auto current = counter.load();
+    if (!current.AllGEZero()) {
+        log_fn(current);
+        counter = ResourceUsage{0, 0};
+    }
+}
+
 folly::SemiFuture<bool>
 DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std::chrono::milliseconds timeout) {
     // NOTE: we can reserve more loading resources than the original request size by adjusting the
@@ -353,10 +364,18 @@ DList::tryEvict(const ResourceUsage& expected_eviction, const ResourceUsage& min
     // Refund logically evicted resources manually, waiting requests notification is left to caller.
     total_loaded_size_ -= size_to_evict;
     evictable_size_ -= size_to_evict;
-    AssertInfo(total_loaded_size_.load().AllGEZero(), "[MCL] total_loaded_size_ should be non-negative but got: {}",
-               total_loaded_size_.load().ToString());
-    AssertInfo(evictable_size_.load().AllGEZero(), "[MCL] evictable_size_ should be non-negative but got: {}",
-               evictable_size_.load().ToString());
+    ClampNonNegative(total_loaded_size_, [&](const ResourceUsage& curr) {
+        LOG_ERROR(
+            "[MCL] total_loaded_size_ became negative after eviction: evicted_size={}, current_total_loaded={}, "
+            "usage_info={}",
+            size_to_evict.ToString(), curr.ToString(), usageInfo());
+    });
+    ClampNonNegative(evictable_size_, [&](const ResourceUsage& curr) {
+        LOG_ERROR(
+            "[MCL] evictable_size_ became negative after eviction: evicted_size={}, current_evictable={}, "
+            "usage_info={}",
+            size_to_evict.ToString(), curr.ToString(), usageInfo());
+    });
 
     LOG_TRACE("[MCL] Logically evicted size: {}", size_to_evict.ToString());
 
@@ -438,9 +457,14 @@ DList::UpdateHighWatermark(const ResourceUsage& new_high_watermark) {
 
 void
 DList::ReleaseLoadingResource(const ResourceUsage& loading_size) {
-    total_loading_size_ -= loading_size;
-    AssertInfo(total_loading_size_.load().AllGEZero(), "[MCL] total_loading_size_ should be non-negative but got: {}",
-               total_loading_size_.load().ToString());
+    auto size = loading_size * eviction_config_.loading_resource_factor;
+    total_loading_size_ -= size;
+    ClampNonNegative(total_loading_size_, [&](const ResourceUsage& curr) {
+        LOG_ERROR(
+            "[MCL] total_loading_size_ became negative after release: release_scaled={}, original_release={}, "
+            "loading_resource_factor={}, current_total_loading={}",
+            size.ToString(), loading_size.ToString(), eviction_config_.loading_resource_factor, curr.ToString());
+    });
     // Notify waiting requests that resources are available
     std::unique_lock<std::mutex> lock(list_mtx_);
     notifyWaitingRequests();
@@ -473,8 +497,12 @@ DList::removeItem(ListNode* list_node, ResourceUsage size) {
     std::lock_guard<std::mutex> list_lock(list_mtx_);
     if (popItem(list_node) && list_node->pin_count_ == 0) {
         evictable_size_ -= size;
-        AssertInfo(evictable_size_.load().AllGEZero(), "[MCL] evictable_size_ should be non-negative but got: {}",
-                   evictable_size_.load().ToString());
+        ClampNonNegative(evictable_size_, [&](const ResourceUsage& curr) {
+            LOG_ERROR(
+                "[MCL] evictable_size_ became negative after remove: removed_size={}, current_evictable={}, "
+                "usage_info={}",
+                size.ToString(), curr.ToString(), usageInfo());
+        });
         // if the cell is evicted, loaded, pinned and unpinned within a single refresh window,
         // the cell should be inserted into the LRU list again.
         list_node->last_touch_ = std::chrono::steady_clock::now() - 2 * eviction_config_.cache_touch_window;
@@ -486,8 +514,11 @@ DList::freezeItem(ListNode* list_node [[maybe_unused]], ResourceUsage size) {
     AssertInfo(list_node->pin_count_ > 0, "[MCL] freezeItem should be called on a cell with pin_count_ > 0, but got {}",
                list_node->pin_count_);
     evictable_size_ -= size;
-    AssertInfo(evictable_size_.load().AllGEZero(), "[MCL] evictable_size_ should be non-negative but got: {}",
-               evictable_size_.load().ToString());
+    ClampNonNegative(evictable_size_, [&](const ResourceUsage& curr) {
+        LOG_ERROR(
+            "[MCL] evictable_size_ became negative after freeze: frozen_size={}, current_evictable={}, usage_info={}",
+            size.ToString(), curr.ToString(), usageInfo());
+    });
 }
 
 void
@@ -541,8 +572,13 @@ DList::ChargeLoadedResource(const ResourceUsage& size) {
 void
 DList::RefundLoadedResource(const ResourceUsage& size) {
     total_loaded_size_ -= size;
-    AssertInfo(total_loaded_size_.load().AllGEZero(), "[MCL] total_loaded_size_ should be non-negative but got: {}",
-               total_loaded_size_.load().ToString());
+    ClampNonNegative(total_loaded_size_, [&](const ResourceUsage& curr) {
+        LOG_ERROR(
+            "[MCL] total_loaded_size_ became negative after refund loaded resource: refund_size={}, "
+            "current_total_loaded={}, "
+            "usage_info={}",
+            size.ToString(), curr.ToString(), usageInfo());
+    });
     // Notify waiting requests that resources are available
     std::unique_lock<std::mutex> lock(list_mtx_);
     notifyWaitingRequests();
