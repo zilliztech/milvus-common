@@ -330,11 +330,13 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
 
         // use the default destructor
         ~CacheCell() override {
-            if (cell_) {
-                auto saved_loaded_size = loaded_size_;
-                clear_data();
-                slot_->dlist_->RefundLoadedResource(saved_loaded_size);
-            }
+            mark_unload([this]() {
+                if (cell_) {
+                    auto saved_loaded_size = loaded_size_;
+                    clear_data();
+                    slot_->dlist_->RefundLoadedResource(saved_loaded_size);
+                }
+            });
         }
 
         CellT*

@@ -55,28 +55,7 @@ ListNode::ListNode(DList* dlist, bool evictable)
 }
 
 ListNode::~ListNode() {
-    std::unique_lock<std::shared_mutex> lock(mtx_);
-    switch (state_) {
-        case State::CACHED: {
-            dlist_->removeItem(this, loaded_size_);
-            // fall through
-        }
-        case State::LOADED: {
-            // data cleanup should be handled in child class, e.g. CacheCell::~CacheCell()
-            state_ = State::NOT_LOADED;
-            break;
-        }
-        case State::LOADING: {
-            // NOTE:
-            // The LOADING state occurs during pin() and set_cell(), while LoadingResource +/- is handled in RunLoad().
-            // We believe RunLoad() will handle all situations, including exceptions, so there's no need to handle
-            // LoadingResource here.
-            // If that edge case actually occurs, it shouldn't be the fault of ~ListNode() - the system must have bugs.
-            LOG_ERROR("[MCL] ListNode destroyed while loading");
-            break;
-        }
-        default:;  // do nothing
-    }
+    // mark_unload() should be called in child class's destructor, e.g. CacheCell::~CacheCell()
 }
 
 bool
@@ -248,6 +227,33 @@ ListNode::unload() {
             ThrowInfo(ErrorCode::UnexpectedError, "[MCL] ListNode unloaded in unexpected state: {}",
                       state_to_string(state_));
         }
+    }
+}
+
+// mark_unload() should only be called in child class's destructor, e.g. CacheCell::~CacheCell()
+void
+ListNode::mark_unload(std::function<void()> cb) {
+    std::unique_lock<std::shared_mutex> lock(mtx_);
+    switch (state_) {
+        case State::CACHED: {
+            dlist_->removeItem(this, loaded_size_);
+            // fall through
+        }
+        case State::LOADED: {
+            cb();
+            state_ = State::NOT_LOADED;
+            break;
+        }
+        case State::LOADING: {
+            // NOTE:
+            // The LOADING state occurs during pin() and set_cell(), while LoadingResource +/- is handled in RunLoad().
+            // We believe RunLoad() will handle all situations, including exceptions, so there's no need to handle
+            // LoadingResource here.
+            // If that edge case actually occurs, it shouldn't be the fault of ~ListNode() - the system must have bugs.
+            LOG_ERROR("[MCL] ListNode destroyed while loading");
+            break;
+        }
+        default:;  // do nothing
     }
 }
 

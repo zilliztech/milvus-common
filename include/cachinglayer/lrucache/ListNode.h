@@ -16,6 +16,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <memory>
 
 #include "cachinglayer/Utils.h"
@@ -174,6 +175,9 @@ class ListNode {
             promise->setValue(folly::Unit());
         }
     }
+
+    void
+    mark_unload(std::function<void()> cb);
 
     void
     set_error(folly::exception_wrapper error);

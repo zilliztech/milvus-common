@@ -30,8 +30,10 @@ class MockListNode : public ListNode {
     }
 
     ~MockListNode() override {
-        DListTestFriend::test_sub_used_memory(dlist_, loaded_size_);
-        loaded_size_ = {0, 0};
+        mark_unload([this]() {
+            DListTestFriend::test_sub_used_memory(dlist_, loaded_size_);
+            loaded_size_ = {0, 0};
+        });
     }
 
     MOCK_METHOD(void, unload, (), (override));
