@@ -261,14 +261,20 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             reservation_success =
                 SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(resource_needed_for_loading, timeout));
 
-            // if the reservation failed, try to reserve only the essential loading resource
-            if (!reservation_success) {
-                resource_needed_for_loading = essential_loading_resource;
-                reservation_success =
-                    SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(resource_needed_for_loading, timeout));
-            } else {
-                // if the reservation succeeded, we can load the bonus cells
-                loading_cids.insert(loading_cids.end(), bonus_cids.begin(), bonus_cids.end());
+            if (!bonus_cids.empty()) {
+                // if the reservation failed, try to reserve only the essential loading resource
+                if (!reservation_success) {
+                    LOG_WARN(
+                        "[MCL] CacheSlot reserve loading resource with bonus cells failed, try to reserve only "
+                        "essential "
+                        "loading resource");
+                    resource_needed_for_loading = essential_loading_resource;
+                    reservation_success =
+                        SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(resource_needed_for_loading, timeout));
+                } else {
+                    // if the reservation succeeded, we can load the bonus cells
+                    loading_cids.insert(loading_cids.end(), bonus_cids.begin(), bonus_cids.end());
+                }
             }
 
             if (!reservation_success) {
@@ -291,13 +297,24 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             monitor::cache_cell_loading_count(cell_data_type_, storage_type_).Increment(loading_cids.size());
 
             // defer release resource_needed_for_loading
-            auto defer_release = folly::makeGuard([this, resource_needed_for_loading, loading_cids]() {
-                monitor::cache_cell_loading_count(cell_data_type_, storage_type_).Decrement(loading_cids.size());
-                monitor::cache_loading_bytes(cell_data_type_, StorageType::MEMORY)
-                    .Decrement(resource_needed_for_loading.memory_bytes);
-                monitor::cache_loading_bytes(cell_data_type_, StorageType::DISK)
-                    .Decrement(resource_needed_for_loading.file_bytes);
-                dlist_->ReleaseLoadingResource(resource_needed_for_loading);
+            auto defer_release = folly::makeGuard([this, &resource_needed_for_loading, &loading_cids]() {
+                try {
+                    dlist_->ReleaseLoadingResource(resource_needed_for_loading);
+                    monitor::cache_cell_loading_count(cell_data_type_, storage_type_).Decrement(loading_cids.size());
+                    monitor::cache_loading_bytes(cell_data_type_, StorageType::MEMORY)
+                        .Decrement(resource_needed_for_loading.memory_bytes);
+                    monitor::cache_loading_bytes(cell_data_type_, StorageType::DISK)
+                        .Decrement(resource_needed_for_loading.file_bytes);
+                } catch (...) {
+                    auto exception = std::current_exception();
+                    auto ew = folly::exception_wrapper(exception);
+                    LOG_ERROR(
+                        "[MCL] CacheSlot failed to release loading resource for cells with exception, something must "
+                        "be wrong: "
+                        "key={}, "
+                        "loading_cids=[{}], error={}",
+                        translator_->key(), fmt::join(loading_cids, ","), ew.what());
+                }
             });
 
             LOG_TRACE(
@@ -371,7 +388,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                     monitor::cache_cell_loaded_count(slot_->cell_data_type_, slot_->storage_type_).Increment();
                 },
                 requesting_thread);
-            LOG_TRACE("CacheSlot Cell loaded: key={}, size={}", key(), loaded_size_.ToString());
+            LOG_TRACE("[MCL] CacheSlot Cell loaded: key={}, size={}", key(), loaded_size_.ToString());
         }
 
         void
@@ -399,7 +416,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                     .Decrement(loaded_size_.memory_bytes);
                 monitor::cache_loaded_bytes(slot_->cell_data_type_, StorageType::DISK)
                     .Decrement(loaded_size_.file_bytes);
-                LOG_TRACE("CacheSlot Cell unloaded: key={}, size={}", key(), loaded_size_.ToString());
+                LOG_TRACE("[MCL] CacheSlot Cell unloaded: key={}, size={}", key(), loaded_size_.ToString());
                 loaded_size_ = {0, 0};  // reset loaded_size_ to 0,0 to avoid double refund from dlist_
             }
         }

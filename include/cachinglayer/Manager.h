@@ -53,9 +53,12 @@ class Manager {
 
     bool
     ReserveLoadingResourceWithTimeout(const ResourceUsage& size, std::chrono::milliseconds timeout) {
-        monitor::cache_loading_bytes(CellDataType::OTHER, StorageType::MEMORY).Increment(size.memory_bytes);
-        monitor::cache_loading_bytes(CellDataType::OTHER, StorageType::DISK).Increment(size.file_bytes);
-        return SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(size, timeout));
+        auto result = SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(size, timeout));
+        if (result) {
+            monitor::cache_loading_bytes(CellDataType::OTHER, StorageType::MEMORY).Increment(size.memory_bytes);
+            monitor::cache_loading_bytes(CellDataType::OTHER, StorageType::DISK).Increment(size.file_bytes);
+        }
+        return result;
     }
 
     void
