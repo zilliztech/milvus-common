@@ -74,7 +74,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     operator=(CacheSlot&&) = delete;
 
     void
-    Warmup(OpContext& ctx) {
+    Warmup(OpContext* ctx) {
         auto warmup_policy = translator_->meta()->cache_warmup_policy;
 
         if (warmup_policy == CacheWarmupPolicy::CacheWarmupPolicy_Disable) {
@@ -90,7 +90,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     }
 
     folly::SemiFuture<std::shared_ptr<CellAccessor<CellT>>>
-    PinAllCells(OpContext& ctx, std::chrono::milliseconds timeout = std::chrono::milliseconds(100000)) {
+    PinAllCells(OpContext* ctx, std::chrono::milliseconds timeout = std::chrono::milliseconds(100000)) {
         return folly::makeSemiFuture().deferValue([this, &ctx, timeout](auto&&) {
             std::vector<cid_t> cids;
             cids.resize(cells_.size());
@@ -100,11 +100,11 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     }
 
     folly::SemiFuture<std::shared_ptr<CellAccessor<CellT>>>
-    PinCells(OpContext& ctx, const std::vector<uid_t>& uids,
+    PinCells(OpContext* ctx, const std::vector<uid_t>& uids,
              std::chrono::milliseconds timeout = std::chrono::milliseconds(100000)) {
         monitor::cache_access_event_total(cell_data_type_, storage_type_).Increment();
         return folly::makeSemiFuture().deferValue(
-            [this, uids = std::vector<uid_t>(uids), &ctx, timeout](auto&&) -> std::shared_ptr<CellAccessor<CellT>> {
+            [this, uids = std::vector<uid_t>(uids), ctx, timeout](auto&&) -> std::shared_ptr<CellAccessor<CellT>> {
                 auto count = std::min(uids.size(), cells_.size());
                 ska::flat_hash_set<cid_t> involved_cids_set;
                 involved_cids_set.reserve(count);
@@ -179,7 +179,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     friend class CellAccessor<CellT>;
 
     std::shared_ptr<CellAccessor<CellT>>
-    PinInternal(OpContext& ctx, const std::vector<cid_t>& cids, std::chrono::milliseconds timeout) {
+    PinInternal(OpContext* ctx, const std::vector<cid_t>& cids, std::chrono::milliseconds timeout) {
         std::vector<folly::SemiFuture<internal::ListNode::NodePin>> futures;
         std::unordered_set<cid_t> need_load_cids;
         futures.reserve(cids.size());
@@ -210,7 +210,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         }
 
         auto pins = SemiInlineGet(folly::collect(futures));
-        ctx.storage_usage.scanned_total_bytes.fetch_add(translator_->cells_storage_bytes(cids));
+        ctx->storage_usage.scanned_total_bytes.fetch_add(translator_->cells_storage_bytes(cids));
         return std::make_shared<CellAccessor<CellT>>(this->shared_from_this(), std::move(pins));
     }
 
@@ -227,7 +227,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     }
 
     void
-    RunLoad(OpContext& ctx, std::unordered_set<cid_t>&& cids, std::chrono::milliseconds timeout) {
+    RunLoad(OpContext* ctx, std::unordered_set<cid_t>&& cids, std::chrono::milliseconds timeout) {
         ResourceUsage essential_loading_resource{};
         ResourceUsage bonus_loading_resource{};
         std::vector<cid_t> loading_cids;
@@ -246,7 +246,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                     cells_[result.first].set_cell(std::move(result.second), cids.count(result.first) > 0);
                 }
                 monitor::cache_load_latency_microseconds(cell_data_type_, storage_type_).Observe(latency.count());
-                ctx.storage_usage.scanned_cold_bytes.fetch_add(translator_->cells_storage_bytes(loading_cids));
+                ctx->storage_usage.scanned_cold_bytes.fetch_add(translator_->cells_storage_bytes(loading_cids));
             };
 
             if (!self_reserve_) {
@@ -336,7 +336,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
 
             run_load_internal();
             // bonus loading should also be considered for storage_usage.used_bytes tracking
-            ctx.storage_usage.scanned_total_bytes.fetch_add(translator_->cells_storage_bytes(bonus_cids));
+            ctx->storage_usage.scanned_total_bytes.fetch_add(translator_->cells_storage_bytes(bonus_cids));
         } catch (...) {
             auto exception = std::current_exception();
             auto ew = folly::exception_wrapper(exception);
