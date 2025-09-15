@@ -96,10 +96,10 @@ ListNode::loaded_size() const {
     return loaded_size_;
 }
 
-std::pair<bool, folly::SemiFuture<ListNode::NodePin>>
+std::pair<bool, std::variant<ListNode::NodePin, folly::SemiFuture<ListNode::NodePin>>>
 ListNode::pin() {
     // must be called with lock acquired, and state must not be NOT_LOADED.
-    auto read_op = [this]() -> std::pair<bool, folly::SemiFuture<NodePin>> {
+    auto read_op = [this]() -> std::pair<bool, std::variant<NodePin, folly::SemiFuture<NodePin>>> {
         // pin the cell now so that we can avoid taking the lock again in deferValue.
         auto old_pin_count = pin_count_.fetch_add(1);
         switch (state_) {
@@ -117,7 +117,7 @@ ListNode::pin() {
             case State::LOADING: {
                 auto p = NodePin(this);
                 return std::make_pair(false, load_promise_->getSemiFuture().deferValue(
-                                                 [this, p = std::move(p)](auto&&) mutable { return std::move(p); }));
+                                                 [p = std::move(p)](auto&&) mutable { return std::move(p); }));
             }
             default:
                 ThrowInfo(ErrorCode::UnexpectedError, "Programming error: read_op called on a {} cell",
@@ -144,8 +144,8 @@ ListNode::pin() {
     // pin the cell now so that we can avoid taking the lock again in deferValue.
     pin_count_.fetch_add(1);
     auto p = NodePin(this);
-    return std::make_pair(true, load_promise_->getSemiFuture().deferValue(
-                                    [this, p = std::move(p)](auto&&) mutable { return std::move(p); }));
+    return std::make_pair(
+        true, load_promise_->getSemiFuture().deferValue([p = std::move(p)](auto&&) mutable { return std::move(p); }));
 }
 
 void

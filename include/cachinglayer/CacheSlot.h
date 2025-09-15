@@ -138,6 +138,81 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             });
     }
 
+    std::shared_ptr<CellAccessor<CellT>>
+    PinOneCellDirect(OpContext* ctx, const uid_t& uid,
+                     std::chrono::milliseconds timeout = std::chrono::milliseconds(100000)) {
+        auto cid = 0;
+        switch (cell_id_mapping_mode_) {
+            case CellIdMappingMode::IDENTICAL: {
+                cid = uid;
+                break;
+            }
+            case CellIdMappingMode::ALWAYS_ZERO: {
+                cid = 0;
+                break;
+            }
+            default: {
+                cid = cell_id_of(uid);
+            }
+        }
+        auto [need_load, result] = cells_[cid].pin();
+        if (std::holds_alternative<internal::ListNode::NodePin>(result)) {
+            std::vector<internal::ListNode::NodePin> pins;
+            pins.push_back(std::get<internal::ListNode::NodePin>(std::move(result)));
+            if (ctx) {
+                ctx->storage_usage.scanned_total_bytes.fetch_add(translator_->cells_storage_bytes({cid}));
+            }
+            monitor::cache_cell_access_hit_total(cell_data_type_, storage_type_).Increment();
+            return std::make_shared<CellAccessor<CellT>>(this->shared_from_this(), std::move(pins));
+        } else {
+            auto pin_future = std::get<folly::SemiFuture<internal::ListNode::NodePin>>(std::move(result));
+            if (need_load) {
+                RunLoad({cid}, timeout);
+            }
+            std::vector<internal::ListNode::NodePin> pins;
+            pins.push_back(SemiInlineGet(std::move(pin_future)));
+            if (ctx) {
+                auto cold_bytes = translator_->cells_storage_bytes({cid});
+                ctx->storage_usage.scanned_cold_bytes.fetch_add(cold_bytes);
+                ctx->storage_usage.scanned_total_bytes.fetch_add(cold_bytes);
+            }
+            monitor::cache_cell_access_miss_total(cell_data_type_, storage_type_).Increment();
+            return std::make_shared<CellAccessor<CellT>>(this->shared_from_this(), std::move(pins));
+        }
+    }
+
+    std::shared_ptr<CellAccessor<CellT>>
+    PinCellsDirect(OpContext* ctx, const std::vector<uid_t>& uids,
+                   std::chrono::milliseconds timeout = std::chrono::milliseconds(100000)) {
+        auto count = std::min(uids.size(), cells_.size());
+        ska::flat_hash_set<cid_t> involved_cids;
+        involved_cids.reserve(count);
+        switch (cell_id_mapping_mode_) {
+            case CellIdMappingMode::IDENTICAL: {
+                for (auto& uid : uids) {
+                    involved_cids.insert(uid);
+                }
+                break;
+            }
+            case CellIdMappingMode::ALWAYS_ZERO: {
+                if (uids.size() > 0) {
+                    involved_cids.insert(0);
+                }
+                break;
+            }
+            default: {
+                for (auto& uid : uids) {
+                    auto cid = cell_id_of(uid);
+                    involved_cids.insert(cid);
+                }
+            }
+        }
+        std::vector<cid_t> involved_cids_vec;
+        involved_cids_vec.reserve(involved_cids.size());
+        std::copy(involved_cids.begin(), involved_cids.end(), std::back_inserter(involved_cids_vec));
+        return PinInternal(ctx, involved_cids_vec, timeout);
+    }
+
     // Manually evicts the cell if it is LOADED and not pinned.
     // Returns true if the eviction happened.
     bool
@@ -184,8 +259,10 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     std::shared_ptr<CellAccessor<CellT>>
     PinInternal(OpContext* ctx, const std::vector<cid_t>& cids, std::chrono::milliseconds timeout) {
         std::vector<folly::SemiFuture<internal::ListNode::NodePin>> futures;
+        std::vector<internal::ListNode::NodePin> ready_pins;
         std::unordered_set<cid_t> need_load_cids;
         futures.reserve(cids.size());
+        ready_pins.reserve(cids.size());
         need_load_cids.reserve(cids.size());
         for (const auto& cid : cids) {
             if (cid >= static_cast<cid_t>(cells_.size())) {
@@ -195,14 +272,15 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         }
 
         for (const auto& cid : cids) {
-            auto [need_load, future] = cells_[cid].pin();
-            // this statistic is not accurate but acceptable.
-            if (future.isReady()) {
+            auto [need_load, result] = cells_[cid].pin();
+            if (std::holds_alternative<internal::ListNode::NodePin>(result)) {
+                ready_pins.push_back(std::get<internal::ListNode::NodePin>(std::move(result)));
+                // this statistic is not accurate but acceptable.
                 monitor::cache_cell_access_hit_total(cell_data_type_, storage_type_).Increment();
             } else {
+                futures.push_back(std::get<folly::SemiFuture<internal::ListNode::NodePin>>(std::move(result)));
                 monitor::cache_cell_access_miss_total(cell_data_type_, storage_type_).Increment();
             }
-            futures.push_back(std::move(future));
             if (need_load) {
                 need_load_cids.insert(cid);
             }
@@ -212,13 +290,27 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             RunLoad(std::move(need_load_cids), timeout);
         }
 
-        auto pins = SemiInlineGet(folly::collect(futures));
+        std::vector<internal::ListNode::NodePin> all_pins;
+        all_pins.reserve(cids.size());
+
+        for (auto& pin : ready_pins) {
+            all_pins.push_back(std::move(pin));
+        }
+
+        if (!futures.empty()) {
+            auto future_pins = SemiInlineGet(folly::collect(futures));
+            for (auto& pin : future_pins) {
+                all_pins.push_back(std::move(pin));
+            }
+        }
+
         if (ctx && storage_usage_tracking_enabled_) {
             std::vector<cid_t> need_load_cids_vec(need_load_cids.begin(), need_load_cids.end());
             ctx->storage_usage.scanned_cold_bytes.fetch_add(translator_->cells_storage_bytes(need_load_cids_vec));
             ctx->storage_usage.scanned_total_bytes.fetch_add(translator_->cells_storage_bytes(cids));
         }
-        return std::make_shared<CellAccessor<CellT>>(this->shared_from_this(), std::move(pins));
+
+        return std::make_shared<CellAccessor<CellT>>(this->shared_from_this(), std::move(all_pins));
     }
 
     [[nodiscard]] cid_t
