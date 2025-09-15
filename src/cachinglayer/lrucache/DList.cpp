@@ -207,9 +207,9 @@ DList::usageInfo() const {
     constexpr double precision = 100.0;
     std::string info = fmt::format(
         "low_watermark_: {}; high_watermark_: {}; "
-        "max_resource_limit_: {}; using_resources_: {} (",
+        "max_resource_limit_: {}; total_loaded_size_: {}; total_loading_size_: {}; using_resources_: {} (",
         curr_low_watermark.ToString(), curr_high_watermark.ToString(), curr_max_resource_limit.ToString(),
-        using_resources.ToString());
+        total_loaded_size_.load().ToString(), total_loading_size_.load().ToString(), using_resources.ToString());
 
     if (using_resources.memory_bytes > 0) {
         info += fmt::format(
