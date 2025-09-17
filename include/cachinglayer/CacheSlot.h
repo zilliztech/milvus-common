@@ -34,7 +34,7 @@
 #include "common/OpContext.h"
 #include "log/Log.h"
 
-namespace milvus::cachinglayer {
+    namespace milvus::cachinglayer {
 
 template <typename CellT>
 class CellAccessor;
@@ -75,6 +75,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     CacheSlot&
     operator=(CacheSlot&&) = delete;
 
+    // Warmup should only be called once before any Pin operation.
     void
     Warmup() {
         auto warmup_policy = translator_->meta()->cache_warmup_policy;
@@ -89,11 +90,18 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             cids.push_back(i);
         }
         // TODO: Warmup is not tracked for now
-        SemiInlineGet(PinCells(nullptr, cids));
+        PinCellsDirect(nullptr, cids);
+
+        // If the slot is not evictable, we don't need to pin the cells anymore after warmup.
+        skip_pin_ = !evictable_;
     }
 
     folly::SemiFuture<std::shared_ptr<CellAccessor<CellT>>>
     PinAllCells(OpContext* ctx, std::chrono::milliseconds timeout = std::chrono::milliseconds(100000)) {
+        if (skip_pin_) {
+            return std::make_shared<CellAccessor<CellT>>(this->shared_from_this(),
+                                                         std::vector<internal::ListNode::NodePin>());
+        }
         return folly::makeSemiFuture().deferValue([this, &ctx, timeout](auto&&) {
             std::vector<cid_t> cids;
             cids.resize(cells_.size());
@@ -105,6 +113,10 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     folly::SemiFuture<std::shared_ptr<CellAccessor<CellT>>>
     PinCells(OpContext* ctx, const std::vector<uid_t>& uids,
              std::chrono::milliseconds timeout = std::chrono::milliseconds(100000)) {
+        if (skip_pin_) {
+            return std::make_shared<CellAccessor<CellT>>(this->shared_from_this(),
+                                                         std::vector<internal::ListNode::NodePin>());
+        }
         monitor::cache_access_event_total(cell_data_type_, storage_type_).Increment();
         return folly::makeSemiFuture().deferValue(
             [this, uids = std::vector<uid_t>(uids), ctx, timeout](auto&&) -> std::shared_ptr<CellAccessor<CellT>> {
@@ -141,6 +153,10 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     std::shared_ptr<CellAccessor<CellT>>
     PinOneCellDirect(OpContext* ctx, const uid_t& uid,
                      std::chrono::milliseconds timeout = std::chrono::milliseconds(100000)) {
+        if (skip_pin_) {
+            return std::make_shared<CellAccessor<CellT>>(this->shared_from_this(),
+                                                         std::vector<internal::ListNode::NodePin>());
+        }
         auto cid = 0;
         switch (cell_id_mapping_mode_) {
             case CellIdMappingMode::IDENTICAL: {
@@ -187,6 +203,10 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     std::shared_ptr<CellAccessor<CellT>>
     PinCellsDirect(OpContext* ctx, const std::vector<uid_t>& uids,
                    std::chrono::milliseconds timeout = std::chrono::milliseconds(100000)) {
+        if (skip_pin_) {
+            return std::make_shared<CellAccessor<CellT>>(this->shared_from_this(),
+                                                         std::vector<internal::ListNode::NodePin>());
+        }
         auto count = std::min(uids.size(), cells_.size());
         ska::flat_hash_set<cid_t> involved_cids;
         involved_cids.reserve(count);
@@ -566,6 +586,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     const bool evictable_;
     const bool self_reserve_;
     const bool storage_usage_tracking_enabled_;
+    bool skip_pin_{false};
 };
 
 // - A thin wrapper for accessing cells in a CacheSlot.
