@@ -243,8 +243,8 @@ DECLARE_PROMETHEUS_GAUGE_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_cell_
 
 /* Metrics for Cache Cell Access */
 DECLARE_PROMETHEUS_COUNTER_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_access_event_total);
-DECLARE_PROMETHEUS_COUNTER_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_cell_access_hit_total);
-DECLARE_PROMETHEUS_COUNTER_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_cell_access_miss_total);
+DECLARE_PROMETHEUS_COUNTER_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_cell_access_hit_bytes_total);
+DECLARE_PROMETHEUS_COUNTER_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_cell_access_miss_bytes_total);
 
 /* Metrics for Cache Cell Loading */
 DECLARE_PROMETHEUS_COUNTER_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_load_event_fail_total);
@@ -266,9 +266,9 @@ DEFINE_METRIC_HELPER_WITH_DATA_TYPE_AND_LOCATION(prometheus::Gauge, cache_loaded
 DEFINE_METRIC_HELPER_WITH_DATA_TYPE_AND_LOCATION(prometheus::Gauge, cache_cell_loaded_count);
 
 DEFINE_METRIC_HELPER_WITH_DATA_TYPE_AND_LOCATION(prometheus::Counter, cache_access_event_total);
-// ignore cache_access_cells_total since we can parse it from the sum of cache_access_hit/miss_total
-DEFINE_METRIC_HELPER_WITH_DATA_TYPE_AND_LOCATION(prometheus::Counter, cache_cell_access_hit_total);
-DEFINE_METRIC_HELPER_WITH_DATA_TYPE_AND_LOCATION(prometheus::Counter, cache_cell_access_miss_total);
+// ignore cache_access_cells_total since we can parse it from the sum of cache_access_hit/miss_bytes_total
+DEFINE_METRIC_HELPER_WITH_DATA_TYPE_AND_LOCATION(prometheus::Counter, cache_cell_access_hit_bytes_total);
+DEFINE_METRIC_HELPER_WITH_DATA_TYPE_AND_LOCATION(prometheus::Counter, cache_cell_access_miss_bytes_total);
 
 DEFINE_METRIC_HELPER_WITH_DATA_TYPE_AND_LOCATION(prometheus::Counter, cache_load_event_fail_total);
 // ignore cache_load_event_success_total since we can parse it from cache_load_latency_microseconds histogram

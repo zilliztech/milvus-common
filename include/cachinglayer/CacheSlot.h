@@ -156,13 +156,18 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             }
         }
         auto [need_load, result] = cells_[cid].pin();
+        auto cell_storage_bytes = translator_->cells_storage_bytes({cid});
+        if (need_load) {
+            monitor::cache_cell_access_miss_bytes_total(cell_data_type_, storage_type_).Increment(cell_storage_bytes);
+        } else {
+            monitor::cache_cell_access_hit_bytes_total(cell_data_type_, storage_type_).Increment(cell_storage_bytes);
+        }
         if (std::holds_alternative<internal::ListNode::NodePin>(result)) {
             std::vector<internal::ListNode::NodePin> pins;
             pins.push_back(std::get<internal::ListNode::NodePin>(std::move(result)));
             if (ctx) {
-                ctx->storage_usage.scanned_total_bytes.fetch_add(translator_->cells_storage_bytes({cid}));
+                ctx->storage_usage.scanned_total_bytes.fetch_add(cell_storage_bytes);
             }
-            monitor::cache_cell_access_hit_total(cell_data_type_, storage_type_).Increment();
             return std::make_shared<CellAccessor<CellT>>(this->shared_from_this(), std::move(pins));
         } else {
             auto pin_future = std::get<folly::SemiFuture<internal::ListNode::NodePin>>(std::move(result));
@@ -172,11 +177,9 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             std::vector<internal::ListNode::NodePin> pins;
             pins.push_back(SemiInlineGet(std::move(pin_future)));
             if (ctx) {
-                auto cold_bytes = translator_->cells_storage_bytes({cid});
-                ctx->storage_usage.scanned_cold_bytes.fetch_add(cold_bytes);
-                ctx->storage_usage.scanned_total_bytes.fetch_add(cold_bytes);
+                ctx->storage_usage.scanned_cold_bytes.fetch_add(cell_storage_bytes);
+                ctx->storage_usage.scanned_total_bytes.fetch_add(cell_storage_bytes);
             }
-            monitor::cache_cell_access_miss_total(cell_data_type_, storage_type_).Increment();
             return std::make_shared<CellAccessor<CellT>>(this->shared_from_this(), std::move(pins));
         }
     }
@@ -275,14 +278,16 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             auto [need_load, result] = cells_[cid].pin();
             if (std::holds_alternative<internal::ListNode::NodePin>(result)) {
                 ready_pins.push_back(std::get<internal::ListNode::NodePin>(std::move(result)));
-                // this statistic is not accurate but acceptable.
-                monitor::cache_cell_access_hit_total(cell_data_type_, storage_type_).Increment();
             } else {
                 futures.push_back(std::get<folly::SemiFuture<internal::ListNode::NodePin>>(std::move(result)));
-                monitor::cache_cell_access_miss_total(cell_data_type_, storage_type_).Increment();
             }
             if (need_load) {
                 need_load_cids.insert(cid);
+                monitor::cache_cell_access_miss_bytes_total(cell_data_type_, storage_type_)
+                    .Increment(cells_[cid].local_storage_bytes());
+            } else {
+                monitor::cache_cell_access_hit_bytes_total(cell_data_type_, storage_type_)
+                    .Increment(cells_[cid].local_storage_bytes());
             }
         }
 
@@ -305,8 +310,10 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         }
 
         if (ctx && storage_usage_tracking_enabled_) {
-            std::vector<cid_t> need_load_cids_vec(need_load_cids.begin(), need_load_cids.end());
-            ctx->storage_usage.scanned_cold_bytes.fetch_add(translator_->cells_storage_bytes(need_load_cids_vec));
+            if (!need_load_cids.empty()) {
+                std::vector<cid_t> need_load_cids_vec(need_load_cids.begin(), need_load_cids.end());
+                ctx->storage_usage.scanned_cold_bytes.fetch_add(translator_->cells_storage_bytes(need_load_cids_vec));
+            }
             ctx->storage_usage.scanned_total_bytes.fetch_add(translator_->cells_storage_bytes(cids));
         }
 
@@ -448,7 +455,10 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
      public:
         CacheCell() = default;
         CacheCell(CacheSlot<CellT>* slot, cid_t cid)
-            : internal::ListNode(slot->dlist_, slot->evictable_), slot_(slot), cid_(cid) {
+            : internal::ListNode(slot->dlist_, slot->evictable_),
+              slot_(slot),
+              cid_(cid),
+              local_storage_bytes_(slot->translator_->cells_storage_bytes({cid})) {
         }
 
         // use the default destructor
@@ -509,6 +519,11 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             internal::ListNode::unload();
         }
 
+        int64_t
+        local_storage_bytes() const {
+            return local_storage_bytes_;
+        }
+
      protected:
         void
         clear_data() {
@@ -537,6 +552,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         cid_t cid_{0};
         std::unique_ptr<CellT> cell_{nullptr};
         std::chrono::steady_clock::time_point life_start_{};
+        int64_t local_storage_bytes_{0};
     };
 
     const std::unique_ptr<Translator<CellT>> translator_;
