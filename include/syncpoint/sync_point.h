@@ -155,7 +155,6 @@ class SyncPoint {
     SyncPoint();
     Data* impl_;
 };
-
 }  // namespace milvus
 
 // Use TEST_SYNC_POINT to specify sync points inside code base.

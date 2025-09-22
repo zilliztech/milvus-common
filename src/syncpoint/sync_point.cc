@@ -87,6 +87,5 @@ void
 SyncPoint::Process(const Slice& point, void* cb_arg) {
     impl_->Process(point, cb_arg);
 }
-
 }  // namespace milvus
 #endif  // ENABLE_SYNCPOINT
