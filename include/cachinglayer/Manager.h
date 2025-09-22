@@ -30,8 +30,8 @@ class Manager {
     // and before any Manager instance method is called.
     // TODO(tiered storage 4): support dynamic update.
     static void
-    ConfigureTieredStorage(CacheWarmupPolicies warmup_policies, CacheLimit cache_limit, bool evictionEnabled,
-                           EvictionConfig eviction_config);
+    ConfigureTieredStorage(CacheWarmupPolicies warmup_policies, CacheLimit cache_limit,
+                           bool storageUsageTrackingEnabled, bool evictionEnabled, EvictionConfig eviction_config);
 
     Manager(const Manager&) = delete;
     Manager&
@@ -45,8 +45,8 @@ class Manager {
     CreateCacheSlot(std::unique_ptr<Translator<CellT>> translator) {
         auto evictable = translator->meta()->support_eviction && evictionEnabled_;
         auto self_reserve = evictionEnabled_;
-        auto cache_slot =
-            std::make_shared<CacheSlot<CellT>>(std::move(translator), dlist_.get(), evictable, self_reserve);
+        auto cache_slot = std::make_shared<CacheSlot<CellT>>(std::move(translator), dlist_.get(), evictable,
+                                                             self_reserve, storage_usage_tracking_enabled_);
         cache_slot->Warmup();
         return cache_slot;
     }
@@ -113,13 +113,14 @@ class Manager {
 
  private:
     friend void
-    ConfigureTieredStorage(CacheWarmupPolicies warmup_policies, CacheLimit cache_limit, bool evictionEnabled,
-                           EvictionConfig eviction_config);
+    ConfigureTieredStorage(CacheWarmupPolicies warmup_policies, CacheLimit cache_limit,
+                           bool storage_usage_tracking_enabled, bool evictionEnabled, EvictionConfig eviction_config);
 
     Manager() = default;
 
     std::unique_ptr<internal::DList> dlist_{nullptr};
     CacheWarmupPolicies warmup_policies_{};
+    bool storage_usage_tracking_enabled_{false};
     bool evictionEnabled_{false};
 };  // class Manager
 
