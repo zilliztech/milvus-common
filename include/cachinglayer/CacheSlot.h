@@ -50,7 +50,8 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                   "CellT must have a CellByteSize() method that returns a ResourceUsage "
                   "representing the memory consumption of the cell");
 
-    CacheSlot(std::unique_ptr<Translator<CellT>> translator, internal::DList* dlist, bool evictable, bool self_reserve)
+    CacheSlot(std::unique_ptr<Translator<CellT>> translator, internal::DList* dlist, bool evictable, bool self_reserve,
+              bool storage_usage_tracking_enabled)
         : translator_(std::move(translator)),
           cells_(translator_->num_cells()),
           cell_id_mapping_mode_(translator_->meta()->cell_id_mapping_mode),
@@ -58,7 +59,8 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
           storage_type_(translator_->meta()->storage_type),
           dlist_(dlist),
           evictable_(evictable),
-          self_reserve_(self_reserve) {
+          self_reserve_(self_reserve),
+          storage_usage_tracking_enabled_(storage_usage_tracking_enabled) {
         for (cid_t i = 0; i < static_cast<cid_t>(translator_->num_cells()); ++i) {
             new (&cells_[i]) CacheCell(this, i);
         }
@@ -211,7 +213,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         }
 
         auto pins = SemiInlineGet(folly::collect(futures));
-        if (ctx) {
+        if (ctx && storage_usage_tracking_enabled_) {
             std::vector<cid_t> need_load_cids_vec(need_load_cids.begin(), need_load_cids.end());
             ctx->storage_usage.scanned_cold_bytes.fetch_add(translator_->cells_storage_bytes(need_load_cids_vec));
             ctx->storage_usage.scanned_total_bytes.fetch_add(translator_->cells_storage_bytes(cids));
@@ -455,6 +457,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     internal::DList* dlist_;
     const bool evictable_;
     const bool self_reserve_;
+    const bool storage_usage_tracking_enabled_;
 };
 
 // - A thin wrapper for accessing cells in a CacheSlot.

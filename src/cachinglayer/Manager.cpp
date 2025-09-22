@@ -24,17 +24,21 @@ Manager::GetInstance() {
 }
 
 void
-Manager::ConfigureTieredStorage(CacheWarmupPolicies warmup_policies, CacheLimit cache_limit, bool evictionEnabled,
+Manager::ConfigureTieredStorage(CacheWarmupPolicies warmup_policies, CacheLimit cache_limit,
+                                bool storage_usage_tracking_enabled, bool evictionEnabled,
                                 EvictionConfig eviction_config) {
     static std::once_flag once;
     std::call_once(once, [&]() {
         Manager& manager = GetInstance();
         manager.warmup_policies_ = warmup_policies;
+        manager.storage_usage_tracking_enabled_ = storage_usage_tracking_enabled;
         manager.evictionEnabled_ = evictionEnabled;
 
         auto policy_str = warmup_policies.ToString();
-        LOG_INFO("[MCL] Tiered Storage manager is configured with warmup policies: {}, eviction enabled: {}",
-                 policy_str, evictionEnabled);
+        LOG_INFO(
+            "[MCL] Tiered Storage manager is configured with warmup policies: {}, storage usage tracking enabled: {}, "
+            "eviction enabled: {}",
+            policy_str, storage_usage_tracking_enabled, evictionEnabled);
 
         ResourceUsage max{cache_limit.memory_max_bytes, cache_limit.disk_max_bytes};
         ResourceUsage low_watermark{cache_limit.memory_low_watermark_bytes, cache_limit.disk_low_watermark_bytes};
