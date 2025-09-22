@@ -522,9 +522,9 @@ TEST_F(CacheSlotTest, TranslatorReturnsExtraCells) {
     EXPECT_TRUE(std::find(requested_cids.begin(), requested_cids.end(), requested_cid) != requested_cids.end());
     EXPECT_TRUE(std::find(requested_cids.begin(), requested_cids.end(), extra_cid) != requested_cids.end());
     EXPECT_EQ(DListTestFriend::get_used_memory(*dlist_), expected_size);
-    // bonus cell should also be tracked
-    EXPECT_EQ(op_ctx->storage_usage.scanned_cold_bytes, expected_size.memory_bytes);
-    EXPECT_EQ(op_ctx->storage_usage.scanned_total_bytes, expected_size.memory_bytes);
+    // bonus cell should not be tracked
+    EXPECT_EQ(op_ctx->storage_usage.scanned_cold_bytes, requested_size.memory_bytes);
+    EXPECT_EQ(op_ctx->storage_usage.scanned_total_bytes, requested_size.memory_bytes);
 
     TestCell* requested_cell = accessor->get_cell_of(requested_uid);
     ASSERT_NE(requested_cell, nullptr);
@@ -538,8 +538,8 @@ TEST_F(CacheSlotTest, TranslatorReturnsExtraCells) {
     EXPECT_EQ(translator_->GetCellsCallCount(), 0);
     EXPECT_EQ(DListTestFriend::get_used_memory(*dlist_), expected_size);
     // bonus cell is not cold anymore
-    EXPECT_EQ(op_ctx->storage_usage.scanned_cold_bytes, expected_size.memory_bytes);
-    EXPECT_EQ(op_ctx->storage_usage.scanned_total_bytes, expected_size.memory_bytes + extra_size.memory_bytes);
+    EXPECT_EQ(op_ctx->storage_usage.scanned_cold_bytes, requested_size.memory_bytes);
+    EXPECT_EQ(op_ctx->storage_usage.scanned_total_bytes, expected_size.memory_bytes);
 
     TestCell* extra_cell = accessor_extra->get_cell_of(extra_uid);
     ASSERT_NE(extra_cell, nullptr);

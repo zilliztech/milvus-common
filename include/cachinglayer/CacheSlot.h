@@ -207,11 +207,13 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         }
 
         if (!need_load_cids.empty()) {
-            RunLoad(ctx, std::move(need_load_cids), timeout);
+            RunLoad(std::move(need_load_cids), timeout);
         }
 
         auto pins = SemiInlineGet(folly::collect(futures));
         if (ctx) {
+            std::vector<cid_t> need_load_cids_vec(need_load_cids.begin(), need_load_cids.end());
+            ctx->storage_usage.scanned_cold_bytes.fetch_add(translator_->cells_storage_bytes(need_load_cids_vec));
             ctx->storage_usage.scanned_total_bytes.fetch_add(translator_->cells_storage_bytes(cids));
         }
         return std::make_shared<CellAccessor<CellT>>(this->shared_from_this(), std::move(pins));
@@ -230,7 +232,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     }
 
     void
-    RunLoad(OpContext* ctx, std::unordered_set<cid_t>&& cids, std::chrono::milliseconds timeout) {
+    RunLoad(std::unordered_set<cid_t>&& cids, std::chrono::milliseconds timeout) {
         ResourceUsage essential_loading_resource{};
         ResourceUsage bonus_loading_resource{};
         std::vector<cid_t> loading_cids;
@@ -249,9 +251,6 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                     cells_[result.first].set_cell(std::move(result.second), cids.count(result.first) > 0);
                 }
                 monitor::cache_load_latency_microseconds(cell_data_type_, storage_type_).Observe(latency.count());
-                if (ctx) {
-                    ctx->storage_usage.scanned_cold_bytes.fetch_add(translator_->cells_storage_bytes(loading_cids));
-                }
             };
 
             if (!self_reserve_) {
@@ -340,10 +339,6 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                 resource_needed_for_loading.ToString(), translator_->key());
 
             run_load_internal();
-            if (ctx) {
-                // bonus loading should also be considered for storage_usage.used_bytes tracking
-                ctx->storage_usage.scanned_total_bytes.fetch_add(translator_->cells_storage_bytes(bonus_cids));
-            }
         } catch (...) {
             auto exception = std::current_exception();
             auto ew = folly::exception_wrapper(exception);
