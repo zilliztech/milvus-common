@@ -34,7 +34,7 @@
 #include "common/OpContext.h"
 #include "log/Log.h"
 
-    namespace milvus::cachinglayer {
+namespace milvus::cachinglayer {
 
 template <typename CellT>
 class CellAccessor;
@@ -387,7 +387,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             }
 
             for (auto& cid : bonus_cids) {
-                bonus_loading_resource += translator_->estimated_byte_size_of_cell(cid).first;
+                bonus_loading_resource += translator_->estimated_byte_size_of_cell(cid).second;
             }
 
             auto resource_needed_for_loading = essential_loading_resource + bonus_loading_resource;

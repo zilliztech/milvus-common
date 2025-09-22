@@ -176,8 +176,8 @@ void
 DList::evictionLoop() {
     while (true) {
         std::unique_lock<std::mutex> lock(list_mtx_);
-        if (eviction_thread_cv_.wait_for(lock, eviction_config_.eviction_interval,
-                                         [this] { return stop_eviction_loop_.load(); })) {
+        if (bg_eviction_thread_cv_.wait_for(lock, eviction_config_.eviction_interval,
+                                            [this] { return stop_bg_eviction_loop_.load(); })) {
             break;
         }
         auto using_resources = total_loaded_size_.load() + total_loading_size_.load();
