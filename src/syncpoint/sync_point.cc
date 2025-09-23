@@ -1,5 +1,5 @@
 // Adapted from RocksDB's SyncPoint implementation
-
+// (https://github.com/facebook/rocksdb/blob/main/test_util/sync_point.h)
 #include "syncpoint/sync_point.h"
 
 #include <fcntl.h>
