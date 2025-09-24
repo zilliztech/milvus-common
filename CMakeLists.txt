@@ -13,6 +13,7 @@ cmake_minimum_required( VERSION 3.18 )
 project(milvus_common CXX C)
 
 option(ENABLE_UNIT_TESTS "Enable unit tests" OFF)
+option(ENABLE_SYNCPOINT "Enable sync point for testing" OFF)
 
 set( CMAKE_CXX_STANDARD 17 )
 set( CMAKE_CXX_STANDARD_REQUIRED on )
@@ -76,6 +77,10 @@ if (WITH_JAEGER)
         target_link_options(milvus-common PRIVATE "-undefined" "dynamic_lookup")
     endif()
     add_definitions(-DWITH_JAEGER)
+endif()
+
+if (ENABLE_SYNCPOINT)
+    add_definitions(-DENABLE_SYNCPOINT)
 endif()
 
 target_link_libraries(milvus-common PUBLIC
