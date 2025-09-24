@@ -44,7 +44,8 @@ Manager::ConfigureTieredStorage(CacheWarmupPolicies warmup_policies, CacheLimit 
         ResourceUsage low_watermark{cache_limit.memory_low_watermark_bytes, cache_limit.disk_low_watermark_bytes};
         ResourceUsage high_watermark{cache_limit.memory_high_watermark_bytes, cache_limit.disk_high_watermark_bytes};
 
-        manager.dlist_ = std::make_unique<internal::DList>(max, low_watermark, high_watermark, eviction_config);
+        manager.dlist_ =
+            std::make_unique<internal::DList>(evictionEnabled, max, low_watermark, high_watermark, eviction_config);
 
         LOG_INFO(
             "[MCL] Configured Tiered Storage manager with "

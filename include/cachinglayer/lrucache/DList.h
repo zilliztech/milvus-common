@@ -31,13 +31,18 @@ namespace milvus::cachinglayer::internal {
 
 class DList {
  public:
-    DList(ResourceUsage max_memory, ResourceUsage low_watermark, ResourceUsage high_watermark,
+    DList(bool eviction_enabled, ResourceUsage max_memory, ResourceUsage low_watermark, ResourceUsage high_watermark,
           EvictionConfig eviction_config)
         : max_resource_limit_(max_memory),
           low_watermark_(low_watermark),
           high_watermark_(high_watermark),
           eviction_config_(eviction_config),
           next_request_id_(1) {
+        // if eviction is disabled, we don't need to initialize the event base and thread
+        if (!eviction_enabled) {
+            return;
+        }
+
         AssertInfo(low_watermark.AllGEZero(), "[MCL] low watermark must be greater than or equal to 0");
         AssertInfo((high_watermark - low_watermark).AllGEZero(),
                    "[MCL] high watermark must be greater than low watermark");
@@ -60,7 +65,7 @@ class DList {
 
         if (eviction_config_.background_eviction_enabled) {
             LOG_INFO("[MCL] Starting periodic background eviction loop thread");
-            eviction_thread_ = std::thread(&DList::evictionLoop, this);
+            bg_eviction_thread_ = std::thread(&DList::evictionLoop, this);
         }
     }
 
@@ -74,10 +79,12 @@ class DList {
         }
 
         // Stop eviction loop
-        stop_eviction_loop_ = true;
-        eviction_thread_cv_.notify_all();
-        if (eviction_thread_.joinable()) {
-            eviction_thread_.join();
+        if (eviction_config_.background_eviction_enabled) {
+            stop_bg_eviction_loop_ = true;
+            bg_eviction_thread_cv_.notify_all();
+            if (bg_eviction_thread_.joinable()) {
+                bg_eviction_thread_.join();
+            }
         }
         clearWaitingQueue();
     }
@@ -238,9 +245,9 @@ class DList {
     std::atomic<ResourceUsage> high_watermark_;
     const EvictionConfig eviction_config_;
 
-    std::thread eviction_thread_;
-    std::condition_variable eviction_thread_cv_;
-    std::atomic<bool> stop_eviction_loop_{false};
+    std::thread bg_eviction_thread_;
+    std::condition_variable bg_eviction_thread_cv_;
+    std::atomic<bool> stop_bg_eviction_loop_{false};
 
     // Waiting queue for timeout-based memory reservation
     std::priority_queue<std::unique_ptr<WaitingRequest>, std::vector<std::unique_ptr<WaitingRequest>>,

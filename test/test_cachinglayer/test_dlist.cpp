@@ -43,7 +43,7 @@ class DListTest : public ::testing::Test {
 
     void
     SetUp() override {
-        dlist = std::make_unique<DList>(initial_limit, low_watermark, high_watermark, eviction_config_);
+        dlist = std::make_unique<DList>(true, initial_limit, low_watermark, high_watermark, eviction_config_);
         managed_nodes.clear();
         loading_nodes.clear();
     }
