@@ -227,7 +227,6 @@ getSystemMemoryInfo() {
 
     if (container_limit > 0 && container_limit < host_memory) {
         info.total_bytes = container_limit;
-        LOG_DEBUG("[MCL] Using container memory limit: {}", FormatBytes(container_limit));
     } else {
         info.total_bytes = host_memory;
         if (container_limit > host_memory) {

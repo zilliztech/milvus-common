@@ -191,10 +191,11 @@ DList::evictionLoop() {
                 : 0,
         };
         const auto min_eviction = ResourceUsage{0, 0};
-        if (eviction_target.AnyGTZero()) {
+        const auto evicted =
             tryEvict(eviction_target, min_eviction, eviction_config_.cache_cell_unaccessed_survival_time.count() > 0);
+        if (evicted.AnyGTZero()) {
+            notifyWaitingRequests();
         }
-        notifyWaitingRequests();
     }
 }
 
@@ -326,7 +327,7 @@ DList::tryEvict(const ResourceUsage& expected_eviction, const ResourceUsage& min
     }
     if (!size_to_evict.AnyGTZero()) {
         // Do not spam log during eviction loop.
-        if (!evict_expired_items) {
+        if (!evict_expired_items && expected_eviction.AnyGTZero()) {
             LOG_DEBUG(
                 "[MCL] No items can be evicted, expected_eviction {}, "
                 "min_eviction {}, giving up eviction. Current usage: {}",
@@ -378,21 +379,9 @@ DList::tryEvict(const ResourceUsage& expected_eviction, const ResourceUsage& min
     });
 
     LOG_TRACE("[MCL] Logically evicted size: {}", size_to_evict.ToString());
+    cachinglayer::monitor::cache_evicted_bytes_total(StorageType::MEMORY).Increment(size_to_evict.memory_bytes);
+    cachinglayer::monitor::cache_evicted_bytes_total(StorageType::DISK).Increment(size_to_evict.file_bytes);
 
-    switch (size_to_evict.storage_type()) {
-        case StorageType::MEMORY:
-            cachinglayer::monitor::cache_evicted_bytes_total(StorageType::MEMORY).Increment(size_to_evict.memory_bytes);
-            break;
-        case StorageType::DISK:
-            cachinglayer::monitor::cache_evicted_bytes_total(StorageType::DISK).Increment(size_to_evict.file_bytes);
-            break;
-        case StorageType::MIXED:
-            cachinglayer::monitor::cache_evicted_bytes_total(StorageType::MEMORY).Increment(size_to_evict.memory_bytes);
-            cachinglayer::monitor::cache_evicted_bytes_total(StorageType::DISK).Increment(size_to_evict.file_bytes);
-            break;
-        default:
-            ThrowInfo(ErrorCode::UnexpectedError, "Unknown StorageType");
-    }
     return size_to_evict;
 }
 
