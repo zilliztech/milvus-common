@@ -25,10 +25,7 @@
 
 #include "log/Log.h"
 #include "nlohmann/json.hpp"
-
-#ifdef WITH_JAEGER
 #include "opentelemetry/exporters/jaeger/jaeger_exporter_factory.h"
-#endif
 #include "opentelemetry/exporters/ostream/span_exporter_factory.h"
 #include "opentelemetry/exporters/otlp/otlp_grpc_exporter_factory.h"
 #include "opentelemetry/sdk/resource/resource.h"
@@ -48,9 +45,7 @@ namespace nostd = opentelemetry::nostd;
 
 namespace trace_sdk = opentelemetry::sdk::trace;
 namespace resource = opentelemetry::sdk::resource;
-#ifdef WITH_JAEGER
 namespace jaeger = opentelemetry::exporter::jaeger;
-#endif
 namespace ostream = opentelemetry::exporter::trace;
 namespace otlp = opentelemetry::exporter::otlp;
 
@@ -64,18 +59,12 @@ initTelemetry(const TraceConfig& cfg) {
     std::unique_ptr<opentelemetry::sdk::trace::SpanExporter> exporter;
     if (cfg.exporter == "stdout") {
         exporter = ostream::OStreamSpanExporterFactory::Create();
-#ifdef WITH_JAEGER
     } else if (cfg.exporter == "jaeger") {
         auto opts = jaeger::JaegerExporterOptions{};
         opts.transport_format = jaeger::TransportFormat::kThriftHttp;
         opts.endpoint = cfg.jaegerURL;
         exporter = jaeger::JaegerExporterFactory::Create(opts);
         LOG_INFO("init jaeger exporter, endpoint: {}", opts.endpoint);
-#else
-    } else if (cfg.exporter == "jaeger") {
-        LOG_INFO("Jaeger exporter is not enabled. Please rebuild with -D{}=ON", "WITH_JAEGER");
-        export_created = false;
-#endif
     } else if (cfg.exporter == "otlp") {
         if (cfg.otlpMethod == "http") {
             auto opts = otlp::OtlpHttpExporterOptions{};
