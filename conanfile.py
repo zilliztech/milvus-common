@@ -31,6 +31,7 @@ class MilvusCommonConan(ConanFile):
 
     options = {
         "with_ut": [True, False],
+        "with_asan": [True, False],
     }
 
     default_options = {
@@ -41,6 +42,7 @@ class MilvusCommonConan(ConanFile):
         "prometheus-cpp:with_pull": False,
         "fmt:header_only": True,
         "with_ut": False,
+        "with_asan": False,
     }
 
     def configure(self):
@@ -82,6 +84,7 @@ class MilvusCommonConan(ConanFile):
             tc.variables["MSVC_USE_STATIC_RUNTIME"] = "MT" in msvc_runtime_flag(self)
 
         tc.variables["WITH_COMMON_UT"] = self.options.with_ut
+        tc.variables["WITH_ASAN"] = self.options.with_asan
         tc.generate()
 
         deps = CMakeDeps(self)
