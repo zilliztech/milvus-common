@@ -17,7 +17,7 @@ find_package(BLAS REQUIRED)
 
 set(ALL_TEST_FILES
     init_gtest.cpp
-    test_tracer.cpp
+    TracerTest.cpp
 )
 
 add_executable(all_tests
