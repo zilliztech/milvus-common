@@ -27,6 +27,10 @@ include_directories(${MILVUS_COMMON_WORKSPACE}/include)
 
 set(CMAKE_CXX_FLAGS "-Wall -fPIC ${CMAKE_CXX_FLAGS}")
 
+if (WITH_ASAN)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -fno-omit-frame-pointer -fno-stack-protector -fno-var-tracking")
+endif()
+
 include(CheckSymbolExists)
 check_symbol_exists(__x86_64__ "" __X86_64)
 
