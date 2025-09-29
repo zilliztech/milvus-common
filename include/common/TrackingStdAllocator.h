@@ -27,12 +27,12 @@ struct TrackingStdAllocator : public std::allocator<T> {
         using other = TrackingStdAllocator<U>;
     };
 
-    TrackingStdAllocator() noexcept = default;
+    TrackingStdAllocator() = default;
 
-    TrackingStdAllocator(const TrackingStdAllocator&) noexcept = default;
+    TrackingStdAllocator(const TrackingStdAllocator&) = default;
 
     template <class U>
-    TrackingStdAllocator(const TrackingStdAllocator<U>& other) noexcept : base_type(), counter_(other.counter_) {
+    TrackingStdAllocator(const TrackingStdAllocator<U>& other) : base_type(), counter_(other.counter_) {
     }
 
     pointer
