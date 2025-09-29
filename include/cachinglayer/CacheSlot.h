@@ -102,7 +102,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             return std::make_shared<CellAccessor<CellT>>(this->shared_from_this(),
                                                          std::vector<internal::ListNode::NodePin>());
         }
-        return folly::makeSemiFuture().deferValue([this, &ctx, timeout](auto&&) {
+        return folly::makeSemiFuture().deferValue([this, ctx, timeout](auto&&) {
             std::vector<cid_t> cids;
             cids.resize(cells_.size());
             std::iota(cids.begin(), cids.end(), 0);
