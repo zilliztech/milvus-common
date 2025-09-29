@@ -39,7 +39,7 @@ jobs:
       - name: Build & Run
         run: |
           mkdir build && cd build && conan install .. --build=missing -o with_ut=True -s compiler.libcxx=libstdc++11 -s compiler.version=12 -s build_type=Release && conan build .. \
-          && ./test/test_cachinglayer/cachinglayer_test
+          && ./test/test_cachinglayer/cachinglayer_test && ./test/all_tests
       - name: Save Conan Packages
         uses: actions/cache/save@v4
         with:

@@ -47,6 +47,7 @@ list(APPEND COMMON_LINKER_LIBS opentelemetry-cpp::opentelemetry_trace)
 list(APPEND COMMON_LINKER_LIBS opentelemetry-cpp::opentelemetry_exporter_ostream_span)
 list(APPEND COMMON_LINKER_LIBS opentelemetry-cpp::opentelemetry_exporter_otlp_grpc)
 list(APPEND COMMON_LINKER_LIBS opentelemetry-cpp::opentelemetry_exporter_otlp_http)
+list(APPEND COMMON_LINKER_LIBS opentelemetry-cpp::opentelemetry_exporter_jaeger_trace)
 
 file(GLOB_RECURSE SRC_FILES src/*.cpp src/*.cc)
 if(__X86_64)
@@ -66,18 +67,6 @@ else()
 endif()
 
 add_library(milvus-common SHARED ${SRC_FILES})
-
-if (WITH_JAEGER)
-    # list(APPEND COMMON_LINKER_LIBS opentelemetry-cpp::opentelemetry_exporter_jaeger_trace)
-    # above commented out is expected as a workaround, we will enable jaeger only when combined with Milvus
-    # use static linking since macos does not support opentelemetry shared library
-    # do not link jaeger here to avoid double static linking, which will cause static object odr
-    # and for macoos, we need to make the compiler happy to ignore the undefined symbol
-    if (APPLE)
-        target_link_options(milvus-common PRIVATE "-undefined" "dynamic_lookup")
-    endif()
-    add_definitions(-DWITH_JAEGER)
-endif()
 
 if (ENABLE_SYNCPOINT)
     add_definitions(-DENABLE_SYNCPOINT)

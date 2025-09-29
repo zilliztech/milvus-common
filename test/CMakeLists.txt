@@ -10,3 +10,35 @@
 # or implied. See the License for the specific language governing permissions and limitations under the License
 
 add_subdirectory(test_cachinglayer)
+
+find_package(GTest CONFIG REQUIRED)
+find_package(OpenMP REQUIRED)
+find_package(BLAS REQUIRED)
+
+set(ALL_TEST_FILES
+    init_gtest.cpp
+    TracerTest.cpp
+)
+
+add_executable(all_tests
+    ${ALL_TEST_FILES}
+)
+
+# Ensure SSE4.2 CRC intrinsics are available to match Folly build (x86_64)
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64" AND NOT MSVC)
+    target_compile_options(all_tests PRIVATE -msse4.2)
+endif()
+
+
+target_link_libraries(all_tests
+    GTest::gtest
+    GTest::gmock
+    milvus-common
+    ${COMMON_LINKER_LIBS}
+    pthread
+    atomic
+    gomp
+    openblas
+)
+
+install(TARGETS all_tests DESTINATION unittest)
