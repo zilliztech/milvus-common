@@ -219,14 +219,21 @@ class DList {
     std::string
     usageInfo() const;
 
+    // [NOTE]: this method is deprecated for now, we only use checkPhysicalMemoryLimit instead.
     // Physical resource protection methods
     // Returns the amount of memory/disk that needs to be evicted to satisfy physical resource limit
     // Returns 0 if no eviction needed, positive value if eviction needed.
     // For disk, it only checks whether the usage will exceed the disk capacity to avoid using up all disk space.
     // Does not obey the configured disk capacity limit. Reason is: we can't easily determine the amount of disk space
     // that is used by the cache(there may be other processes using the disk).
-    ResourceUsage
+    [[maybe_unused]] ResourceUsage
     checkPhysicalResourceLimit(const ResourceUsage& size) const;
+
+    // Physical memory limit check, used to check if the memory usage will exceed the physical memory limit.
+    // Returns the amount of memory that needs to be evicted to satisfy physical memory limit.
+    // Returns 0 if no eviction needed, positive value if eviction needed.
+    ResourceUsage
+    checkPhysicalMemoryLimit(const ResourceUsage& size) const;
 
     // not thread safe, use for debug only
     std::string
