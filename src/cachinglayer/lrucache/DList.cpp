@@ -99,7 +99,7 @@ DList::reserveResourceInternal(const ResourceUsage& size) {
 
     // Combined logical and physical memory limit check
     bool logical_limit_exceeded = !max_resource_limit_.load().CanHold(using_resources + size);
-    auto physical_eviction_needed = checkPhysicalResourceLimit(size);
+    auto physical_eviction_needed = checkPhysicalMemoryLimit(size);
 
     // If either limit is exceeded, attempt unified eviction
     // we attempt eviction based on logical limit once, but multiple times on physical limit
@@ -154,7 +154,7 @@ DList::reserveResourceInternal(const ResourceUsage& size) {
             break;
         }
 
-        if (physical_eviction_needed = checkPhysicalResourceLimit(size); !physical_eviction_needed.AnyGTZero()) {
+        if (physical_eviction_needed = checkPhysicalMemoryLimit(size); !physical_eviction_needed.AnyGTZero()) {
             // if after eviction we no longer need to evict, we can break.
             break;
         }
@@ -674,6 +674,36 @@ DList::checkPhysicalResourceLimit(const ResourceUsage& size) const {
         ResourceUsage{sys_mem.total_bytes, sys_disk.total_bytes}.ToString(), eviction_needed.ToString());
 
     return eviction_needed;
+}
+
+ResourceUsage
+DList::checkPhysicalMemoryLimit(const ResourceUsage& size) const {
+    if (size.memory_bytes <= 0) {
+        return ResourceUsage{0, 0};
+    }
+    auto sys_mem = getSystemMemoryInfo();
+    auto current_loading_mem = total_loading_size_.load().memory_bytes;
+    auto projected_mem_usage = current_loading_mem + size.memory_bytes + sys_mem.used_bytes;
+
+    auto eviction_mem_needed =
+        projected_mem_usage -
+        static_cast<int64_t>(sys_mem.total_bytes * eviction_config_.overloaded_memory_threshold_percentage);
+    if (eviction_mem_needed < 0) {
+        eviction_mem_needed = 0;
+    }
+
+    LOG_TRACE(
+        "[MCL] Physical memory check: "
+        "projected_mem_usage={}(used_mem={}, loading_mem={}, requesting_mem={}), limit_mem={} (mem {}% of total {}), "
+        "eviction_mem_needed={}",
+        FormatBytes(projected_mem_usage), FormatBytes(sys_mem.used_bytes), FormatBytes(current_loading_mem),
+        FormatBytes(size.memory_bytes),
+        FormatBytes(
+            static_cast<int64_t>(sys_mem.total_bytes * eviction_config_.overloaded_memory_threshold_percentage)),
+        eviction_config_.overloaded_memory_threshold_percentage * 100, FormatBytes(sys_mem.total_bytes),
+        FormatBytes(eviction_mem_needed));
+
+    return ResourceUsage{eviction_mem_needed, 0};
 }
 
 }  // namespace milvus::cachinglayer::internal
