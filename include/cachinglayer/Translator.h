@@ -82,4 +82,12 @@ class Translator {
     virtual ~Translator() = default;
 };
 
+template <typename CellT>
+struct CellTraits {
+    // the mapping mode of the cell id to the cell index in the CacheSlot
+    static constexpr CellIdMappingMode mapping_mode = CellIdMappingMode::CUSTOMIZED;
+    // whether the translator supports bonus cells
+    static constexpr bool bonus_cells_supported = false;
+};
+
 }  // namespace milvus::cachinglayer

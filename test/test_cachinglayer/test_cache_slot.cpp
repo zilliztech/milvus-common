@@ -197,6 +197,12 @@ class MockTranslator : public Translator<TestCell> {
     bool for_concurrent_test_ = false;
 };
 
+template <>
+struct milvus::cachinglayer::CellTraits<TestCell> {
+    static constexpr CellIdMappingMode mapping_mode = CellIdMappingMode::CUSTOMIZED;
+    static constexpr bool bonus_cells_supported = true;
+};
+
 class CacheSlotTest : public ::testing::Test {
  protected:
     std::unique_ptr<DList> dlist_;
