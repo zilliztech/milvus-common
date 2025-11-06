@@ -10,6 +10,8 @@
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
 #pragma once
+#include <folly/CancellationToken.h>
+
 #include <atomic>
 
 namespace milvus {
@@ -28,9 +30,11 @@ struct OpContext {
         std::atomic<int64_t> scanned_total_bytes{0};
     } storage_usage;
 
-    // TODO: OpenTelemetry Tracing integration
+    folly::CancellationToken cancellation_token;
 
     OpContext() = default;
+    OpContext(const folly::CancellationToken& cancellation_token) : cancellation_token(cancellation_token) {
+    }
     ~OpContext() = default;
     OpContext(const OpContext&) = delete;
     OpContext&
