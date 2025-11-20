@@ -54,7 +54,6 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
               bool storage_usage_tracking_enabled)
         : translator_(std::move(translator)),
           cells_(translator_->num_cells()),
-          cell_id_mapping_mode_(translator_->meta()->cell_id_mapping_mode),
           cell_data_type_(translator_->meta()->cell_data_type),
           storage_type_(translator_->meta()->storage_type),
           dlist_(dlist),
@@ -123,24 +122,18 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                 auto count = std::min(uids.size(), cells_.size());
                 ska::flat_hash_set<cid_t> involved_cids_set;
                 involved_cids_set.reserve(count);
-                switch (cell_id_mapping_mode_) {
-                    case CellIdMappingMode::IDENTICAL: {
-                        for (auto& uid : uids) {
-                            involved_cids_set.insert(uid);
-                        }
-                        break;
+                if constexpr (CellTraits<CellT>::mapping_mode == CellIdMappingMode::IDENTICAL) {
+                    for (auto& uid : uids) {
+                        involved_cids_set.insert(uid);
                     }
-                    case CellIdMappingMode::ALWAYS_ZERO: {
-                        if (uids.size() > 0) {
-                            involved_cids_set.insert(0);
-                        }
-                        break;
+                } else if constexpr (CellTraits<CellT>::mapping_mode == CellIdMappingMode::ALWAYS_ZERO) {
+                    if (uids.size() > 0) {
+                        involved_cids_set.insert(0);
                     }
-                    default: {
-                        for (auto& uid : uids) {
-                            auto cid = cell_id_of(uid);
-                            involved_cids_set.insert(cid);
-                        }
+                } else {
+                    for (auto& uid : uids) {
+                        auto cid = cell_id_of(uid);
+                        involved_cids_set.insert(cid);
                     }
                 }
                 std::vector<cid_t> involved_cids_vec;
@@ -158,18 +151,12 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                                                          std::vector<internal::ListNode::NodePin>());
         }
         auto cid = 0;
-        switch (cell_id_mapping_mode_) {
-            case CellIdMappingMode::IDENTICAL: {
-                cid = uid;
-                break;
-            }
-            case CellIdMappingMode::ALWAYS_ZERO: {
-                cid = 0;
-                break;
-            }
-            default: {
-                cid = cell_id_of(uid);
-            }
+        if constexpr (CellTraits<CellT>::mapping_mode == CellIdMappingMode::IDENTICAL) {
+            cid = uid;
+        } else if constexpr (CellTraits<CellT>::mapping_mode == CellIdMappingMode::ALWAYS_ZERO) {
+            cid = 0;
+        } else {
+            cid = cell_id_of(uid);
         }
         auto [need_load, result] = cells_[cid].pin();
         auto cell_storage_bytes = translator_->cells_storage_bytes({cid});
@@ -210,24 +197,18 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         auto count = std::min(uids.size(), cells_.size());
         ska::flat_hash_set<cid_t> involved_cids;
         involved_cids.reserve(count);
-        switch (cell_id_mapping_mode_) {
-            case CellIdMappingMode::IDENTICAL: {
-                for (auto& uid : uids) {
-                    involved_cids.insert(uid);
-                }
-                break;
+        if constexpr (CellTraits<CellT>::mapping_mode == CellIdMappingMode::IDENTICAL) {
+            for (auto& uid : uids) {
+                involved_cids.insert(uid);
             }
-            case CellIdMappingMode::ALWAYS_ZERO: {
-                if (uids.size() > 0) {
-                    involved_cids.insert(0);
-                }
-                break;
+        } else if constexpr (CellTraits<CellT>::mapping_mode == CellIdMappingMode::ALWAYS_ZERO) {
+            if (uids.size() > 0) {
+                involved_cids.insert(0);
             }
-            default: {
-                for (auto& uid : uids) {
-                    auto cid = cell_id_of(uid);
-                    involved_cids.insert(cid);
-                }
+        } else {
+            for (auto& uid : uids) {
+                auto cid = cell_id_of(uid);
+                involved_cids.insert(cid);
             }
         }
         std::vector<cid_t> involved_cids_vec;
@@ -342,20 +323,18 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
 
     [[nodiscard]] cid_t
     cell_id_of(uid_t uid) const {
-        switch (cell_id_mapping_mode_) {
-            case CellIdMappingMode::IDENTICAL:
-                return uid;
-            case CellIdMappingMode::ALWAYS_ZERO:
-                return 0;
-            default:
-                return translator_->cell_id_of(uid);
+        if constexpr (CellTraits<CellT>::mapping_mode == CellIdMappingMode::IDENTICAL) {
+            return uid;
+        } else if constexpr (CellTraits<CellT>::mapping_mode == CellIdMappingMode::ALWAYS_ZERO) {
+            return 0;
+        } else {
+            return translator_->cell_id_of(uid);
         }
     }
 
     void
     RunLoad(std::unordered_set<cid_t>&& cids, std::chrono::milliseconds timeout) {
         ResourceUsage essential_loading_resource{};
-        ResourceUsage bonus_loading_resource{};
         std::vector<cid_t> loading_cids;
         try {
             auto start = std::chrono::steady_clock::now();
@@ -379,35 +358,39 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                 return;
             }
 
-            // bonus cells should be empty if self_reserve_ is false.
-            auto bonus_cids = translator_->bonus_cells_to_be_loaded(loading_cids);
-
             for (auto& cid : loading_cids) {
                 essential_loading_resource += translator_->estimated_byte_size_of_cell(cid).second;
             }
-
-            for (auto& cid : bonus_cids) {
-                bonus_loading_resource += translator_->estimated_byte_size_of_cell(cid).second;
-            }
-
-            auto resource_needed_for_loading = essential_loading_resource + bonus_loading_resource;
-            reservation_success =
-                SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(resource_needed_for_loading, timeout));
-
-            if (!bonus_cids.empty()) {
-                // if the reservation failed, try to reserve only the essential loading resource
-                if (!reservation_success) {
-                    LOG_WARN(
-                        "[MCL] CacheSlot reserve loading resource with bonus cells failed, try to reserve only "
-                        "essential "
-                        "loading resource");
-                    resource_needed_for_loading = essential_loading_resource;
-                    reservation_success =
-                        SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(resource_needed_for_loading, timeout));
-                } else {
-                    // if the reservation succeeded, we can load the bonus cells
-                    loading_cids.insert(loading_cids.end(), bonus_cids.begin(), bonus_cids.end());
+            ResourceUsage resource_needed_for_loading{};
+            if constexpr (CellTraits<CellT>::bonus_cells_supported) {
+                // bonus cells should be empty if self_reserve_ is false.
+                auto bonus_cids = translator_->bonus_cells_to_be_loaded(loading_cids);
+                ResourceUsage bonus_loading_resource{};
+                for (auto& cid : bonus_cids) {
+                    bonus_loading_resource += translator_->estimated_byte_size_of_cell(cid).second;
                 }
+                resource_needed_for_loading = essential_loading_resource + bonus_loading_resource;
+                reservation_success =
+                    SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(resource_needed_for_loading, timeout));
+                if (!bonus_cids.empty()) {
+                    // if the reservation failed, try to reserve only the essential loading resource
+                    if (!reservation_success) {
+                        LOG_WARN(
+                            "[MCL] CacheSlot reserve loading resource with bonus cells failed, try to reserve only "
+                            "essential "
+                            "loading resource");
+                        resource_needed_for_loading = essential_loading_resource;
+                        reservation_success = SemiInlineGet(
+                            dlist_->ReserveLoadingResourceWithTimeout(resource_needed_for_loading, timeout));
+                    } else {
+                        // if the reservation succeeded, we can load the bonus cells
+                        loading_cids.insert(loading_cids.end(), bonus_cids.begin(), bonus_cids.end());
+                    }
+                }
+            } else {
+                resource_needed_for_loading = essential_loading_resource;
+                reservation_success =
+                    SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(resource_needed_for_loading, timeout));
             }
 
             if (!reservation_success) {
@@ -579,7 +562,6 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     // Each CacheCell's cid_t is its index in vector
     // Once initialized, cells_ should never be resized.
     std::vector<CacheCell> cells_;
-    CellIdMappingMode cell_id_mapping_mode_;
     CellDataType cell_data_type_;
     StorageType storage_type_;
     internal::DList* dlist_;
@@ -602,8 +584,14 @@ class CellAccessor {
 
     CellT*
     get_cell_of(uid_t uid) {
-        auto cid = slot_->cell_id_of(uid);
-        return slot_->cells_[cid].cell();
+        if constexpr (CellTraits<CellT>::mapping_mode == CellIdMappingMode::IDENTICAL) {
+            return slot_->cells_[uid].cell();
+        } else if constexpr (CellTraits<CellT>::mapping_mode == CellIdMappingMode::ALWAYS_ZERO) {
+            return slot_->cells_[0].cell();
+        } else {
+            auto cid = slot_->cell_id_of(uid);
+            return slot_->cells_[cid].cell();
+        }
     }
 
     CellT*
