@@ -18,6 +18,7 @@ set(CACHINGLAYER_TEST_FILES
     ../init_gtest.cpp
     test_dlist.cpp
     test_cache_slot.cpp
+    test_utils.cpp
 )
 
 add_executable(cachinglayer_test

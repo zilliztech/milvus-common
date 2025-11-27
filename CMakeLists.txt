@@ -81,6 +81,9 @@ target_link_libraries(milvus-common PUBLIC
 )
 
 if(WITH_COMMON_UT)
+    # Enable unit-test-only helpers for caching layer
+    target_compile_definitions(milvus-common PRIVATE MCL_ENABLE_TEST_CGROUP_OVERRIDE)
+
     find_package(GTest REQUIRED)
     add_subdirectory(test)
 endif()

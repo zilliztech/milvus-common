@@ -85,6 +85,21 @@ getContainerMemLimit() {
 #ifdef __linux__
     std::vector<int64_t> limits;
 
+#ifdef MCL_ENABLE_TEST_CGROUP_OVERRIDE
+    const char* cgroup_root_env = std::getenv("MCL_CGROUP_ROOT");
+    std::string cgroup_root = cgroup_root_env ? cgroup_root_env : "/sys/fs/cgroup";
+    // Ensure no trailing slash to avoid '//' in paths
+    if (!cgroup_root.empty() && cgroup_root.back() == '/') {
+        cgroup_root.pop_back();
+    }
+
+    const char* proc_cgroup_env = std::getenv("MCL_PROC_CGROUP");
+    std::string proc_cgroup_path = proc_cgroup_env ? proc_cgroup_env : "/proc/self/cgroup";
+#else
+    std::string cgroup_root = "/sys/fs/cgroup";
+    std::string proc_cgroup_path = "/proc/self/cgroup";
+#endif
+
     // Check MEM_LIMIT environment variable (Docker/container override)
     const char* mem_limit_env = std::getenv("MEM_LIMIT");
     if (mem_limit_env) {
@@ -98,7 +113,7 @@ getContainerMemLimit() {
     }
 
     // Check direct cgroup v1 path
-    std::ifstream cgroup_v1("/sys/fs/cgroup/memory/memory.limit_in_bytes");
+    std::ifstream cgroup_v1(cgroup_root + "/memory/memory.limit_in_bytes");
     if (cgroup_v1.is_open()) {
         std::string limit_str;
         if (std::getline(cgroup_v1, limit_str)) {
@@ -108,8 +123,8 @@ getContainerMemLimit() {
                     limits.push_back(limit);
                     LOG_TRACE(
                         "[MCL] Found direct cgroups v1 limit "
-                        "(/sys/fs/cgroup/memory/memory.limit_in_bytes): {}",
-                        FormatBytes(limit));
+                        "({}/memory/memory.limit_in_bytes): {}",
+                        cgroup_root, FormatBytes(limit));
                 }
             } catch (...) {
                 // Ignore parse errors
@@ -119,7 +134,7 @@ getContainerMemLimit() {
     }
 
     // Check direct cgroup v2 path
-    std::ifstream cgroup_v2("/sys/fs/cgroup/memory.max");
+    std::ifstream cgroup_v2(cgroup_root + "/memory.max");
     if (cgroup_v2.is_open()) {
         std::string limit_str;
         if (std::getline(cgroup_v2, limit_str) && limit_str != "max") {
@@ -128,8 +143,8 @@ getContainerMemLimit() {
                 limits.push_back(limit);
                 LOG_TRACE(
                     "[MCL] Found direct cgroups v2 limit "
-                    "(/sys/fs/cgroup/memory.max): {}",
-                    FormatBytes(limit));
+                    "({}/memory.max): {}",
+                    cgroup_root, FormatBytes(limit));
             } catch (...) {
                 // Ignore parse errors
             }
@@ -138,18 +153,18 @@ getContainerMemLimit() {
     }
 
     // Check process-specific cgroup limits from /proc/self/cgroup
-    std::ifstream proc_cgroup("/proc/self/cgroup");
+    std::ifstream proc_cgroup(proc_cgroup_path);
     if (proc_cgroup.is_open()) {
         std::string line;
         while (std::getline(proc_cgroup, line)) {
             // Look for memory controller lines
-            if (line.find(":memory:") != std::string::npos || line.find(":0:") != std::string::npos) {
+            if (line.find(":memory:") != std::string::npos || line.find("0::") != std::string::npos) {
                 size_t last_colon = line.find_last_of(':');
                 if (last_colon != std::string::npos) {
                     std::string cgroup_path = line.substr(last_colon + 1);
 
                     // Try v2 path
-                    std::string v2_path = "/sys/fs/cgroup" + cgroup_path + "/memory.max";
+                    std::string v2_path = cgroup_root + cgroup_path + "/memory.max";
                     std::ifstream proc_v2(v2_path);
                     if (proc_v2.is_open()) {
                         std::string proc_line;
@@ -159,8 +174,8 @@ getContainerMemLimit() {
                                 limits.push_back(proc_limit);
                                 LOG_TRACE(
                                     "[MCL] Found process-specific cgroups v2 "
-                                    "limit: {}",
-                                    FormatBytes(proc_limit));
+                                    "limit: {} from {}",
+                                    v2_path, FormatBytes(proc_limit));
                             } catch (...) {
                                 // Ignore parse errors
                             }
@@ -168,7 +183,7 @@ getContainerMemLimit() {
                     }
 
                     // Try v1 path
-                    std::string v1_path = "/sys/fs/cgroup/memory" + cgroup_path + "/memory.limit_in_bytes";
+                    std::string v1_path = cgroup_root + "/memory" + cgroup_path + "/memory.limit_in_bytes";
                     std::ifstream proc_v1(v1_path);
                     if (proc_v1.is_open()) {
                         std::string proc_line;
