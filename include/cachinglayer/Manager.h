@@ -31,7 +31,8 @@ class Manager {
     // TODO(tiered storage 4): support dynamic update.
     static void
     ConfigureTieredStorage(CacheWarmupPolicies warmup_policies, CacheLimit cache_limit,
-                           bool storageUsageTrackingEnabled, bool evictionEnabled, EvictionConfig eviction_config);
+                           bool storage_usage_tracking_enabled, bool eviction_enabled, EvictionConfig eviction_config,
+                           std::chrono::milliseconds loading_timeout);
 
     Manager(const Manager&) = delete;
     Manager&
@@ -43,10 +44,11 @@ class Manager {
     template <typename CellT>
     std::shared_ptr<CacheSlot<CellT>>
     CreateCacheSlot(std::unique_ptr<Translator<CellT>> translator) {
-        auto evictable = translator->meta()->support_eviction && evictionEnabled_;
-        auto self_reserve = evictionEnabled_;
-        auto cache_slot = std::make_shared<CacheSlot<CellT>>(std::move(translator), dlist_.get(), evictable,
-                                                             self_reserve, storage_usage_tracking_enabled_);
+        auto evictable = translator->meta()->support_eviction && eviction_enabled_;
+        auto self_reserve = eviction_enabled_;
+        auto cache_slot =
+            std::make_shared<CacheSlot<CellT>>(std::move(translator), dlist_.get(), evictable, self_reserve,
+                                               storage_usage_tracking_enabled_, loading_timeout_);
         cache_slot->Warmup();
         return cache_slot;
     }
@@ -54,7 +56,7 @@ class Manager {
     bool
     ReserveLoadingResourceWithTimeout(const ResourceUsage& size, std::chrono::milliseconds timeout,
                                       const std::string& ctx_info = "") {
-        auto result = SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(size, timeout));
+        auto result = SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(size, timeout, nullptr));
         if (result) {
             monitor::cache_loading_bytes(CellDataType::OTHER, StorageType::MEMORY).Increment(size.memory_bytes);
             monitor::cache_loading_bytes(CellDataType::OTHER, StorageType::DISK).Increment(size.file_bytes);
@@ -113,20 +115,17 @@ class Manager {
 
     [[nodiscard]] bool
     isEvictionEnabled() const {
-        return evictionEnabled_;
+        return eviction_enabled_;
     }
 
  private:
-    friend void
-    ConfigureTieredStorage(CacheWarmupPolicies warmup_policies, CacheLimit cache_limit,
-                           bool storage_usage_tracking_enabled, bool evictionEnabled, EvictionConfig eviction_config);
-
     Manager() = default;
 
     std::unique_ptr<internal::DList> dlist_{nullptr};
     CacheWarmupPolicies warmup_policies_{};
     bool storage_usage_tracking_enabled_{false};
-    bool evictionEnabled_{false};
+    bool eviction_enabled_{false};
+    std::chrono::milliseconds loading_timeout_{100000};
 };  // class Manager
 
 }  // namespace milvus::cachinglayer
