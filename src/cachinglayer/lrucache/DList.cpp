@@ -36,7 +36,8 @@ ClampNonNegative(std::atomic<ResourceUsage>& counter, LogFn&& log_fn) {
 }
 
 folly::SemiFuture<bool>
-DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std::chrono::milliseconds timeout) {
+DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std::chrono::milliseconds timeout,
+                                         const folly::CancellationToken* cancel_token) {
     // NOTE: we can reserve more loading resources than the original request size by adjusting the
     // loading_resource_factor to avoid potential problems from bad resource estimation.
     auto size = original_size * eviction_config_.loading_resource_factor;
@@ -62,9 +63,9 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std
 
     uint64_t request_id = next_request_id_.fetch_add(1);
 
-    auto waiting_request =
-        std::make_unique<WaitingRequest>(size, deadline, std::move(promise), event_base_.get(), request_id);
-    waiting_requests_map_[request_id] = waiting_request.get();
+    auto waiting_request = std::make_unique<WaitingRequest>(size, deadline, std::move(promise), request_id);
+    WaitingRequest* request_ptr = waiting_request.get();
+    waiting_requests_map_[request_id] = request_ptr;
     waiting_queue_.push(std::move(waiting_request));
     waiting_queue_empty_ = false;
 
@@ -73,8 +74,8 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std
         "in {}ms",
         request_id, size.ToString(), timeout.count());
 
-    event_base_->runInEventBaseThread([this, request_id, timeout]() {
-        event_base_->runAfterDelay(
+    event_base_thread_->getEventBase()->runInEventBaseThread([this, request_id, timeout]() {
+        event_base_thread_->getEventBase()->runAfterDelay(
             [this, request_id]() {
                 std::unique_lock<std::mutex> lock(list_mtx_);
                 auto it = waiting_requests_map_.find(request_id);
@@ -89,6 +90,24 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std
             },
             static_cast<uint32_t>(timeout.count()));
     });
+
+    // Register cancellation callback. The callback is dispatched to the event base thread
+    // to avoid deadlock - CancellationCallback may invoke synchronously if the token is
+    // already cancelled or gets cancelled during emplace(), and we currently hold list_mtx_.
+    if (cancel_token && cancel_token->canBeCancelled()) {
+        request_ptr->cancel_cb.emplace(*cancel_token, [this, request_id]() {
+            event_base_thread_->getEventBase()->runInEventBaseThread([this, request_id]() {
+                std::unique_lock<std::mutex> lock(list_mtx_);
+                auto it = waiting_requests_map_.find(request_id);
+                if (it == waiting_requests_map_.end()) {
+                    return;
+                }
+                LOG_WARN("[MCL] Request {} cancelled, notifying failure.", request_id);
+                it->second->promise.setValue(false);
+                waiting_requests_map_.erase(it);
+            });
+        });
+    }
 
     return std::move(future);
 }
@@ -194,7 +213,9 @@ DList::evictionLoop() {
         const auto evicted =
             tryEvict(eviction_target, min_eviction, eviction_config_.cache_cell_unaccessed_survival_time.count() > 0);
         if (evicted.AnyGTZero()) {
-            notifyWaitingRequests();
+            auto to_destroy = handleWaitingRequests();
+            lock.unlock();
+            // Destroy requests outside lock to avoid deadlock with cancel callbacks
         }
     }
 }
@@ -455,8 +476,12 @@ DList::ReleaseLoadingResource(const ResourceUsage& loading_size) {
             size.ToString(), loading_size.ToString(), eviction_config_.loading_resource_factor, curr.ToString());
     });
     // Notify waiting requests that resources are available
-    std::unique_lock<std::mutex> lock(list_mtx_);
-    notifyWaitingRequests();
+    std::vector<std::unique_ptr<WaitingRequest>> to_destroy;
+    {
+        std::unique_lock<std::mutex> lock(list_mtx_);
+        to_destroy = handleWaitingRequests();
+    }
+    // Destroy requests outside lock to avoid deadlock with cancel callbacks
 }
 
 void
@@ -471,14 +496,18 @@ DList::touchItem(ListNode* list_node, bool force_touch, std::optional<ResourceUs
         return;
     }
     // move the node to the head of the list
-    std::lock_guard<std::mutex> list_lock(list_mtx_);
-    popItem(list_node);
-    pushHead(list_node);
-    // If there are waiters, try to satisfy them
-    if (size.has_value() && !waiting_queue_empty_) {
-        notifyWaitingRequests();
+    std::vector<std::unique_ptr<WaitingRequest>> to_destroy;
+    {
+        std::lock_guard<std::mutex> list_lock(list_mtx_);
+        popItem(list_node);
+        pushHead(list_node);
+        // If there are waiters, try to satisfy them
+        if (size.has_value() && !waiting_queue_empty_) {
+            to_destroy = handleWaitingRequests();
+        }
+        list_node->last_touch_ = now;
     }
-    list_node->last_touch_ = now;
+    // Destroy requests outside lock to avoid deadlock with cancel callbacks
 }
 
 void
@@ -569,14 +598,30 @@ DList::RefundLoadedResource(const ResourceUsage& size) {
             size.ToString(), curr.ToString(), usageInfo());
     });
     // Notify waiting requests that resources are available
-    std::unique_lock<std::mutex> lock(list_mtx_);
-    notifyWaitingRequests();
+    std::vector<std::unique_ptr<WaitingRequest>> to_destroy;
+    {
+        std::unique_lock<std::mutex> lock(list_mtx_);
+        to_destroy = handleWaitingRequests();
+    }
+    // Destroy requests outside lock to avoid deadlock with cancel callbacks
 }
 
-void
-DList::notifyWaitingRequests() {
+std::vector<std::unique_ptr<DList::WaitingRequest>>
+DList::handleWaitingRequests() {
+    // Collect requests to destroy outside the lock to avoid deadlock with cancel callbacks.
+    std::vector<std::unique_ptr<WaitingRequest>> requests_to_destroy;
+
     while (!waiting_queue_.empty()) {
         auto& request_ptr_ref = const_cast<std::unique_ptr<WaitingRequest>&>(waiting_queue_.top());
+
+        // Check if request was already handled by timeout/cancel (not in map anymore)
+        if (waiting_requests_map_.find(request_ptr_ref->request_id) == waiting_requests_map_.end()) {
+            LOG_DEBUG("[MCL] Request {} has already been handled, destroying and continuing.",
+                      request_ptr_ref->request_id);
+            requests_to_destroy.push_back(std::move(request_ptr_ref));
+            waiting_queue_.pop();
+            continue;
+        }
 
         // Check if request has expired
         if (std::chrono::steady_clock::now() > request_ptr_ref->deadline) {
@@ -584,34 +629,41 @@ DList::notifyWaitingRequests() {
             // a race with the timeout handler. We "claim" the request by
             // erasing it from the map.
             auto request = std::move(request_ptr_ref);
-            waiting_queue_.pop();
 
             if (waiting_requests_map_.erase(request->request_id) > 0) {
-                // If we successfully erased it, it means the timeout handler hasn't
+                // If we successfully erased it, it means the timeout/cancel handler hasn't
                 // run yet. We are now responsible for fulfilling the promise.
                 LOG_DEBUG(
                     "[MCL] Request {} expired, cleaned up by "
-                    "notifyWaitingRequests.",
+                    "handleWaitingRequests.",
                     request->request_id);
-                request->event_base->runInEventBaseThread(
-                    [promise = std::move(request->promise)]() mutable { promise.setValue(false); });
+                request->promise.setValue(false);
             }
-            // If erase returned 0, the timeout handler ran first and claimed the
+            // If erase returned 0, the timeout/cancel handler ran first and claimed the
             // request. We don't need to do anything with the promise.
+
+            requests_to_destroy.push_back(std::move(request));
+            waiting_queue_.pop();
             continue;
         }
 
         if (reserveResourceInternal(request_ptr_ref->required_size)) {
             auto request = std::move(request_ptr_ref);
-            waiting_queue_.pop();
-            waiting_requests_map_.erase(request->request_id);
 
-            // Success - notify the request
-            request->event_base->runInEventBaseThread(
-                [promise = std::move(request->promise), request_id = request->request_id]() mutable {
-                    LOG_DEBUG("[MCL] Executing success notification for request {}", request_id);
-                    promise.setValue(true);
-                });
+            if (waiting_requests_map_.erase(request->request_id) > 0) {
+                // Success - notify the request
+                LOG_DEBUG("[MCL] Executing success notification for request {}", request->request_id);
+                request->promise.setValue(true);
+            } else {
+                // Request was already handled by timeout/cancel, rollback reserved resource.
+                LOG_WARN(
+                    "[MCL] Request {} of size {} was already handled by timeout/cancel, rolling back reserved "
+                    "resource.",
+                    request->request_id, request->required_size.ToString());
+                total_loading_size_ -= request->required_size;
+            }
+            requests_to_destroy.push_back(std::move(request));
+            waiting_queue_.pop();
         } else {
             LOG_DEBUG("[MCL] Request {} of size {} cannot be satisfied, breaking.", request_ptr_ref->request_id,
                       request_ptr_ref->required_size.ToString());
@@ -622,25 +674,37 @@ DList::notifyWaitingRequests() {
         }
     }
     waiting_queue_empty_ = waiting_queue_.empty();
+    return requests_to_destroy;
 }
 
 void
 DList::clearWaitingQueue() {
-    std::unique_lock<std::mutex> lock(list_mtx_);
+    // Move requests out while holding the lock, then destroy them outside the lock
+    // to avoid deadlock with cancel callbacks that also need the lock.
+    std::vector<std::unique_ptr<WaitingRequest>> requests_to_destroy;
 
-    // Notify all waiting requests that they failed
-    while (!waiting_queue_.empty()) {
-        auto& request = waiting_queue_.top();
-        try {
-            request->promise.setValue(false);
-        } catch (const std::exception& e) {
-            LOG_WARN("[MCL] Failed to set value for request {}, error: {}", request->request_id, e.what());
+    {
+        std::unique_lock<std::mutex> lock(list_mtx_);
+
+        // Notify all waiting requests that they failed
+        while (!waiting_queue_.empty()) {
+            auto request = std::move(const_cast<std::unique_ptr<WaitingRequest>&>(waiting_queue_.top()));
+            waiting_queue_.pop();
+
+            // Only setValue if this request hasn't been handled by timeout/cancel
+            if (waiting_requests_map_.erase(request->request_id) > 0) {
+                request->promise.setValue(false);
+            }
+            requests_to_destroy.push_back(std::move(request));
         }
-        waiting_queue_.pop();
+
+        waiting_queue_empty_ = true;
     }
 
-    waiting_queue_empty_ = true;
-    waiting_requests_map_.clear();
+    // Destroy requests (and their cancel_cb) outside the lock
+    // This avoids deadlock: cancel_cb destructor waits for callback to finish,
+    // and callback needs the lock.
+    requests_to_destroy.clear();
 }
 
 ResourceUsage
