@@ -25,27 +25,28 @@ Manager::GetInstance() {
 
 void
 Manager::ConfigureTieredStorage(CacheWarmupPolicies warmup_policies, CacheLimit cache_limit,
-                                bool storage_usage_tracking_enabled, bool evictionEnabled,
-                                EvictionConfig eviction_config) {
+                                bool storage_usage_tracking_enabled, bool eviction_enabled,
+                                EvictionConfig eviction_config, std::chrono::milliseconds loading_timeout) {
     static std::once_flag once;
     std::call_once(once, [&]() {
         Manager& manager = GetInstance();
         manager.warmup_policies_ = warmup_policies;
         manager.storage_usage_tracking_enabled_ = storage_usage_tracking_enabled;
-        manager.evictionEnabled_ = evictionEnabled;
+        manager.eviction_enabled_ = eviction_enabled;
+        manager.loading_timeout_ = loading_timeout;
 
         auto policy_str = warmup_policies.ToString();
         LOG_INFO(
             "[MCL] Tiered Storage manager is configured with warmup policies: {}, storage usage tracking enabled: {}, "
             "eviction enabled: {}",
-            policy_str, storage_usage_tracking_enabled, evictionEnabled);
+            policy_str, storage_usage_tracking_enabled, eviction_enabled);
 
         ResourceUsage max{cache_limit.memory_max_bytes, cache_limit.disk_max_bytes};
         ResourceUsage low_watermark{cache_limit.memory_low_watermark_bytes, cache_limit.disk_low_watermark_bytes};
         ResourceUsage high_watermark{cache_limit.memory_high_watermark_bytes, cache_limit.disk_high_watermark_bytes};
 
         manager.dlist_ =
-            std::make_unique<internal::DList>(evictionEnabled, max, low_watermark, high_watermark, eviction_config);
+            std::make_shared<internal::DList>(eviction_enabled, max, low_watermark, high_watermark, eviction_config);
 
         LOG_INFO(
             "[MCL] Configured Tiered Storage manager with "

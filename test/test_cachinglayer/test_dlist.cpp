@@ -1,3 +1,4 @@
+#include <folly/CancellationToken.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
@@ -33,7 +34,7 @@ class DListTest : public ::testing::Test {
                                     true,  // enable background eviction
                                     100};  // eviction_interval (100 ms)
 
-    std::unique_ptr<DList> dlist;
+    std::shared_ptr<DList> dlist;
     // Keep track of nodes to prevent them from being deleted prematurely
     std::vector<std::shared_ptr<MockListNode>> managed_nodes;
     // Keep track of nodes that are loading
@@ -43,7 +44,7 @@ class DListTest : public ::testing::Test {
 
     void
     SetUp() override {
-        dlist = std::make_unique<DList>(true, initial_limit, low_watermark, high_watermark, eviction_config_);
+        dlist = std::make_shared<DList>(true, initial_limit, low_watermark, high_watermark, eviction_config_);
         managed_nodes.clear();
         loading_nodes.clear();
     }
@@ -770,4 +771,330 @@ TEST_F(DListTest, ReserveResourceUsesLowWatermark) {
     EXPECT_EQ(get_used_memory(), usage2);
     EXPECT_EQ(get_loading_memory(), reserve_size);
     DLF::verify_list(dlist.get(), {node2});
+}
+
+TEST_F(DListTest, ReserveWithCancellationTokenImmediateSuccess) {
+    // If reservation succeeds immediately, cancellation token should not affect the result
+    folly::CancellationSource cancel_source;
+    auto cancel_token = cancel_source.getToken();
+    auto op_ctx = std::make_unique<milvus::OpContext>(cancel_token);
+
+    ResourceUsage size{20, 10};
+    auto future = dlist->ReserveLoadingResourceWithTimeout(size, std::chrono::milliseconds(1000), op_ctx.get());
+    EXPECT_TRUE(std::move(future).get());
+    EXPECT_EQ(get_loading_memory(), size);
+}
+
+TEST_F(DListTest, ReserveWithCancellationTokenCancelledWhileWaiting) {
+    // Fill up the cache so new requests must wait
+    MockListNode* node1 = add_and_load_node({30, 15}, "key1", 0, 1);  // Pinned, cannot evict
+    MockListNode* node2 = add_and_load_node({20, 10}, "key2", 0, 1);  // Pinned, cannot evict
+    ResourceUsage usage = node1->loaded_size() + node2->loaded_size();
+    ASSERT_EQ(get_used_memory(), usage);
+
+    EXPECT_CALL(*node1, unload()).Times(0);
+    EXPECT_CALL(*node2, unload()).Times(0);
+
+    folly::CancellationSource cancel_source;
+    auto cancel_token = cancel_source.getToken();
+    auto op_ctx = std::make_unique<milvus::OpContext>(cancel_token);
+
+    // Request size that exceeds available capacity (all nodes pinned)
+    ResourceUsage reserve_size{50, 30};
+    auto future = dlist->ReserveLoadingResourceWithTimeout(reserve_size, std::chrono::milliseconds(5000), op_ctx.get());
+
+    // Cancel the request
+    cancel_source.requestCancellation();
+
+    // The future should return false due to cancellation
+    EXPECT_FALSE(std::move(future).get());
+    EXPECT_EQ(get_loading_memory(), ResourceUsage{});
+}
+
+TEST_F(DListTest, ReserveWithCancellationTokenSucceedsBeforeCancel) {
+    // Test that if reservation succeeds before cancellation, it returns true
+    folly::CancellationSource cancel_source;
+    auto cancel_token = cancel_source.getToken();
+    auto op_ctx = std::make_unique<milvus::OpContext>(cancel_token);
+
+    ResourceUsage size{20, 10};
+    auto future = dlist->ReserveLoadingResourceWithTimeout(size, std::chrono::milliseconds(1000), op_ctx.get());
+
+    // Request succeeds immediately, so get should return true
+    bool result = std::move(future).get();
+    EXPECT_TRUE(result);
+
+    // Cancel after success (should have no effect)
+    cancel_source.requestCancellation();
+
+    EXPECT_EQ(get_loading_memory(), size);
+}
+
+TEST_F(DListTest, ReserveWithCancellationTokenMultipleRequests) {
+    // Fill up the cache so new requests must wait
+    MockListNode* node1 = add_and_load_node({30, 15}, "key1", 0, 1);  // Pinned
+    MockListNode* node2 = add_and_load_node({20, 10}, "key2", 0, 1);  // Pinned
+    EXPECT_CALL(*node1, unload()).Times(0);
+    EXPECT_CALL(*node2, unload()).Times(0);
+
+    folly::CancellationSource cancel_source1;
+    folly::CancellationSource cancel_source2;
+    auto cancel_token1 = cancel_source1.getToken();
+    auto cancel_token2 = cancel_source2.getToken();
+    auto op_ctx1 = std::make_unique<milvus::OpContext>(cancel_token1);
+    auto op_ctx2 = std::make_unique<milvus::OpContext>(cancel_token2);
+
+    // Both requests will wait
+    ResourceUsage reserve_size{50, 30};
+    auto future1 =
+        dlist->ReserveLoadingResourceWithTimeout(reserve_size, std::chrono::milliseconds(5000), op_ctx1.get());
+    auto future2 =
+        dlist->ReserveLoadingResourceWithTimeout(reserve_size, std::chrono::milliseconds(5000), op_ctx2.get());
+
+    // Cancel only the first request
+    cancel_source1.requestCancellation();
+
+    // First request should fail
+    EXPECT_FALSE(std::move(future1).get());
+
+    // Cancel the second request too
+    cancel_source2.requestCancellation();
+    EXPECT_FALSE(std::move(future2).get());
+
+    EXPECT_EQ(get_loading_memory(), ResourceUsage{});
+}
+
+TEST_F(DListTest, ReserveWithNullCancellationToken) {
+    // Test that null cancellation token works correctly (no cancellation)
+    ResourceUsage size{20, 10};
+    auto op_ctx = std::make_unique<milvus::OpContext>();
+    auto future = dlist->ReserveLoadingResourceWithTimeout(size, std::chrono::milliseconds(1000), op_ctx.get());
+    EXPECT_TRUE(std::move(future).get());
+    EXPECT_EQ(get_loading_memory(), size);
+}
+
+TEST_F(DListTest, ReserveWithCancellationTokenResourceFreedAfterCancel) {
+    // Fill up cache
+    MockListNode* node1 = add_and_load_node({30, 15}, "key1", 0, 1);  // Pinned
+    MockListNode* node2 = add_and_load_node({20, 10}, "key2", 0, 1);  // Pinned
+    EXPECT_CALL(*node1, unload()).Times(0);
+    EXPECT_CALL(*node2, unload()).Times(0);
+
+    folly::CancellationSource cancel_source;
+    auto cancel_token = cancel_source.getToken();
+    auto op_ctx = std::make_unique<milvus::OpContext>(cancel_token);
+
+    ResourceUsage reserve_size{50, 30};
+    auto future = dlist->ReserveLoadingResourceWithTimeout(reserve_size, std::chrono::milliseconds(5000), op_ctx.get());
+
+    // Cancel the request
+    cancel_source.requestCancellation();
+    EXPECT_FALSE(std::move(future).get());
+
+    // Resource should not be reserved after cancellation
+    EXPECT_EQ(get_loading_memory(), ResourceUsage{});
+
+    // Now a new request should be able to succeed if there is space
+    ResourceUsage small_size{10, 5};
+    EXPECT_TRUE(reserveLoadingMemorySync(small_size));
+    EXPECT_EQ(get_loading_memory(), small_size);
+}
+
+TEST_F(DListTest, ReserveWithCancellationTokenTimeoutBeforeCancel) {
+    // Test that timeout happens before cancellation
+    MockListNode* node1 = add_and_load_node({30, 15}, "key1", 0, 1);  // Pinned
+    MockListNode* node2 = add_and_load_node({20, 10}, "key2", 0, 1);  // Pinned
+    EXPECT_CALL(*node1, unload()).Times(0);
+    EXPECT_CALL(*node2, unload()).Times(0);
+
+    folly::CancellationSource cancel_source;
+    auto cancel_token = cancel_source.getToken();
+    auto op_ctx = std::make_unique<milvus::OpContext>(cancel_token);
+
+    // Very short timeout
+    ResourceUsage reserve_size{50, 30};
+    auto future = dlist->ReserveLoadingResourceWithTimeout(reserve_size, std::chrono::milliseconds(50), op_ctx.get());
+
+    // Wait for timeout (don't cancel)
+    EXPECT_FALSE(std::move(future).get());
+    EXPECT_EQ(get_loading_memory(), ResourceUsage{});
+}
+
+TEST_F(DListTest, ReserveWithCancellationTokenSucceedsWhenResourcesFreed) {
+    // Start with full cache (unpinned nodes that can be evicted)
+    MockListNode* node1 = add_and_load_node({30, 15}, "key1");
+    MockListNode* node2 = add_and_load_node({20, 10}, "key2");
+    ASSERT_EQ(get_used_memory(), node1->loaded_size() + node2->loaded_size());
+
+    // Expect node1 to be evicted when we try to reserve more
+    EXPECT_CALL(*node1, unload()).Times(1);
+    EXPECT_CALL(*node2, unload()).Times(0);
+
+    folly::CancellationSource cancel_source;
+    auto cancel_token = cancel_source.getToken();
+    auto op_ctx = std::make_unique<milvus::OpContext>(cancel_token);
+
+    // Reserve size that requires eviction but should succeed
+    ResourceUsage reserve_size{60, 30};
+    auto future = dlist->ReserveLoadingResourceWithTimeout(reserve_size, std::chrono::milliseconds(1000), op_ctx.get());
+
+    // Should succeed after eviction
+    EXPECT_TRUE(std::move(future).get());
+    EXPECT_EQ(get_loading_memory(), reserve_size);
+    EXPECT_EQ(get_used_memory(), node2->loaded_size());
+}
+
+TEST_F(DListTest, ReserveWithCancellationTokenCancelledQuickly) {
+    // This test verifies that cancellation actually works and doesn't just timeout.
+    // The bug was using isCancellationRequested() instead of canBeCancelled(),
+    // which meant the callback was never registered if the token wasn't already cancelled.
+
+    // Fill up the cache so new requests must wait
+    MockListNode* node1 = add_and_load_node({30, 15}, "key1", 0, 1);  // Pinned, cannot evict
+    MockListNode* node2 = add_and_load_node({20, 10}, "key2", 0, 1);  // Pinned, cannot evict
+    ResourceUsage usage = node1->loaded_size() + node2->loaded_size();
+    ASSERT_EQ(get_used_memory(), usage);
+
+    EXPECT_CALL(*node1, unload()).Times(0);
+    EXPECT_CALL(*node2, unload()).Times(0);
+
+    folly::CancellationSource cancel_source;
+    auto cancel_token = cancel_source.getToken();
+    auto op_ctx = std::make_unique<milvus::OpContext>(cancel_token);
+
+    // Request size that exceeds available capacity (all nodes pinned)
+    // Use a very long timeout so we can verify cancellation is fast
+    ResourceUsage reserve_size{50, 30};
+    auto future =
+        dlist->ReserveLoadingResourceWithTimeout(reserve_size, std::chrono::milliseconds(60000), op_ctx.get());
+
+    auto start = std::chrono::steady_clock::now();
+
+    // Cancel the request
+    cancel_source.requestCancellation();
+
+    // The future should return false due to cancellation
+    EXPECT_FALSE(std::move(future).get());
+
+    auto duration = std::chrono::steady_clock::now() - start;
+
+    // Cancellation should be fast (well under the 60s timeout)
+    // Allow up to 1 second for event base thread scheduling
+    EXPECT_LT(duration, std::chrono::seconds(1))
+        << "Cancellation took too long (" << std::chrono::duration_cast<std::chrono::milliseconds>(duration).count()
+        << "ms). This suggests the cancellation callback was not registered.";
+
+    EXPECT_EQ(get_loading_memory(), ResourceUsage{});
+}
+
+TEST_F(DListTest, ReserveWithAlreadyCancelledToken) {
+    // Test that a pre-cancelled token returns false quickly without waiting for timeout.
+    // This specifically catches the bug where isCancellationRequested() was used instead
+    // of canBeCancelled() - with that bug, a pre-cancelled token would still register
+    // the callback (since isCancellationRequested() returns true), but a token cancelled
+    // AFTER the reserve call would not.
+
+    // Fill up the cache so new requests must wait
+    MockListNode* node1 = add_and_load_node({30, 15}, "key1", 0, 1);  // Pinned, cannot evict
+    MockListNode* node2 = add_and_load_node({20, 10}, "key2", 0, 1);  // Pinned, cannot evict
+    ASSERT_EQ(get_used_memory(), node1->loaded_size() + node2->loaded_size());
+
+    EXPECT_CALL(*node1, unload()).Times(0);
+    EXPECT_CALL(*node2, unload()).Times(0);
+
+    // Cancel BEFORE making the reserve call
+    folly::CancellationSource cancel_source;
+    cancel_source.requestCancellation();
+    auto cancel_token = cancel_source.getToken();
+    auto op_ctx = std::make_unique<milvus::OpContext>(cancel_token);
+
+    auto start = std::chrono::steady_clock::now();
+
+    // Request size that exceeds available capacity (all nodes pinned)
+    ResourceUsage reserve_size{50, 30};
+    auto future =
+        dlist->ReserveLoadingResourceWithTimeout(reserve_size, std::chrono::milliseconds(60000), op_ctx.get());
+
+    // The future should return false due to cancellation
+    EXPECT_FALSE(std::move(future).get());
+
+    auto duration = std::chrono::steady_clock::now() - start;
+
+    // Should return quickly since token was already cancelled
+    EXPECT_LT(duration, std::chrono::seconds(1))
+        << "Pre-cancelled token took too long ("
+        << std::chrono::duration_cast<std::chrono::milliseconds>(duration).count()
+        << "ms). The cancellation callback should fire synchronously during emplace().";
+
+    EXPECT_EQ(get_loading_memory(), ResourceUsage{});
+}
+
+TEST_F(DListTest, ReserveWithZeroTimeoutImmediateSuccess) {
+    // Test that timeout=0 works for immediate reservation (no waiting needed)
+    ResourceUsage size{20, 10};
+    auto future = dlist->ReserveLoadingResourceWithTimeout(size, std::chrono::milliseconds(0));
+    EXPECT_TRUE(std::move(future).get());
+    EXPECT_EQ(get_loading_memory(), size);
+}
+
+TEST_F(DListTest, ReserveWithZeroTimeoutWaitsIndefinitelyUntilCancelled) {
+    // Test that timeout=0 means no timeout callback is scheduled.
+    // The request will wait indefinitely until cancelled or resources become available.
+
+    // Fill up the cache so new requests must wait
+    MockListNode* node1 = add_and_load_node({30, 15}, "key1", 0, 1);  // Pinned, cannot evict
+    MockListNode* node2 = add_and_load_node({20, 10}, "key2", 0, 1);  // Pinned, cannot evict
+    ASSERT_EQ(get_used_memory(), node1->loaded_size() + node2->loaded_size());
+
+    EXPECT_CALL(*node1, unload()).Times(0);
+    EXPECT_CALL(*node2, unload()).Times(0);
+
+    folly::CancellationSource cancel_source;
+    auto cancel_token = cancel_source.getToken();
+    auto op_ctx = std::make_unique<milvus::OpContext>(cancel_token);
+
+    // Request with timeout=0 (no timeout scheduled)
+    ResourceUsage reserve_size{50, 30};
+    auto future = dlist->ReserveLoadingResourceWithTimeout(reserve_size, std::chrono::milliseconds(0), op_ctx.get());
+
+    auto start = std::chrono::steady_clock::now();
+
+    // Cancel the request after a short delay
+    std::thread cancel_thread([&cancel_source]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        cancel_source.requestCancellation();
+    });
+
+    // The future should return false due to cancellation (not timeout)
+    EXPECT_FALSE(std::move(future).get());
+
+    auto duration = std::chrono::steady_clock::now() - start;
+
+    // Should complete around 100ms (when we cancelled), not immediately
+    EXPECT_GE(duration, std::chrono::milliseconds(100));
+    // But should not wait too long either
+    EXPECT_LT(duration, std::chrono::milliseconds(500));
+
+    cancel_thread.join();
+    EXPECT_EQ(get_loading_memory(), ResourceUsage{});
+}
+
+TEST_F(DListTest, ReserveWithZeroTimeoutSucceedsWhenResourcesFreed) {
+    // Test that timeout=0 request succeeds when resources become available
+
+    // Fill up the cache with an unpinned node that can be evicted
+    MockListNode* node1 = add_and_load_node({30, 15}, "key1");        // Unpinned, can evict
+    MockListNode* node2 = add_and_load_node({20, 10}, "key2", 0, 1);  // Pinned
+    ASSERT_EQ(get_used_memory(), node1->loaded_size() + node2->loaded_size());
+
+    EXPECT_CALL(*node1, unload()).Times(1);  // Will be evicted
+    EXPECT_CALL(*node2, unload()).Times(0);
+
+    // Request with timeout=0 - should succeed after evicting node1
+    ResourceUsage reserve_size{60, 30};
+    auto future = dlist->ReserveLoadingResourceWithTimeout(reserve_size, std::chrono::milliseconds(0));
+
+    EXPECT_TRUE(std::move(future).get());
+    EXPECT_EQ(get_loading_memory(), reserve_size);
+    EXPECT_EQ(get_used_memory(), node2->loaded_size());
 }
