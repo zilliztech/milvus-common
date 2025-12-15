@@ -26,6 +26,9 @@ class LocalOutputStream : public OutputStream {
     size_t
     Write(int fd, size_t size) override;
 
+    void
+    Close() override;
+
  private:
     mutable std::ofstream stream_;
     std::string filename_;

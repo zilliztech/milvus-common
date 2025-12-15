@@ -59,5 +59,11 @@ class OutputStream {
 
     virtual size_t
     Write(int fd, size_t size) = 0;
+
+    /**
+     * @brief close the stream
+     */
+    virtual void
+    Close() = 0;
 };
 }  // namespace milvus
