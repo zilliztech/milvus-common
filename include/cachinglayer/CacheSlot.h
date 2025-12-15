@@ -51,7 +51,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                   "representing the memory consumption of the cell");
 
     CacheSlot(std::unique_ptr<Translator<CellT>> translator, internal::DList* dlist, bool evictable, bool self_reserve,
-              bool storage_usage_tracking_enabled, std::chrono::milliseconds loading_timeout)
+              bool storage_usage_tracking_enabled)
         : translator_(std::move(translator)),
           cells_(translator_->num_cells()),
           cell_id_mapping_mode_(translator_->meta()->cell_id_mapping_mode),
@@ -60,8 +60,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
           dlist_(dlist),
           evictable_(evictable),
           self_reserve_(self_reserve),
-          storage_usage_tracking_enabled_(storage_usage_tracking_enabled),
-          loading_timeout_(loading_timeout) {
+          storage_usage_tracking_enabled_(storage_usage_tracking_enabled) {
         for (cid_t i = 0; i < static_cast<cid_t>(translator_->num_cells()); ++i) {
             new (&cells_[i]) CacheCell(this, i);
         }
@@ -98,28 +97,29 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     }
 
     folly::SemiFuture<std::shared_ptr<CellAccessor<CellT>>>
-    PinAllCells(OpContext* ctx) {
+    PinAllCells(OpContext* ctx, std::chrono::milliseconds timeout = std::chrono::milliseconds(100000)) {
         if (skip_pin_) {
             return std::make_shared<CellAccessor<CellT>>(this->shared_from_this(),
                                                          std::vector<internal::ListNode::NodePin>());
         }
-        return folly::makeSemiFuture().deferValue([this, ctx](auto&&) {
+        return folly::makeSemiFuture().deferValue([this, ctx, timeout](auto&&) {
             std::vector<cid_t> cids;
             cids.resize(cells_.size());
             std::iota(cids.begin(), cids.end(), 0);
-            return PinInternal(ctx, cids, loading_timeout_);
+            return PinInternal(ctx, cids, timeout);
         });
     }
 
     folly::SemiFuture<std::shared_ptr<CellAccessor<CellT>>>
-    PinCells(OpContext* ctx, const std::vector<uid_t>& uids) {
+    PinCells(OpContext* ctx, const std::vector<uid_t>& uids,
+             std::chrono::milliseconds timeout = std::chrono::milliseconds(100000)) {
         if (skip_pin_) {
             return std::make_shared<CellAccessor<CellT>>(this->shared_from_this(),
                                                          std::vector<internal::ListNode::NodePin>());
         }
         monitor::cache_access_event_total(cell_data_type_, storage_type_).Increment();
         return folly::makeSemiFuture().deferValue(
-            [this, uids = std::vector<uid_t>(uids), ctx](auto&&) -> std::shared_ptr<CellAccessor<CellT>> {
+            [this, uids = std::vector<uid_t>(uids), ctx, timeout](auto&&) -> std::shared_ptr<CellAccessor<CellT>> {
                 auto count = std::min(uids.size(), cells_.size());
                 ska::flat_hash_set<cid_t> involved_cids_set;
                 involved_cids_set.reserve(count);
@@ -146,12 +146,13 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                 std::vector<cid_t> involved_cids_vec;
                 involved_cids_vec.reserve(involved_cids_set.size());
                 std::copy(involved_cids_set.begin(), involved_cids_set.end(), std::back_inserter(involved_cids_vec));
-                return PinInternal(ctx, involved_cids_vec, loading_timeout_);
+                return PinInternal(ctx, involved_cids_vec, timeout);
             });
     }
 
     std::shared_ptr<CellAccessor<CellT>>
-    PinOneCellDirect(OpContext* ctx, const uid_t& uid) {
+    PinOneCellDirect(OpContext* ctx, const uid_t& uid,
+                     std::chrono::milliseconds timeout = std::chrono::milliseconds(100000)) {
         if (skip_pin_) {
             return std::make_shared<CellAccessor<CellT>>(this->shared_from_this(),
                                                          std::vector<internal::ListNode::NodePin>());
@@ -187,7 +188,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         } else {
             auto pin_future = std::get<folly::SemiFuture<internal::ListNode::NodePin>>(std::move(result));
             if (need_load) {
-                RunLoad(ctx, {cid}, loading_timeout_);
+                RunLoad({cid}, timeout);
             }
             std::vector<internal::ListNode::NodePin> pins;
             pins.push_back(SemiInlineGet(std::move(pin_future)));
@@ -200,7 +201,8 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     }
 
     std::shared_ptr<CellAccessor<CellT>>
-    PinCellsDirect(OpContext* ctx, const std::vector<uid_t>& uids) {
+    PinCellsDirect(OpContext* ctx, const std::vector<uid_t>& uids,
+                   std::chrono::milliseconds timeout = std::chrono::milliseconds(100000)) {
         if (skip_pin_) {
             return std::make_shared<CellAccessor<CellT>>(this->shared_from_this(),
                                                          std::vector<internal::ListNode::NodePin>());
@@ -231,7 +233,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         std::vector<cid_t> involved_cids_vec;
         involved_cids_vec.reserve(involved_cids.size());
         std::copy(involved_cids.begin(), involved_cids.end(), std::back_inserter(involved_cids_vec));
-        return PinInternal(ctx, involved_cids_vec, loading_timeout_);
+        return PinInternal(ctx, involved_cids_vec, timeout);
     }
 
     // Manually evicts the cell if it is LOADED and not pinned.
@@ -310,7 +312,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         }
 
         if (!need_load_cids.empty()) {
-            RunLoad(ctx, std::move(need_load_cids), timeout);
+            RunLoad(std::move(need_load_cids), timeout);
         }
 
         std::vector<internal::ListNode::NodePin> all_pins;
@@ -351,7 +353,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     }
 
     void
-    RunLoad(OpContext* ctx, std::unordered_set<cid_t>&& cids, std::chrono::milliseconds timeout) {
+    RunLoad(std::unordered_set<cid_t>&& cids, std::chrono::milliseconds timeout) {
         ResourceUsage essential_loading_resource{};
         ResourceUsage bonus_loading_resource{};
         std::vector<cid_t> loading_cids;
@@ -362,11 +364,8 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             loading_cids = std::vector<cid_t>(cids.begin(), cids.end());
 
             auto run_load_internal = [&]() {
-                if (ctx && ctx->cancellation_token.isCancellationRequested()) {
-                    throw std::runtime_error("Operation cancelled, stop loading cache cells");
-                }
                 start = std::chrono::steady_clock::now();
-                auto results = translator_->get_cells(ctx, loading_cids);
+                auto results = translator_->get_cells(loading_cids);
                 auto latency =
                     std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start);
                 for (auto& result : results) {
@@ -392,8 +391,8 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             }
 
             auto resource_needed_for_loading = essential_loading_resource + bonus_loading_resource;
-            reservation_success = SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(
-                resource_needed_for_loading, timeout, ctx ? &ctx->cancellation_token : nullptr));
+            reservation_success =
+                SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(resource_needed_for_loading, timeout));
 
             if (!bonus_cids.empty()) {
                 // if the reservation failed, try to reserve only the essential loading resource
@@ -403,8 +402,8 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                         "essential "
                         "loading resource");
                     resource_needed_for_loading = essential_loading_resource;
-                    reservation_success = SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(
-                        resource_needed_for_loading, timeout, ctx ? &ctx->cancellation_token : nullptr));
+                    reservation_success =
+                        SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(resource_needed_for_loading, timeout));
                 } else {
                     // if the reservation succeeded, we can load the bonus cells
                     loading_cids.insert(loading_cids.end(), bonus_cids.begin(), bonus_cids.end());
@@ -587,7 +586,6 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     const bool evictable_;
     const bool self_reserve_;
     const bool storage_usage_tracking_enabled_;
-    std::chrono::milliseconds loading_timeout_{100000};
     bool skip_pin_{false};
 };
 
