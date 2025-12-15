@@ -29,6 +29,11 @@ LocalOutputStream::Write(const void* ptr, size_t size) {
     return size;
 }
 
+void
+LocalOutputStream::Close() {
+    stream_.close();
+}
+
 size_t
 LocalOutputStream::Write(int fd, size_t size) {
     size_t buffer_size = std::min(size, static_cast<size_t>(4096));
