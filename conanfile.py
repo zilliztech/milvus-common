@@ -63,6 +63,7 @@ class MilvusCommonConan(ConanFile):
 
     def generate(self):
         tc = CMakeToolchain(self)
+        tc.generator = "Unix Makefiles"
         tc.variables["CMAKE_POSITION_INDEPENDENT_CODE"] = self.options.get_safe(
             "fPIC", True
         )
@@ -97,5 +98,6 @@ class MilvusCommonConan(ConanFile):
     def build(self):
         # files.apply_conandata_patches(self)
         cmake = CMake(self)
+        cmake.generator = "Unix Makefiles"
         cmake.configure()
         cmake.build()
