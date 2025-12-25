@@ -27,12 +27,6 @@ LocalFileManager::RemoveFile(const std::string& filename) {
     return true;
 }
 
-bool
-LocalFileManager::AddFileMeta(const FileMeta& file_meta) {
-    files.insert(file_meta.file_path);
-    return true;
-}
-
 std::shared_ptr<InputStream>
 LocalFileManager::OpenInputStream(const std::string& filename) {
     return std::make_shared<LocalInputStream>(filename);

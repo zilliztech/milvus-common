@@ -52,16 +52,6 @@ class FileManager {
     AddFile(const std::string& filename) = 0;
 
     /**
-     * @brief Add file meta to FileManager to manipulate it.
-     *
-     * @param filename
-     * @param size
-     * @return false if any error, or return true.
-     */
-    virtual bool
-    AddFileMeta(const FileMeta& file_meta) = 0;
-
-    /**
      * @brief Check if a file exists.
      *
      * @param filename
