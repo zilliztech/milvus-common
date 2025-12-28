@@ -89,6 +89,12 @@ class MockTranslator : public Translator<TestCell> {
 
     int64_t
     cells_storage_bytes(const std::vector<cid_t>& cids) const override {
+        // Check if we should throw for any of the requested cids
+        for (const auto& cid : cids) {
+            if (static_cast<int>(cid) == cells_storage_bytes_throw_on_cid_) {
+                throw std::runtime_error("Simulated cells_storage_bytes failure for cid " + std::to_string(cid));
+            }
+        }
         int64_t total_bytes = 0;
         // make the storage size equal to the loaded memory size in test
         for (const auto& cid : cids) {
@@ -157,6 +163,11 @@ class MockTranslator : public Translator<TestCell> {
     SetShouldThrow(bool should_throw) {
         load_should_throw_ = should_throw;
     }
+    // Set which cid should cause cells_storage_bytes to throw. -1 means no throw.
+    void
+    SetCellsStorageBytesThrowOnCid(int cid) {
+        cells_storage_bytes_throw_on_cid_ = cid;
+    }
     // for some cid, translator will return extra cells.
     void
     SetExtraReturnCids(std::unordered_map<cid_t, std::vector<cid_t>> extra_cids) {
@@ -189,6 +200,7 @@ class MockTranslator : public Translator<TestCell> {
 
     std::unordered_map<cid_t, int> cid_load_delay_ms_;
     bool load_should_throw_ = false;
+    int cells_storage_bytes_throw_on_cid_ = -1;  // -1 means no throw
     std::unordered_map<cid_t, std::vector<cid_t>> extra_cids_;
     std::atomic<int> get_cells_call_count_ = 0;
     std::vector<std::vector<cid_t>> requested_cids_;
@@ -845,3 +857,28 @@ INSTANTIATE_TEST_SUITE_P(BonusCellParam, CacheSlotConcurrentTest, ::testing::Boo
                          [](const ::testing::TestParamInfo<bool>& info) {
                              return info.param ? "WithBonusCells" : "NoBonusCells";
                          });
+
+// Test that CacheSlot construction handles exceptions in CacheCell initialization gracefully.
+// This tests the fix for the placement new double destruction bug.
+TEST(CacheSlotConstructionTest, CacheCellConstructionExceptionDoesNotCauseDoubleFree) {
+    auto limit = ResourceUsage{10000, 0};
+    auto dlist = std::make_unique<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
+
+    // Create a translator that throws on cid 2 (a middle cell)
+    // This means cells 0 and 1 are successfully constructed before the failure
+    std::vector<std::pair<cid_t, int64_t>> cell_sizes = {{0, 100}, {1, 100}, {2, 100}, {3, 100}, {4, 100}};
+    std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map = {{0, 0}, {1, 1}, {2, 2}, {3, 3}, {4, 4}};
+    auto translator =
+        std::make_unique<MockTranslator>(cell_sizes, uid_to_cid_map, "throwing_slot", StorageType::MEMORY);
+    translator->SetCellsStorageBytesThrowOnCid(2);
+
+    // This should throw an exception, but NOT crash due to double destruction
+    EXPECT_THROW(
+        {
+            auto cache_slot =
+                std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true);
+        },
+        std::runtime_error);
+
+    // If we reach here without crashing, the fix is working
+}
