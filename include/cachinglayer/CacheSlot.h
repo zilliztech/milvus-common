@@ -53,7 +53,6 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     CacheSlot(std::unique_ptr<Translator<CellT>> translator, internal::DList* dlist, bool evictable, bool self_reserve,
               bool storage_usage_tracking_enabled)
         : translator_(std::move(translator)),
-          cells_(translator_->num_cells()),
           cell_id_mapping_mode_(translator_->meta()->cell_id_mapping_mode),
           cell_data_type_(translator_->meta()->cell_data_type),
           storage_type_(translator_->meta()->storage_type),
@@ -61,8 +60,9 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
           evictable_(evictable),
           self_reserve_(self_reserve),
           storage_usage_tracking_enabled_(storage_usage_tracking_enabled) {
+        cells_.reserve(translator_->num_cells());
         for (cid_t i = 0; i < static_cast<cid_t>(translator_->num_cells()); ++i) {
-            new (&cells_[i]) CacheCell(this, i);
+            cells_.push_back(std::make_unique<CacheCell>(this, i));
         }
         monitor::cache_slot_count(cell_data_type_, storage_type_).Increment();
         monitor::cache_cell_count(cell_data_type_, storage_type_).Increment(translator_->num_cells());
@@ -171,7 +171,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                 cid = cell_id_of(uid);
             }
         }
-        auto [need_load, result] = cells_[cid].pin();
+        auto [need_load, result] = cells_[cid]->pin();
         auto cell_storage_bytes = translator_->cells_storage_bytes({cid});
         if (need_load) {
             monitor::cache_cell_access_miss_bytes_total(cell_data_type_, storage_type_).Increment(cell_storage_bytes);
@@ -240,7 +240,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     // Returns true if the eviction happened.
     bool
     ManualEvict(cid_t cid) {
-        return cells_[cid].manual_evict();
+        return cells_[cid]->manual_evict();
     }
 
     // Manually evicts all cells that are LOADED and not pinned.
@@ -249,7 +249,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     ManualEvictAll() {
         bool evicted = false;
         for (cid_t cid = 0; cid < cells_.size(); ++cid) {
-            if (cells_[cid].manual_evict()) {
+            if (cells_[cid]->manual_evict()) {
                 evicted = true;
             }
         }
@@ -263,7 +263,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
 
     [[nodiscard]] ResourceUsage
     size_of_cell(cid_t cid) const {
-        return cells_[cid].loaded_size();
+        return cells_[cid]->loaded_size();
     }
 
     Meta*
@@ -295,7 +295,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         }
 
         for (const auto& cid : cids) {
-            auto [need_load, result] = cells_[cid].pin();
+            auto [need_load, result] = cells_[cid]->pin();
             if (std::holds_alternative<internal::ListNode::NodePin>(result)) {
                 ready_pins.push_back(std::get<internal::ListNode::NodePin>(std::move(result)));
             } else {
@@ -304,10 +304,10 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             if (need_load) {
                 need_load_cids.insert(cid);
                 monitor::cache_cell_access_miss_bytes_total(cell_data_type_, storage_type_)
-                    .Increment(cells_[cid].local_storage_bytes());
+                    .Increment(cells_[cid]->local_storage_bytes());
             } else {
                 monitor::cache_cell_access_hit_bytes_total(cell_data_type_, storage_type_)
-                    .Increment(cells_[cid].local_storage_bytes());
+                    .Increment(cells_[cid]->local_storage_bytes());
             }
         }
 
@@ -369,7 +369,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                 auto latency =
                     std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start);
                 for (auto& result : results) {
-                    cells_[result.first].set_cell(std::move(result.second), cids.count(result.first) > 0);
+                    cells_[result.first]->set_cell(std::move(result.second), cids.count(result.first) > 0);
                 }
                 monitor::cache_load_latency_microseconds(cell_data_type_, storage_type_).Observe(latency.count());
             };
@@ -466,7 +466,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             monitor::cache_load_event_fail_total(cell_data_type_, storage_type_).Increment();
             // set_error should only be called on the cells that are actually loaded, bonus cells are not considered.
             for (auto cid : cids) {
-                cells_[cid].set_error(ew);
+                cells_[cid]->set_error(ew);
             }
         }
     }
@@ -576,9 +576,10 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     };
 
     const std::unique_ptr<Translator<CellT>> translator_;
-    // Each CacheCell's cid_t is its index in vector
+    // Each CacheCell's cid_t is its index in vector.
+    // Using unique_ptr because CacheCell is non-movable (inherits from ListNode).
     // Once initialized, cells_ should never be resized.
-    std::vector<CacheCell> cells_;
+    std::vector<std::unique_ptr<CacheCell>> cells_;
     CellIdMappingMode cell_id_mapping_mode_;
     CellDataType cell_data_type_;
     StorageType storage_type_;
@@ -603,12 +604,12 @@ class CellAccessor {
     CellT*
     get_cell_of(uid_t uid) {
         auto cid = slot_->cell_id_of(uid);
-        return slot_->cells_[cid].cell();
+        return slot_->cells_[cid]->cell();
     }
 
     CellT*
     get_ith_cell(cid_t cid) {
-        return slot_->cells_[cid].cell();
+        return slot_->cells_[cid]->cell();
     }
 
  private:
