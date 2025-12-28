@@ -473,7 +473,8 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
 
     struct CacheCell : internal::ListNode {
      public:
-        CacheCell() = default;
+        CacheCell() = delete;
+
         CacheCell(CacheSlot<CellT>* slot, cid_t cid)
             : internal::ListNode(slot->dlist_, slot->evictable_),
               slot_(slot),
