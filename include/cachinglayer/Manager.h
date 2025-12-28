@@ -43,6 +43,8 @@ class Manager {
     template <typename CellT>
     std::shared_ptr<CacheSlot<CellT>>
     CreateCacheSlot(std::unique_ptr<Translator<CellT>> translator) {
+        AssertInfo(dlist_ != nullptr,
+                   "dlist_ must be initialized by ConfigureTieredStorage before any CacheSlot is created");
         auto evictable = translator->meta()->support_eviction && evictionEnabled_;
         auto self_reserve = evictionEnabled_;
         auto cache_slot = std::make_shared<CacheSlot<CellT>>(std::move(translator), dlist_.get(), evictable,

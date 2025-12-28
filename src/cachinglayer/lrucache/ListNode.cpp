@@ -251,6 +251,13 @@ ListNode::mark_unload(std::function<void()> cb) {
             // LoadingResource here.
             // If that edge case actually occurs, it shouldn't be the fault of ~ListNode() - the system must have bugs.
             LOG_ERROR("[MCL] ListNode destroyed while loading");
+            if (load_promise_) {
+                // NOTE: it should not happen, but if it does, we should not make the program deadlock.
+                auto promise = std::move(load_promise_);
+                lock.unlock();
+                promise->setException(folly::exception_wrapper(
+                    std::runtime_error("ListNode destroyed while loading, this should not happen")));
+            }
             break;
         }
         default:;  // do nothing
