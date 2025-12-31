@@ -25,6 +25,7 @@ set( CMAKE_EXPORT_COMPILE_COMMANDS ON )
 set(MILVUS_COMMON_WORKSPACE ${CMAKE_CURRENT_SOURCE_DIR})
 include_directories(${MILVUS_COMMON_WORKSPACE}/include)
 
+
 set(CMAKE_CXX_FLAGS "-Wall -fPIC ${CMAKE_CXX_FLAGS}")
 
 if (WITH_ASAN)
@@ -40,12 +41,14 @@ find_package(gflags REQUIRED)
 find_package(glog REQUIRED)
 find_package(fmt REQUIRED)
 find_package(prometheus-cpp REQUIRED)
+find_package(hiredis REQUIRED)
 
 list(APPEND COMMON_LINKER_LIBS glog::glog)
 list(APPEND COMMON_LINKER_LIBS prometheus-cpp::core prometheus-cpp::push)
 list(APPEND COMMON_LINKER_LIBS fmt::fmt-header-only)
 list(APPEND COMMON_LINKER_LIBS Folly::folly)
 list(APPEND COMMON_LINKER_LIBS gflags::gflags)
+list(APPEND COMMON_LINKER_LIBS hiredis::hiredis)
 
 list(APPEND COMMON_LINKER_LIBS opentelemetry-cpp::opentelemetry_trace)
 list(APPEND COMMON_LINKER_LIBS opentelemetry-cpp::opentelemetry_exporter_ostream_span)
@@ -54,6 +57,7 @@ list(APPEND COMMON_LINKER_LIBS opentelemetry-cpp::opentelemetry_exporter_otlp_ht
 list(APPEND COMMON_LINKER_LIBS opentelemetry-cpp::opentelemetry_exporter_jaeger_trace)
 
 file(GLOB_RECURSE SRC_FILES src/*.cpp src/*.cc)
+
 if(__X86_64)
    set_source_files_properties(src/knowhere/thread_pool.cc PROPERTIES
      COMPILE_OPTIONS "-msse4.2"
