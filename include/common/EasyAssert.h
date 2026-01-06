@@ -63,14 +63,15 @@ enum ErrorCode {
     MemAllocateFailed = 2034,
     MemAllocateSizeNotMatch = 2035,
     MmapError = 2036,
+    NcsUploadError = 2037,
     // timeout or cancel related
-    FollyOtherException = 2037,
-    FollyCancel = 2038,
-    OutOfRange = 2039,
-    GcpNativeError = 2040,
-    TextIndexNotFound = 2041,
-    InvalidParameter = 2042,
-    InsufficientResource = 2043,
+    FollyOtherException = 2038,
+    FollyCancel = 2039,
+    OutOfRange = 2040,
+    GcpNativeError = 2041,
+    TextIndexNotFound = 2042,
+    InvalidParameter = 2043,
+    InsufficientResource = 2044,
 
     KnowhereError = 2099
 };
