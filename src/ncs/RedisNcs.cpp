@@ -1,3 +1,5 @@
+#ifdef USE_REDIS
+
 #include "ncs/RedisNcs.h"
 #include "log/Log.h"
 #include <memory>
@@ -9,26 +11,19 @@ namespace milvus {
 
 // RedisNcs implementation
 RedisNcs::RedisNcs(const std::string& host, int port) 
-    : context_(nullptr), host_(host), port_(port) {
-    context_ = redisConnect(host.c_str(), port);
+    : context_(nullptr, redisFree), host_(host), port_(port) {
+    context_.reset(redisConnect(host.c_str(), port));
     if (context_ == nullptr || context_->err) {
-        if (context_) {
-            LOG_ERROR("[RedisNcs] Redis connection error: {}", context_->errstr);
-            redisFree(context_);
-            context_ = nullptr;
-        } else {
-            LOG_ERROR("[RedisNcs] Redis connection error: can't allocate redis context");
-        }
+        std::string error_msg = context_ ? context_->errstr : "can't allocate redis context";
+        LOG_ERROR("[RedisNcs] Redis connection error: {}", error_msg);
+        context_.reset();
         throw std::runtime_error("Failed to connect to Redis at " + host + ":" + std::to_string(port));
     }
     LOG_INFO("[RedisNcs] Connected to Redis at {}:{}", host, port);
 }
 
 RedisNcs::~RedisNcs() {
-    if (context_) {
-        redisFree(context_);
-        context_ = nullptr;
-    }
+    // unique_ptr automatically calls redisFree
 }
 
 NcsStatus RedisNcs::createBucket(uint64_t bucketId) {
@@ -39,7 +34,10 @@ NcsStatus RedisNcs::createBucket(uint64_t bucketId) {
     }
     
     std::string key = "bucket_" + std::to_string(bucketId) + "_valid";
-    redisReply* reply = (redisReply*)redisCommand(context_, "SET %s true", key.c_str());
+    ncs::RedisReplyPtr reply(
+        (redisReply*)redisCommand(context_.get(), "SET %s true", key.c_str()),
+        freeReplyObject
+    );
     
     if (reply == nullptr) {
         LOG_ERROR("[RedisNcs] Failed to create bucket {}: {}", bucketId, context_->errstr);
@@ -47,14 +45,12 @@ NcsStatus RedisNcs::createBucket(uint64_t bucketId) {
     }
     
     if (reply->type == REDIS_REPLY_STATUS && std::string(reply->str) == "OK") {
-        freeReplyObject(reply);
         LOG_INFO("[RedisNcs] Created bucket {}", bucketId);
         return NcsStatus::OK;
     }
     
     LOG_ERROR("[RedisNcs] Failed to create bucket {}. Reply type: {}, str: {}", 
              bucketId, reply->type, (reply->str ? reply->str : "null"));
-    freeReplyObject(reply);
     return NcsStatus::ERROR;
 }
 
@@ -71,12 +67,13 @@ NcsStatus RedisNcs::deleteBucket(uint64_t bucketId) {
     // Use SCAN to find all keys matching the pattern
     int cursor = 0;
     do {
-        redisReply* reply = (redisReply*)redisCommand(context_, 
-            "SCAN %d MATCH %s COUNT 100", cursor, pattern.c_str());
+        ncs::RedisReplyPtr reply(
+            (redisReply*)redisCommand(context_.get(), "SCAN %d MATCH %s COUNT 100", cursor, pattern.c_str()),
+            freeReplyObject
+        );
         
         if (reply == nullptr || reply->type != REDIS_REPLY_ARRAY) {
             LOG_ERROR("[RedisNcs] Failed to scan keys for bucket {}", bucketId);
-            if (reply) freeReplyObject(reply);
             return NcsStatus::ERROR;
         }
         
@@ -88,8 +85,6 @@ NcsStatus RedisNcs::deleteBucket(uint64_t bucketId) {
         for (size_t i = 0; i < keysArray->elements; ++i) {
             keysToDelete.push_back(keysArray->element[i]->str);
         }
-        
-        freeReplyObject(reply);
     } while (cursor != 0);
     
     // Delete all found keys using UNLINK (async delete)
@@ -100,7 +95,10 @@ NcsStatus RedisNcs::deleteBucket(uint64_t bucketId) {
             cmd += " " + key;
         }
         
-        redisReply* reply = (redisReply*)redisCommand(context_, cmd.c_str());
+        ncs::RedisReplyPtr reply(
+            (redisReply*)redisCommand(context_.get(), cmd.c_str()),
+            freeReplyObject
+        );
         if (reply == nullptr) {
             LOG_ERROR("[RedisNcs] Failed to delete keys for bucket {}: {}", 
                      bucketId, context_->errstr);
@@ -108,7 +106,6 @@ NcsStatus RedisNcs::deleteBucket(uint64_t bucketId) {
         }
         
         LOG_INFO("[RedisNcs] Deleted {} keys for bucket {}", reply->integer, bucketId);
-        freeReplyObject(reply);
     }
     
     return NcsStatus::OK;
@@ -126,23 +123,23 @@ bool RedisNcs::isBucketExist(uint64_t bucketId) {
     }
     
     std::string key = "bucket_" + std::to_string(bucketId) + "_valid";
-    redisReply* reply = (redisReply*)redisCommand(context_, "EXISTS %s", key.c_str());
+    ncs::RedisReplyPtr reply(
+        (redisReply*)redisCommand(context_.get(), "EXISTS %s", key.c_str()),
+        freeReplyObject
+    );
     
     if (reply == nullptr) {
         LOG_ERROR("[RedisNcs] Failed to check bucket existence: {}", context_->errstr);
         return false;
     }
     
-    bool exists = (reply->type == REDIS_REPLY_INTEGER && reply->integer == 1);
-    freeReplyObject(reply);
-    
-    return exists;
+    return (reply->type == REDIS_REPLY_INTEGER && reply->integer == 1);
 }
 
 // RedisNcsFactory implementation
 const std::string RedisNcsFactory::KIND = "redis";
 
-std::unique_ptr<Ncs> RedisNcsFactory::createNcs(const json& params) {
+std::unique_ptr<Ncs> RedisNcsFactory::createNcs(const nlohmann::json& params) {
     if (!params.contains("redis_host")) {
         throw std::runtime_error("RedisNcsFactory: 'redis_host' is required in params");
     }
@@ -171,3 +168,5 @@ namespace {
 }
 
 } // namespace milvus
+
+#endif // USE_REDIS

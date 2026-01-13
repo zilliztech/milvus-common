@@ -9,8 +9,10 @@
 #include <gtest/gtest.h>
 #include "ncs/InMemNcsConnector.h"
 #include "ncs/InMemoryNcs.h"
+#ifdef USE_REDIS
 #include "ncs/RedisNcs.h"
 #include "ncs/RedisNcsConnector.h"
+#endif
 #include <memory>
 #include <vector>
 #include <thread>
@@ -28,13 +30,17 @@ namespace {
 
 enum class NcsType {
     InMemory,
+#ifdef USE_REDIS
     Redis
+#endif
 };
 
 std::string NcsTypeToString(NcsType type) {
     switch (type) {
         case NcsType::InMemory: return "InMemory";
+#ifdef USE_REDIS
         case NcsType::Redis: return "Redis";
+#endif
     }
     return "Unknown";
 }
@@ -45,18 +51,20 @@ std::string NcsTypeToString(NcsType type) {
 struct NcsTestConfig {
     NcsType type;
     std::string kind;
-    json config;
+    nlohmann::json config;
 
     static NcsTestConfig InMemory() {
-        return {NcsType::InMemory, "in_memory", json::object()};
+        return {NcsType::InMemory, "in_memory", nlohmann::json::object()};
     }
     
+#ifdef USE_REDIS
     static NcsTestConfig Redis() {
-        json config;
+        nlohmann::json config;
         config["redis_host"] = "localhost";
         config["redis_port"] = 6379;
         return {NcsType::Redis, "redis", config};
     }
+#endif
 };
 
 } // namespace (anonymous)
@@ -78,9 +86,11 @@ protected:
                 case NcsType::InMemory:
                     NcsSingleton::initNcs(InMemoryNcsFactory::KIND);
                     break;
+#ifdef USE_REDIS
                 case NcsType::Redis:
                     NcsSingleton::initNcs(RedisNcsFactory::KIND, config_.config);
                     break;
+#endif
             }
         } catch (const std::exception& e) {
             GTEST_SKIP() << NcsTypeToString(config_.type) << " not available: " << e.what();
@@ -124,7 +134,7 @@ protected:
     /**
      * @brief Create a connector with custom config (for high-concurrency tests).
      */
-    std::unique_ptr<NcsConnector> createConnectorWithConfig(uint64_t bucketId, const json& customConfig) {
+    std::unique_ptr<NcsConnector> createConnectorWithConfig(uint64_t bucketId, const nlohmann::json& customConfig) {
         ncs_->createBucket(bucketId);
         auto descriptor = std::make_unique<NcsDescriptor>(config_.kind, bucketId, customConfig);
         return std::unique_ptr<NcsConnector>(
@@ -159,7 +169,7 @@ protected:
         // Pre-populate data using the main connector
         std::vector<uint32_t> allKeys;
         std::vector<std::vector<uint8_t>> allValues;
-        std::vector<SpanBytes> allSpans;
+        std::vector<boost::span<uint8_t>> allSpans;
         
         for (size_t i = 0; i < numKeys; ++i) {
             allKeys.push_back(static_cast<uint32_t>(i));
@@ -198,7 +208,7 @@ protected:
                     size_t batchSize = batchDist(rng);
                     std::vector<uint32_t> keys;
                     std::vector<std::vector<uint8_t>> buffers;
-                    std::vector<SpanBytes> spans;
+                    std::vector<boost::span<uint8_t>> spans;
                     
                     for (size_t b = 0; b < batchSize; ++b) {
                         size_t keyIdx = keyDist(rng);
@@ -258,7 +268,7 @@ TEST_P(NcsTest, BasicOperations) {
         generateTestData(200, 0x22),
         generateTestData(300, 0x33)
     };
-    std::vector<SpanBytes> putSpans;
+    std::vector<boost::span<uint8_t>> putSpans;
     for (auto& v : values) {
         putSpans.emplace_back(v.data(), v.size());
     }
@@ -272,10 +282,12 @@ TEST_P(NcsTest, BasicOperations) {
 
     // Get
     std::vector<std::vector<uint8_t>> readBuffers;
-    std::vector<SpanBytes> readSpans;
+    std::vector<boost::span<uint8_t>> readSpans;
     for (const auto& v : values) {
         readBuffers.emplace_back(v.size());
-        readSpans.emplace_back(readBuffers.back().data(), readBuffers.back().size());
+    }
+    for (auto& buf : readBuffers) {
+        readSpans.emplace_back(buf.data(), buf.size());
     }
 
     auto getResults = connector_->multiGet(keys, readSpans);
@@ -301,13 +313,13 @@ TEST_P(NcsTest, BasicOperations) {
 TEST_P(NcsTest, BufferTooSmall) {
     std::vector<uint32_t> keys = {100};
     std::vector<uint8_t> value(300, 0xAA);
-    std::vector<SpanBytes> putSpans = {SpanBytes(value.data(), value.size())};
+    std::vector<boost::span<uint8_t>> putSpans = {boost::span<uint8_t>(value.data(), value.size())};
     
     connector_->multiPut(keys, putSpans);
     
     // Try to read with buffer too small
     std::vector<uint8_t> smallBuffer(50);
-    std::vector<SpanBytes> smallSpans = {SpanBytes(smallBuffer.data(), smallBuffer.size())};
+    std::vector<boost::span<uint8_t>> smallSpans = {boost::span<uint8_t>(smallBuffer.data(), smallBuffer.size())};
     
     auto result = connector_->multiGet(keys, smallSpans);
     EXPECT_EQ(result[0], NcsStatus::ERROR);
@@ -318,19 +330,19 @@ TEST_P(NcsTest, BufferTooSmall) {
 TEST_P(NcsTest, Overwrite) {
     std::vector<uint32_t> keys = {10};
     std::vector<uint8_t> value1(50, 0xAA);
-    std::vector<SpanBytes> putSpans1 = {SpanBytes(value1.data(), value1.size())};
+    std::vector<boost::span<uint8_t>> putSpans1 = {boost::span<uint8_t>(value1.data(), value1.size())};
     
     connector_->multiPut(keys, putSpans1);
     
     // Overwrite with new value
     std::vector<uint8_t> value2(50, 0xBB);
-    std::vector<SpanBytes> putSpans2 = {SpanBytes(value2.data(), value2.size())};
+    std::vector<boost::span<uint8_t>> putSpans2 = {boost::span<uint8_t>(value2.data(), value2.size())};
     
     connector_->multiPut(keys, putSpans2);
     
     // Verify new value
     std::vector<uint8_t> readBuffer(50);
-    std::vector<SpanBytes> readSpans = {SpanBytes(readBuffer.data(), readBuffer.size())};
+    std::vector<boost::span<uint8_t>> readSpans = {boost::span<uint8_t>(readBuffer.data(), readBuffer.size())};
     
     auto result = connector_->multiGet(keys, readSpans);
     EXPECT_EQ(result[0], NcsStatus::OK);
@@ -370,7 +382,7 @@ TEST_P(NcsTest, MissingBucket) {
 
 TEST_P(NcsTest, EmptyBatch) {
     std::vector<uint32_t> emptyKeys;
-    std::vector<SpanBytes> emptySpans;
+    std::vector<boost::span<uint8_t>> emptySpans;
     
     auto getResults = connector_->multiGet(emptyKeys, emptySpans);
     EXPECT_TRUE(getResults.empty());
@@ -387,7 +399,7 @@ TEST_P(NcsTest, LargeBatch) {
     
     std::vector<uint32_t> keys;
     std::vector<std::vector<uint8_t>> values;
-    std::vector<SpanBytes> putSpans;
+    std::vector<boost::span<uint8_t>> putSpans;
     
     for (size_t i = 0; i < batchSize; ++i) {
         keys.push_back(static_cast<uint32_t>(5000 + i));
@@ -406,7 +418,7 @@ TEST_P(NcsTest, LargeBatch) {
     
     // Get batch
     std::vector<std::vector<uint8_t>> readBuffers(batchSize, std::vector<uint8_t>(kValueSize));
-    std::vector<SpanBytes> readSpans;
+    std::vector<boost::span<uint8_t>> readSpans;
     for (auto& buf : readBuffers) {
         readSpans.emplace_back(buf.data(), buf.size());
     }
@@ -450,7 +462,7 @@ TEST_P(NcsTest, MultipleBatches) {
     
     std::vector<uint32_t> keys;
     std::vector<std::vector<uint8_t>> values;
-    std::vector<SpanBytes> putSpans;
+    std::vector<boost::span<uint8_t>> putSpans;
     
     for (size_t i = 0; i < batchSize; ++i) {
         keys.push_back(static_cast<uint32_t>(10000 + i));
@@ -468,7 +480,7 @@ TEST_P(NcsTest, MultipleBatches) {
         }
         
         std::vector<std::vector<uint8_t>> readBuffers(batchSize, std::vector<uint8_t>(kValueSize));
-        std::vector<SpanBytes> readSpans;
+        std::vector<boost::span<uint8_t>> readSpans;
         for (auto& buf : readBuffers) {
             readSpans.emplace_back(buf.data(), buf.size());
         }
@@ -498,7 +510,9 @@ std::string NcsTestNameGenerator(const ::testing::TestParamInfo<NcsTestConfig>& 
 std::vector<NcsTestConfig> GetNcsTestConfigs() {
     std::vector<NcsTestConfig> configs;
     configs.push_back(NcsTestConfig::InMemory());
+#ifdef USE_REDIS
     configs.push_back(NcsTestConfig::Redis());
+#endif
     return configs;
 }
 } // namespace (anonymous)

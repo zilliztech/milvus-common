@@ -14,6 +14,7 @@ project(milvus_common CXX C)
 
 option(ENABLE_UNIT_TESTS "Enable unit tests" OFF)
 option(ENABLE_SYNCPOINT "Enable sync point for testing" OFF)
+option(USE_REDIS "Enable Redis NCS support" ON)
 
 set( CMAKE_CXX_STANDARD 17 )
 set( CMAKE_CXX_STANDARD_REQUIRED on )
@@ -41,14 +42,20 @@ find_package(gflags REQUIRED)
 find_package(glog REQUIRED)
 find_package(fmt REQUIRED)
 find_package(prometheus-cpp REQUIRED)
-find_package(hiredis REQUIRED)
+
+if(USE_REDIS)
+    find_package(hiredis REQUIRED)
+endif()
 
 list(APPEND COMMON_LINKER_LIBS glog::glog)
 list(APPEND COMMON_LINKER_LIBS prometheus-cpp::core prometheus-cpp::push)
 list(APPEND COMMON_LINKER_LIBS fmt::fmt-header-only)
 list(APPEND COMMON_LINKER_LIBS Folly::folly)
 list(APPEND COMMON_LINKER_LIBS gflags::gflags)
-list(APPEND COMMON_LINKER_LIBS hiredis::hiredis)
+
+if(USE_REDIS)
+    list(APPEND COMMON_LINKER_LIBS hiredis::hiredis)
+endif()
 
 list(APPEND COMMON_LINKER_LIBS opentelemetry-cpp::opentelemetry_trace)
 list(APPEND COMMON_LINKER_LIBS opentelemetry-cpp::opentelemetry_exporter_ostream_span)
@@ -74,10 +81,25 @@ else()
     list(APPEND COMMON_LINKER_LIBS ${LIBAIO_LIBRARY})
 endif()
 
+# Conditionally exclude Redis source files if USE_REDIS is OFF
+if(NOT USE_REDIS)
+    list(REMOVE_ITEM SRC_FILES 
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/ncs/RedisNcs.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/ncs/RedisNcsConnector.cpp
+    )
+    message(STATUS "Redis support disabled, excluding Redis NCS files from build")
+else()
+    message(STATUS "Redis support enabled, including Redis NCS files in build")
+endif()
+
 add_library(milvus-common SHARED ${SRC_FILES})
 
 if (ENABLE_SYNCPOINT)
     add_definitions(-DENABLE_SYNCPOINT)
+endif()
+
+if (USE_REDIS)
+    target_compile_definitions(milvus-common PUBLIC USE_REDIS)
 endif()
 
 target_link_libraries(milvus-common PUBLIC

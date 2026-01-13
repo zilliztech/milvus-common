@@ -6,15 +6,13 @@
 
 namespace milvus {
 
-using std::make_unique;
-
 class InMemNcsConnector : public NcsConnector {
 public:
     friend class InMemoryNcsConnectorCreator;
     
     // Interface implementations
-    std::vector<NcsStatus> multiGet(const std::vector<uint32_t>& keys, const std::vector<SpanBytes>& buffs) override;
-    std::vector<NcsStatus> multiPut(const std::vector<uint32_t>& keys, const std::vector<SpanBytes>& buffs) override;
+    std::vector<NcsStatus> multiGet(const std::vector<uint32_t>& keys, const std::vector<boost::span<uint8_t>>& buffs) override;
+    std::vector<NcsStatus> multiPut(const std::vector<uint32_t>& keys, const std::vector<boost::span<uint8_t>>& buffs) override;
     std::vector<NcsStatus> multiDelete(const std::vector<uint32_t>& keys) override;
 
 private:

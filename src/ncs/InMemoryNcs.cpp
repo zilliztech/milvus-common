@@ -25,7 +25,7 @@ bool InMemoryNcs::isBucketExist(uint64_t bucketId) {
 // InMemoryNcsFactory implementation
 const std::string InMemoryNcsFactory::KIND = "in_memory";
 
-std::unique_ptr<Ncs> InMemoryNcsFactory::createNcs(const json& params) {
+std::unique_ptr<Ncs> InMemoryNcsFactory::createNcs(const nlohmann::json& params) {
     return std::unique_ptr<Ncs>(new InMemoryNcs());
 }
 

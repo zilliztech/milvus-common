@@ -5,8 +5,6 @@
 
 namespace milvus {
 
-using std::make_unique;
-
 
 InMemNcsConnector::InMemNcsConnector(uint64_t bucketId)
 : NcsConnector(bucketId) {
@@ -15,7 +13,7 @@ InMemNcsConnector::InMemNcsConnector(uint64_t bucketId)
 
 
 std::vector<NcsStatus> InMemNcsConnector::multiGet(const std::vector<uint32_t>& keys, 
-                                              const std::vector<SpanBytes>& buffs) {
+                                              const std::vector<boost::span<uint8_t>>& buffs) {
     std::vector<NcsStatus> results;
     results.reserve(keys.size());
 
@@ -28,7 +26,7 @@ std::vector<NcsStatus> InMemNcsConnector::multiGet(const std::vector<uint32_t>& 
 }
 
 std::vector<NcsStatus> InMemNcsConnector::multiPut(const std::vector<uint32_t>& keys, 
-                                              const std::vector<SpanBytes>& buffs) {
+                                              const std::vector<boost::span<uint8_t>>& buffs) {
     std::vector<NcsStatus> results;
     results.reserve(keys.size());
 

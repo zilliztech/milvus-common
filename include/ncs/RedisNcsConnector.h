@@ -1,6 +1,9 @@
 #pragma once
 
+#ifdef USE_REDIS
+
 #include "ncs/ncs.h"
+#include "ncs/RedisTypes.h"
 #include "log/Log.h"
 #include <memory>
 #include <string>
@@ -23,8 +26,9 @@ namespace milvus {
 class RedisNcsConnector : public NcsConnector {
 public:
     ~RedisNcsConnector() override;
-    std::vector<NcsStatus> multiGet(const std::vector<uint32_t>& keys, const std::vector<SpanBytes>& buffs) override;
-    std::vector<NcsStatus> multiPut(const std::vector<uint32_t>& keys, const std::vector<SpanBytes>& buffs) override;
+    
+    std::vector<NcsStatus> multiGet(const std::vector<uint32_t>& keys, const std::vector<boost::span<uint8_t>>& buffs) override;
+    std::vector<NcsStatus> multiPut(const std::vector<uint32_t>& keys, const std::vector<boost::span<uint8_t>>& buffs) override;
     std::vector<NcsStatus> multiDelete(const std::vector<uint32_t>& keys) override;
 
 private:
@@ -35,10 +39,12 @@ private:
      * @return true if connection is valid, false otherwise.
      */
     bool ensureConnected();
+
+    ncs::RedisReplyPtr getSafeReply();
     
-    redisContext* ctx_ = nullptr;
+    ncs::RedisContextPtr ctx_{nullptr, redisFree};
     std::string host_;
-    int port_;
+    int port_ = 0;
     
     friend class RedisNcsConnectorCreator;
 };
@@ -51,3 +57,5 @@ public:
 };
 
 } // namespace milvus
+
+#endif // USE_REDIS

@@ -1,3 +1,5 @@
+#ifdef USE_REDIS
+
 #include "ncs/RedisNcsConnector.h"
 #include "log/Log.h"
 #include <memory>
@@ -13,17 +15,13 @@ namespace milvus {
 // ============================================================================
 
 RedisNcsConnector::RedisNcsConnector(uint64_t bucketId, const std::string& host, int port)
-    : NcsConnector(bucketId), ctx_(nullptr), host_(host), port_(port) {
+    : NcsConnector(bucketId), ctx_(nullptr, redisFree), host_(host), port_(port) {
     
-    ctx_ = redisConnect(host.c_str(), port);
+    ctx_.reset(redisConnect(host.c_str(), port));
     if (ctx_ == nullptr || ctx_->err) {
-        if (ctx_) {
-            LOG_ERROR("[RedisNcsConnector] Connection error: {}", ctx_->errstr);
-            redisFree(ctx_);
-            ctx_ = nullptr;
-        } else {
-            LOG_ERROR("[RedisNcsConnector] Cannot allocate redis context");
-        }
+        std::string error_msg = ctx_ ? ctx_->errstr : "Cannot allocate redis context";
+        LOG_ERROR("[RedisNcsConnector] Connection error: {}", error_msg);
+        ctx_.reset();
         throw std::runtime_error("Failed to connect to Redis at " + host + ":" + std::to_string(port));
     }
     
@@ -32,10 +30,6 @@ RedisNcsConnector::RedisNcsConnector(uint64_t bucketId, const std::string& host,
 }
 
 RedisNcsConnector::~RedisNcsConnector() {
-    if (ctx_) {
-        redisFree(ctx_);
-        ctx_ = nullptr;
-    }
     LOG_DEBUG("[RedisNcsConnector] Destroyed connector for bucket {}", bucketId_);
 }
 
@@ -44,17 +38,11 @@ bool RedisNcsConnector::ensureConnected() {
         return true;
     }
     
-    if (ctx_) {
-        redisFree(ctx_);
-    }
-    
-    ctx_ = redisConnect(host_.c_str(), port_);
+    ctx_.reset(redisConnect(host_.c_str(), port_));
     if (ctx_ == nullptr || ctx_->err) {
-        if (ctx_) {
-            LOG_ERROR("[RedisNcsConnector] Reconnection error: {}", ctx_->errstr);
-            redisFree(ctx_);
-            ctx_ = nullptr;
-        }
+        std::string error_msg = ctx_ ? ctx_->errstr : "Cannot allocate redis context";
+        LOG_ERROR("[RedisNcsConnector] Reconnection error: {}", error_msg);
+        ctx_.reset();
         return false;
     }
     
@@ -62,9 +50,17 @@ bool RedisNcsConnector::ensureConnected() {
     return true;
 }
 
+ncs::RedisReplyPtr RedisNcsConnector::getSafeReply() {
+    redisReply* raw_reply = nullptr;
+    if (redisGetReply(ctx_.get(), (void**)&raw_reply) != REDIS_OK) {
+        return ncs::RedisReplyPtr(nullptr, freeReplyObject);
+    }
+    return ncs::RedisReplyPtr(raw_reply, freeReplyObject);
+}
+
 std::vector<NcsStatus> RedisNcsConnector::multiGet(
     const std::vector<uint32_t>& keys, 
-    const std::vector<SpanBytes>& buffs) {
+    const std::vector<boost::span<uint8_t>>& buffs) {
     
     std::vector<NcsStatus> results(keys.size(), NcsStatus::ERROR);
     
@@ -86,28 +82,21 @@ std::vector<NcsStatus> RedisNcsConnector::multiGet(
     for (size_t i = 0; i < keys.size(); ++i) {
         std::string redisKey = "bucket_" + std::to_string(bucketId_) + "_" + std::to_string(keys[i]);
         
-        if (redisAppendCommand(ctx_, "GET %s", redisKey.c_str()) != REDIS_OK) {
+        if (redisAppendCommand(ctx_.get(), "GET %s", redisKey.c_str()) != REDIS_OK) {
             LOG_ERROR("[RedisNcsConnector] Failed to append GET command for key {}", redisKey);
-            for (size_t j = 0; j < i; ++j) {
-                redisReply* reply = nullptr;
-                redisGetReply(ctx_, (void**)&reply);
-                if (reply) freeReplyObject(reply);
-            }
+            // Connection is in bad state, force reconnect on next call
+            ctx_.reset();
             return results;
         }
     }
     
     for (size_t i = 0; i < keys.size(); ++i) {
-        redisReply* reply = nullptr;
+        auto reply = getSafeReply();
         
-        if (redisGetReply(ctx_, (void**)&reply) != REDIS_OK) {
+        if (!reply) {
             std::string redisKey = "bucket_" + std::to_string(bucketId_) + "_" + std::to_string(keys[i]);
             LOG_ERROR("[RedisNcsConnector] Failed to get reply for key {}: {}", 
                      redisKey, ctx_->errstr ? ctx_->errstr : "unknown error");
-            continue;
-        }
-        
-        if (reply == nullptr) {
             continue;
         }
         
@@ -128,8 +117,6 @@ std::vector<NcsStatus> RedisNcsConnector::multiGet(
             std::string redisKey = "bucket_" + std::to_string(bucketId_) + "_" + std::to_string(keys[i]);
             LOG_ERROR("[RedisNcsConnector] Unexpected reply type {} for key {}", reply->type, redisKey);
         }
-        
-        freeReplyObject(reply);
     }
     
     return results;
@@ -137,7 +124,7 @@ std::vector<NcsStatus> RedisNcsConnector::multiGet(
 
 std::vector<NcsStatus> RedisNcsConnector::multiPut(
     const std::vector<uint32_t>& keys, 
-    const std::vector<SpanBytes>& buffs) {
+    const std::vector<boost::span<uint8_t>>& buffs) {
     
     std::vector<NcsStatus> results(keys.size(), NcsStatus::ERROR);
     
@@ -158,29 +145,22 @@ std::vector<NcsStatus> RedisNcsConnector::multiPut(
     for (size_t i = 0; i < keys.size(); ++i) {
         std::string redisKey = "bucket_" + std::to_string(bucketId_) + "_" + std::to_string(keys[i]);
         
-        if (redisAppendCommand(ctx_, "SET %s %b", 
+        if (redisAppendCommand(ctx_.get(), "SET %s %b", 
                               redisKey.c_str(), buffs[i].data(), buffs[i].size()) != REDIS_OK) {
             LOG_ERROR("[RedisNcsConnector] Failed to append SET command for key {}", redisKey);
-            for (size_t j = 0; j < i; ++j) {
-                redisReply* reply = nullptr;
-                redisGetReply(ctx_, (void**)&reply);
-                if (reply) freeReplyObject(reply);
-            }
+            // Connection is in bad state, force reconnect on next call
+            ctx_.reset();
             return results;
         }
     }
     
     for (size_t i = 0; i < keys.size(); ++i) {
-        redisReply* reply = nullptr;
+        auto reply = getSafeReply();
         
-        if (redisGetReply(ctx_, (void**)&reply) != REDIS_OK) {
+        if (!reply) {
             std::string redisKey = "bucket_" + std::to_string(bucketId_) + "_" + std::to_string(keys[i]);
             LOG_ERROR("[RedisNcsConnector] Failed to get reply for key {}: {}", 
                      redisKey, ctx_->errstr ? ctx_->errstr : "unknown error");
-            continue;
-        }
-        
-        if (reply == nullptr) {
             continue;
         }
         
@@ -191,8 +171,6 @@ std::vector<NcsStatus> RedisNcsConnector::multiPut(
             std::string redisKey = "bucket_" + std::to_string(bucketId_) + "_" + std::to_string(keys[i]);
             LOG_ERROR("[RedisNcsConnector] Failed to SET key {}", redisKey);
         }
-        
-        freeReplyObject(reply);
     }
     
     return results;
@@ -213,28 +191,21 @@ std::vector<NcsStatus> RedisNcsConnector::multiDelete(const std::vector<uint32_t
     for (size_t i = 0; i < keys.size(); ++i) {
         std::string redisKey = "bucket_" + std::to_string(bucketId_) + "_" + std::to_string(keys[i]);
         
-        if (redisAppendCommand(ctx_, "DEL %s", redisKey.c_str()) != REDIS_OK) {
+        if (redisAppendCommand(ctx_.get(), "DEL %s", redisKey.c_str()) != REDIS_OK) {
             LOG_ERROR("[RedisNcsConnector] Failed to append DEL command for key {}", redisKey);
-            for (size_t j = 0; j < i; ++j) {
-                redisReply* reply = nullptr;
-                redisGetReply(ctx_, (void**)&reply);
-                if (reply) freeReplyObject(reply);
-            }
+            // Connection is in bad state, force reconnect on next call
+            ctx_.reset();
             return results;
         }
     }
     
     for (size_t i = 0; i < keys.size(); ++i) {
-        redisReply* reply = nullptr;
+        auto reply = getSafeReply();
         
-        if (redisGetReply(ctx_, (void**)&reply) != REDIS_OK) {
+        if (!reply) {
             std::string redisKey = "bucket_" + std::to_string(bucketId_) + "_" + std::to_string(keys[i]);
             LOG_ERROR("[RedisNcsConnector] Failed to get reply for key {}: {}", 
                      redisKey, ctx_->errstr ? ctx_->errstr : "unknown error");
-            continue;
-        }
-        
-        if (reply == nullptr) {
             continue;
         }
         
@@ -244,8 +215,6 @@ std::vector<NcsStatus> RedisNcsConnector::multiDelete(const std::vector<uint32_t
             std::string redisKey = "bucket_" + std::to_string(bucketId_) + "_" + std::to_string(keys[i]);
             LOG_ERROR("[RedisNcsConnector] Failed to DEL key {}", redisKey);
         }
-        
-        freeReplyObject(reply);
     }
     
     return results;
@@ -255,7 +224,7 @@ std::vector<NcsStatus> RedisNcsConnector::multiDelete(const std::vector<uint32_t
 const std::string RedisNcsConnectorCreator::KIND = "redis";
 
 NcsConnector* RedisNcsConnectorCreator::factoryMethod(const NcsDescriptor* descriptor) {
-    const json& extras = descriptor->getExtras();
+    const nlohmann::json& extras = descriptor->getExtras();
     
     if (!extras.contains("redis_host")) {
         throw std::runtime_error("RedisNcsConnectorCreator: 'redis_host' is required in descriptor extras");
@@ -269,19 +238,22 @@ NcsConnector* RedisNcsConnectorCreator::factoryMethod(const NcsDescriptor* descr
     
     // Check if bucket exists by querying Redis directly
     std::string bucketKey = "bucket_" + std::to_string(descriptor->getbucketId()) + "_valid";
-    redisContext* ctx = redisConnect(host.c_str(), port);
+    ncs::RedisContextPtr ctx(
+        redisConnect(host.c_str(), port),
+        redisFree
+    );
     if (ctx == nullptr || ctx->err) {
         if (ctx) {
             LOG_ERROR("[RedisNcsConnectorCreator] Failed to connect to Redis: {}", ctx->errstr);
-            redisFree(ctx);
         }
         return nullptr;
     }
     
-    redisReply* reply = (redisReply*)redisCommand(ctx, "EXISTS %s", bucketKey.c_str());
+    ncs::RedisReplyPtr reply(
+        (redisReply*)redisCommand(ctx.get(), "EXISTS %s", bucketKey.c_str()),
+        freeReplyObject
+    );
     bool bucketExists = (reply != nullptr && reply->type == REDIS_REPLY_INTEGER && reply->integer == 1);
-    if (reply) freeReplyObject(reply);
-    redisFree(ctx);
     
     if (!bucketExists) {
         LOG_ERROR("[RedisNcsConnectorCreator] Bucket {} does not exist", descriptor->getbucketId());
@@ -309,3 +281,5 @@ namespace {
 }
 
 } // namespace milvus
+
+#endif // USE_REDIS

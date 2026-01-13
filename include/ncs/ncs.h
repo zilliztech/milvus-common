@@ -64,16 +64,10 @@
 #include <stdexcept>
 #include "nlohmann/json.hpp"
 
-#include "common/SpanBytes.h"
+#include <boost/core/span.hpp>
 
 
 namespace milvus {
-
-using std::string;
-using std::vector;
-using std::unique_ptr;
-using std::unordered_map;
-using json = nlohmann::json;
 
 enum class NcsStatus {
     OK,
@@ -82,18 +76,18 @@ enum class NcsStatus {
 
 class NcsDescriptor {
 public: 
-    NcsDescriptor(const std::string& ncsKind, uint64_t bucketId, const json& extras);
+    NcsDescriptor(const std::string& ncsKind, uint64_t bucketId, const nlohmann::json& extras);
     virtual ~NcsDescriptor() = default;
     const std::string& getKind() const;
     uint64_t getbucketId() const;
-    const json& getExtras() const { return extras_; }
+    const nlohmann::json& getExtras() const { return extras_; }
     
     NLOHMANN_DEFINE_TYPE_INTRUSIVE(NcsDescriptor, ncsKind_, bucketId_, extras_)
     NcsDescriptor() = default;
 private:
     std::string ncsKind_;
-    uint64_t bucketId_;
-    json extras_;
+    uint64_t bucketId_ = 0;
+    nlohmann::json extras_;
 };
 
 class NcsBucketStatus{
@@ -146,7 +140,7 @@ protected:
 
 class NcsFactory {
 public:
-    virtual std::unique_ptr<Ncs> createNcs(const json& params = json{}) = 0;
+    virtual std::unique_ptr<Ncs> createNcs(const nlohmann::json& params = nlohmann::json{}) = 0;
     virtual const std::string& getKind() const = 0;
     virtual ~NcsFactory() = default;
 };
@@ -155,7 +149,7 @@ class NcsFactoryRegistry {
 public:
     static NcsFactoryRegistry& Instance();
     void registerFactory(std::unique_ptr<NcsFactory> factory);
-    std::unique_ptr<Ncs> createNcs(const std::string& kind, const json& params = json{});
+    std::unique_ptr<Ncs> createNcs(const std::string& kind, const nlohmann::json& params = nlohmann::json{});
     bool hasKind(const std::string& kind) const;
     ~NcsFactoryRegistry() = default;
 
@@ -166,7 +160,7 @@ private:
 
 class NcsSingleton final{
 public:
-    static void initNcs(const std::string& kind, const json& extras = json{});
+    static void initNcs(const std::string& kind, const nlohmann::json& extras = nlohmann::json{});
     static Ncs* Instance();
     
     /**
@@ -185,7 +179,7 @@ public:
     
 private:
     inline static std::string kind_;
-    inline static json extras_;
+    inline static nlohmann::json extras_;
     inline static std::unique_ptr<Ncs> instance_ = nullptr;
 };
 
@@ -206,6 +200,12 @@ class NcsConnector {
 public:
     virtual ~NcsConnector() = default;
     
+    // Delete copy and move operations - connectors are not copyable/movable
+    NcsConnector(const NcsConnector&) = delete;
+    NcsConnector& operator=(const NcsConnector&) = delete;
+    NcsConnector(NcsConnector&&) = delete;
+    NcsConnector& operator=(NcsConnector&&) = delete;
+    
     /**
      * @brief Read multiple key-value pairs.
      * @param keys Vector of keys to read.
@@ -215,7 +215,7 @@ public:
      *         - NcsStatus::OK if read succeeded
      *         - NcsStatus::ERROR if key doesn't exist or buffer too small
      */
-    virtual std::vector<NcsStatus> multiGet(const std::vector<uint32_t>& keys, const std::vector<SpanBytes>& buffs) = 0;
+    virtual std::vector<NcsStatus> multiGet(const std::vector<uint32_t>& keys, const std::vector<boost::span<uint8_t>>& buffs) = 0;
     
     /**
      * @brief Write multiple key-value pairs.
@@ -227,7 +227,7 @@ public:
      * 
      * Note: If a key already exists, its value is overwritten.
      */
-    virtual std::vector<NcsStatus> multiPut(const std::vector<uint32_t>& keys, const std::vector<SpanBytes>& buffs) = 0;
+    virtual std::vector<NcsStatus> multiPut(const std::vector<uint32_t>& keys, const std::vector<boost::span<uint8_t>>& buffs) = 0;
     
     /**
      * @brief Delete multiple keys.

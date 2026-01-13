@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <unistd.h>
 
-#include "common/SpanBytes.h"
+#include <boost/core/span.hpp>
 
 namespace milvus {
 
@@ -15,11 +15,11 @@ public:
 
     // Put a value into an existing bucket. Returns true on success, false if the
     // bucket does not exist.
-    bool put(uint64_t bucketId, uint32_t key, const SpanBytes& value);
+    bool put(uint64_t bucketId, uint32_t key, const boost::span<uint8_t>& value);
     bool createBucket(uint64_t bucketId);
     bool deleteBucket(uint64_t bucketId);
     bool hasBucket(uint64_t bucketId) const;
-    bool get(uint64_t bucketId, uint32_t key, const SpanBytes& buff) const;
+    bool get(uint64_t bucketId, uint32_t key, const boost::span<uint8_t>& buff) const;
     bool deleteKey(uint64_t bucketId, uint32_t key);
 private:
     InMemoryKV() = default;

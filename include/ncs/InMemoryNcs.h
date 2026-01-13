@@ -23,7 +23,7 @@ private:
 class InMemoryNcsFactory : public NcsFactory {
 public:
     static const std::string KIND;
-    std::unique_ptr<Ncs> createNcs(const json& params = json{}) override;
+    std::unique_ptr<Ncs> createNcs(const nlohmann::json& params = nlohmann::json{}) override;
     const std::string& getKind() const override;
 };
 

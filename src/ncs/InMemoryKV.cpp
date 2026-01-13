@@ -8,7 +8,7 @@ InMemoryKV* InMemoryKV::Instance() {
     return &instance;
 }
 
-bool InMemoryKV::put(uint64_t bucketId, uint32_t key, const SpanBytes& value) {
+bool InMemoryKV::put(uint64_t bucketId, uint32_t key, const boost::span<uint8_t>& value) {
     auto bucket_it = data_.find(bucketId);
     if (bucket_it == data_.end()) {
         // bucket not created
@@ -37,7 +37,7 @@ bool InMemoryKV::hasBucket(uint64_t bucketId) const {
     return data_.find(bucketId) != data_.end();
 }
 
-bool InMemoryKV::get(uint64_t bucketId, uint32_t key, const SpanBytes& buff) const {
+bool InMemoryKV::get(uint64_t bucketId, uint32_t key, const boost::span<uint8_t>& buff) const {
     auto bucket_it = data_.find(bucketId);
     if (bucket_it == data_.end()) return false;
 

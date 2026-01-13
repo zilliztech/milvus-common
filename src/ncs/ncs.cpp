@@ -16,7 +16,7 @@ void NcsFactoryRegistry::registerFactory(std::unique_ptr<NcsFactory> factory) {
     registry_[kind] = std::move(factory);
 }
 
-std::unique_ptr<Ncs> NcsFactoryRegistry::createNcs(const std::string& kind, const json& params) {
+std::unique_ptr<Ncs> NcsFactoryRegistry::createNcs(const std::string& kind, const nlohmann::json& params) {
     LOG_DEBUG("[NCS] Creating NCS of kind: {} with params: {}", kind, params.dump());
     auto it = registry_.find(kind);
     if (it != registry_.end()) {
@@ -38,7 +38,7 @@ bool NcsFactoryRegistry::hasKind(const std::string& kind) const {
 }
 
 // NcsSingleton implementation
-void NcsSingleton::initNcs(const std::string& kind, const json& extras) {
+void NcsSingleton::initNcs(const std::string& kind, const nlohmann::json& extras) {
     if (!NcsFactoryRegistry::Instance().hasKind(kind)) {
         throw std::runtime_error("NCS Factory kind '" + kind + "' is not registered.");
     }
@@ -91,7 +91,7 @@ NcsConnectorFactory& NcsConnectorFactory::Instance() {
 // Already defaulted in header
 
 // NcsDescriptor implementation
-NcsDescriptor::NcsDescriptor(const std::string& ncsKind, uint64_t bucketId, const json& extras)
+NcsDescriptor::NcsDescriptor(const std::string& ncsKind, uint64_t bucketId, const nlohmann::json& extras)
     : ncsKind_(ncsKind), bucketId_(bucketId), extras_(extras) {
 }
 

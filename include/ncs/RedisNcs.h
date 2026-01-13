@@ -1,6 +1,9 @@
 #pragma once
 
+#ifdef USE_REDIS
+
 #include "ncs/ncs.h"
+#include "ncs/RedisTypes.h"
 #include "log/Log.h"
 #include <memory>
 #include <string>
@@ -19,9 +22,9 @@ public:
     
 private:
     explicit RedisNcs(const std::string& host, int port);
-    redisContext* context_;
+    ncs::RedisContextPtr context_;
     std::string host_;
-    int port_;
+    int port_ = 0;
     std::mutex mutex_;
     
     friend class RedisNcsFactory;
@@ -30,8 +33,10 @@ private:
 class RedisNcsFactory : public NcsFactory {
 public:
     static const std::string KIND;
-    std::unique_ptr<Ncs> createNcs(const json& params = json{}) override;
+    std::unique_ptr<Ncs> createNcs(const nlohmann::json& params = nlohmann::json{}) override;
     const std::string& getKind() const override;
 };
 
 } // namespace milvus
+
+#endif // USE_REDIS
