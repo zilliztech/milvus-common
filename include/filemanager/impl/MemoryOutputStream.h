@@ -2,11 +2,13 @@
 
 #include <unistd.h>
 
+#include <boost/core/span.hpp>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <system_error>
 
 #include "filemanager/OutputStream.h"
 
@@ -40,15 +42,30 @@ class MemoryOutputStream : public OutputStream {
     Write(int fd, size_t size) override {
         TryExpand(size);
         size_t write_size = std::min(size, capacity_ - offset_);
-        read(fd, data_.get() + offset_, write_size);
-        assert(bytes_read >= 0 && static_cast<size_t>(bytes_read) == write_size);
-        offset_ += write_size;
-        return write_size;
+        ssize_t ret = ::read(fd, data_.get() + offset_, write_size);
+        if (ret < 0) {
+            throw std::system_error(errno, std::generic_category(), "read failed");
+        }
+        offset_ += static_cast<size_t>(ret);
+        return static_cast<size_t>(ret);
     }
 
     void
     Close() override {
         // do nothing
+    }
+
+    [[nodiscard]] boost::span<const uint8_t>
+    GetData() const {
+        return {data_.get(), offset_};
+    }
+
+    [[nodiscard]] boost::span<const uint8_t>
+    GetDataAt(size_t offset, size_t size) const {
+        if (offset + size > offset_) {
+            throw std::invalid_argument("GetDataAt out of range");
+        }
+        return {data_.get() + offset, size};
     }
 
  private:

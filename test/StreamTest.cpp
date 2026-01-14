@@ -379,6 +379,75 @@ TEST_F(StreamTest, MemoryOutputStream_AutoExpand) {
     delete[] ptr;
 }
 
+TEST_F(StreamTest, MemoryOutputStream_GetData) {
+    MemoryOutputStream out;
+
+    std::vector<uint8_t> data = {1, 2, 3, 4, 5};
+    out.Write(data.data(), data.size());
+
+    auto span = out.GetData();
+    EXPECT_EQ(span.size(), data.size());
+    EXPECT_TRUE(std::equal(span.begin(), span.end(), data.begin()));
+
+    // Write more data and verify GetData reflects the update
+    std::vector<uint8_t> more_data = {6, 7, 8};
+    out.Write(more_data.data(), more_data.size());
+
+    span = out.GetData();
+    EXPECT_EQ(span.size(), data.size() + more_data.size());
+
+    std::vector<uint8_t> expected;
+    expected.insert(expected.end(), data.begin(), data.end());
+    expected.insert(expected.end(), more_data.begin(), more_data.end());
+    EXPECT_TRUE(std::equal(span.begin(), span.end(), expected.begin()));
+}
+
+TEST_F(StreamTest, MemoryOutputStream_GetDataAt) {
+    MemoryOutputStream out;
+
+    std::vector<uint8_t> data = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    out.Write(data.data(), data.size());
+
+    // Get slice from middle
+    auto span = out.GetDataAt(3, 4);
+    EXPECT_EQ(span.size(), 4u);
+    EXPECT_EQ(span[0], 3);
+    EXPECT_EQ(span[1], 4);
+    EXPECT_EQ(span[2], 5);
+    EXPECT_EQ(span[3], 6);
+
+    // Get slice from beginning
+    span = out.GetDataAt(0, 3);
+    EXPECT_EQ(span.size(), 3u);
+    EXPECT_EQ(span[0], 0);
+    EXPECT_EQ(span[1], 1);
+    EXPECT_EQ(span[2], 2);
+
+    // Get slice at end
+    span = out.GetDataAt(7, 3);
+    EXPECT_EQ(span.size(), 3u);
+    EXPECT_EQ(span[0], 7);
+    EXPECT_EQ(span[1], 8);
+    EXPECT_EQ(span[2], 9);
+}
+
+TEST_F(StreamTest, MemoryOutputStream_GetDataAt_OutOfRange) {
+    MemoryOutputStream out;
+
+    std::vector<uint8_t> data = {1, 2, 3, 4, 5};
+    out.Write(data.data(), data.size());
+
+    // Offset + size exceeds written data
+    EXPECT_THROW((void)out.GetDataAt(3, 5), std::invalid_argument);
+
+    // Offset beyond written data
+    EXPECT_THROW((void)out.GetDataAt(10, 1), std::invalid_argument);
+
+    // Valid boundary case
+    EXPECT_NO_THROW((void)out.GetDataAt(0, 5));
+    EXPECT_NO_THROW((void)out.GetDataAt(4, 1));
+}
+
 // ============================================================================
 // MemoryInputStream Tests
 // ============================================================================
@@ -486,6 +555,71 @@ TEST_F(StreamTest, MemoryInputStream_EmptyData) {
     // Read on empty stream should return 0
     uint8_t buffer[10];
     EXPECT_EQ(in.Read(buffer, 10), 0u);
+}
+
+TEST_F(StreamTest, MemoryInputStream_GetData) {
+    auto data = GenerateTestData(100);
+    MemoryInputStream in(data.data(), data.size());
+
+    // GetData returns full buffer regardless of read position
+    auto span = in.GetData();
+    EXPECT_EQ(span.size(), data.size());
+    EXPECT_TRUE(std::equal(span.begin(), span.end(), data.begin()));
+
+    // Advance read position
+    std::vector<uint8_t> tmp(50);
+    in.Read(tmp.data(), 50);
+    EXPECT_EQ(in.Tell(), 50u);
+
+    // GetData still returns full buffer
+    span = in.GetData();
+    EXPECT_EQ(span.size(), data.size());
+    EXPECT_TRUE(std::equal(span.begin(), span.end(), data.begin()));
+}
+
+TEST_F(StreamTest, MemoryInputStream_GetDataAt) {
+    std::vector<uint8_t> data = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    MemoryInputStream in(data.data(), data.size());
+
+    // Get slice from middle
+    auto span = in.GetDataAt(3, 4);
+    EXPECT_EQ(span.size(), 4u);
+    EXPECT_EQ(span[0], 3);
+    EXPECT_EQ(span[1], 4);
+    EXPECT_EQ(span[2], 5);
+    EXPECT_EQ(span[3], 6);
+
+    // Get slice from beginning
+    span = in.GetDataAt(0, 3);
+    EXPECT_EQ(span.size(), 3u);
+    EXPECT_EQ(span[0], 0);
+    EXPECT_EQ(span[1], 1);
+    EXPECT_EQ(span[2], 2);
+
+    // Get slice at end
+    span = in.GetDataAt(7, 3);
+    EXPECT_EQ(span.size(), 3u);
+    EXPECT_EQ(span[0], 7);
+    EXPECT_EQ(span[1], 8);
+    EXPECT_EQ(span[2], 9);
+
+    // GetDataAt does not affect read position
+    EXPECT_EQ(in.Tell(), 0u);
+}
+
+TEST_F(StreamTest, MemoryInputStream_GetDataAt_OutOfRange) {
+    std::vector<uint8_t> data = {1, 2, 3, 4, 5};
+    MemoryInputStream in(data.data(), data.size());
+
+    // Offset + size exceeds data size
+    EXPECT_THROW((void)in.GetDataAt(3, 5), std::invalid_argument);
+
+    // Offset beyond data
+    EXPECT_THROW((void)in.GetDataAt(10, 1), std::invalid_argument);
+
+    // Valid boundary case
+    EXPECT_NO_THROW((void)in.GetDataAt(0, 5));
+    EXPECT_NO_THROW((void)in.GetDataAt(4, 1));
 }
 
 // ============================================================================
