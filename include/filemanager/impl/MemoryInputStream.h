@@ -2,10 +2,12 @@
 
 #include <unistd.h>
 
+#include <boost/core/span.hpp>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <system_error>
 
 #include "filemanager/InputStream.h"
 
@@ -70,11 +72,28 @@ class MemoryInputStream : public InputStream {
         }
         assert(offset_ + size <= size_);
         size_t read_size = std::min(size, size_ - offset_);
-        write(fd, data_ + offset_, read_size);
-        assert(written >= 0 && static_cast<size_t>(written) == read_size);
-        ::fsync(fd);
-        offset_ += read_size;
-        return read_size;
+        ssize_t ret = ::write(fd, data_ + offset_, read_size);
+        if (ret < 0) {
+            throw std::system_error(errno, std::generic_category(), "write failed");
+        }
+        if (::fsync(fd) < 0) {
+            throw std::system_error(errno, std::generic_category(), "fsync failed");
+        }
+        offset_ += static_cast<size_t>(ret);
+        return static_cast<size_t>(ret);
+    }
+
+    [[nodiscard]] boost::span<const uint8_t>
+    GetData() const {
+        return {data_, size_};
+    }
+
+    [[nodiscard]] boost::span<const uint8_t>
+    GetDataAt(size_t offset, size_t size) const {
+        if (offset + size > size_) {
+            throw std::invalid_argument("GetDataAt out of range");
+        }
+        return {data_ + offset, size};
     }
 
  private:
