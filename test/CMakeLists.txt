@@ -10,6 +10,7 @@
 # or implied. See the License for the specific language governing permissions and limitations under the License
 
 add_subdirectory(test_cachinglayer)
+add_subdirectory(test_ncs)
 
 find_package(GTest CONFIG REQUIRED)
 find_package(OpenMP REQUIRED)
