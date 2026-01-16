@@ -78,7 +78,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
 
     // Warmup should only be called once before any Pin operation.
     void
-    Warmup() {
+    Warmup(OpContext* ctx) {
         auto warmup_policy = translator_->meta()->cache_warmup_policy;
 
         if (warmup_policy == CacheWarmupPolicy::CacheWarmupPolicy_Disable) {
@@ -91,7 +91,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             cids.push_back(i);
         }
         // TODO: Warmup is not tracked for now
-        PinCellsDirect(nullptr, cids);
+        PinCellsDirect(ctx, cids);
 
         // If the slot is not evictable, we don't need to pin the cells anymore after warmup.
         skip_pin_ = !evictable_;
