@@ -10,9 +10,11 @@
 // or implied. See the License for the specific language governing permissions and limitations under the License
 #pragma once
 
+#include <folly/CancellationToken.h>
 #include <folly/futures/Future.h>
 #include <folly/futures/SharedPromise.h>
 #include <folly/io/async/EventBase.h>
+#include <folly/io/async/ScopedEventBaseThread.h>
 #include <folly/system/ThreadName.h>
 
 #include <atomic>
@@ -25,11 +27,12 @@
 #include "cachinglayer/Metrics.h"
 #include "cachinglayer/Utils.h"
 #include "cachinglayer/lrucache/ListNode.h"
+#include "common/OpContext.h"
 #include "log/Log.h"
 
 namespace milvus::cachinglayer::internal {
 
-class DList {
+class DList : public std::enable_shared_from_this<DList> {
  public:
     DList(bool eviction_enabled, ResourceUsage max_memory, ResourceUsage low_watermark, ResourceUsage high_watermark,
           EvictionConfig eviction_config)
@@ -56,12 +59,7 @@ class DList {
         monitor::cache_low_watermark_bytes(StorageType::DISK).Set(low_watermark.file_bytes);
 
         // Initialize event base and thread
-        event_base_ = std::make_unique<folly::EventBase>();
-        event_base_thread_ = std::make_unique<std::thread>([this] {
-            LOG_INFO("[MCL] Starting cache EventBase thread");
-            folly::setThreadName("cache-eb");
-            event_base_->loopForever();
-        });
+        event_base_thread_ = std::make_unique<folly::ScopedEventBaseThread>("cache-eb");
 
         if (eviction_config_.background_eviction_enabled) {
             LOG_INFO("[MCL] Starting periodic background eviction loop thread");
@@ -70,15 +68,17 @@ class DList {
     }
 
     ~DList() {
-        // Stop event base first
-        if (event_base_) {
-            event_base_->terminateLoopSoon();
-        }
-        if (event_base_thread_ && event_base_thread_->joinable()) {
-            event_base_thread_->join();
+        // waiting requests should be cleared before event base thread is stopped
+        clearWaitingQueue();
+
+        if (event_base_thread_) {
+            // drain event base thread to ensure all in-flight callbacks are processed before stopping the thread
+            event_base_thread_->getEventBase()->runInEventBaseThreadAndWait([]() {});
+            // destroy event base thread
+            event_base_thread_.reset();
         }
 
-        // Stop eviction loop
+        // stop eviction loop thread
         if (eviction_config_.background_eviction_enabled) {
             stop_bg_eviction_loop_ = true;
             bg_eviction_thread_cv_.notify_all();
@@ -86,7 +86,6 @@ class DList {
                 bg_eviction_thread_.join();
             }
         }
-        clearWaitingQueue();
     }
 
     // If after evicting all unpinned items, the used_resources_ is still larger than new_limit, false will be returned
@@ -108,7 +107,8 @@ class DList {
 
     // Reserve loading resource with timeout, called before loading a cell.
     folly::SemiFuture<bool>
-    ReserveLoadingResourceWithTimeout(const ResourceUsage& size, std::chrono::milliseconds timeout);
+    ReserveLoadingResourceWithTimeout(const ResourceUsage& size, std::chrono::milliseconds timeout,
+                                      OpContext* ctx = nullptr);
 
     // Release resource used for loading, called after loading a cell.
     void
@@ -156,12 +156,12 @@ class DList {
         ResourceUsage required_size;
         std::chrono::steady_clock::time_point deadline;
         folly::Promise<bool> promise;
-        folly::EventBase* event_base;
         uint64_t request_id;
+        std::optional<folly::CancellationCallback> cancel_cb{std::nullopt};
 
         WaitingRequest(ResourceUsage size, std::chrono::steady_clock::time_point dl, folly::Promise<bool> p,
-                       folly::EventBase* eb, uint64_t id)
-            : required_size(size), deadline(dl), promise(std::move(p)), event_base(eb), request_id(id) {
+                       uint64_t id)
+            : required_size(size), deadline(dl), promise(std::move(p)), request_id(id) {
         }
     };
 
@@ -196,10 +196,11 @@ class DList {
     tryEvict(const ResourceUsage& expected_eviction, const ResourceUsage& min_eviction,
              const bool evict_expired_items = false);
 
-    // Notify waiting requests when resources are available.
+    // Handle waiting requests when resources are available.
     // This method should be called with list_mtx_ already held.
-    void
-    notifyWaitingRequests();
+    // Returns requests that need to be destroyed outside the lock to avoid deadlock.
+    std::vector<std::unique_ptr<WaitingRequest>>
+    handleWaitingRequests();
 
     // Clear all waiting requests (used in destructor)
     void
@@ -277,8 +278,7 @@ class DList {
     std::atomic<ResourceUsage> total_loaded_size_{};
 
     // EventBase and thread for handling timeout operations
-    std::unique_ptr<folly::EventBase> event_base_;
-    std::unique_ptr<std::thread> event_base_thread_;
+    std::unique_ptr<folly::ScopedEventBaseThread> event_base_thread_;
 };
 
 }  // namespace milvus::cachinglayer::internal
