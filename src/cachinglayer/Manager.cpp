@@ -10,6 +10,8 @@
 // or implied. See the License for the specific language governing permissions and limitations under the License
 #include "cachinglayer/Manager.h"
 
+#include <folly/executors/thread_factory/NamedThreadFactory.h>
+
 #include <memory>
 
 #include "cachinglayer/Utils.h"
@@ -23,10 +25,18 @@ Manager::GetInstance() {
     return instance;
 }
 
+Manager::~Manager() {
+    if (prefetch_pool_) {
+        prefetch_pool_->stop();
+        prefetch_pool_->join();
+    }
+}
+
 void
 Manager::ConfigureTieredStorage(CacheWarmupPolicies warmup_policies, CacheLimit cache_limit,
                                 bool storage_usage_tracking_enabled, bool eviction_enabled,
-                                EvictionConfig eviction_config, std::chrono::milliseconds loading_timeout) {
+                                EvictionConfig eviction_config, std::chrono::milliseconds loading_timeout,
+                                uint32_t prefetch_pool_threads) {
     static std::once_flag once;
     std::call_once(once, [&]() {
         Manager& manager = GetInstance();
@@ -34,6 +44,12 @@ Manager::ConfigureTieredStorage(CacheWarmupPolicies warmup_policies, CacheLimit 
         manager.storage_usage_tracking_enabled_ = storage_usage_tracking_enabled;
         manager.eviction_enabled_ = eviction_enabled;
         manager.loading_timeout_ = loading_timeout;
+
+        if (prefetch_pool_threads > 0) {
+            manager.prefetch_pool_ = std::make_shared<folly::CPUThreadPoolExecutor>(
+                prefetch_pool_threads, std::make_shared<folly::NamedThreadFactory>("milvus_prefetch"));
+            LOG_INFO("[MCL] Prefetch pool initialized with {} threads", prefetch_pool_threads);
+        }
 
         auto policy_str = warmup_policies.ToString();
         LOG_INFO(

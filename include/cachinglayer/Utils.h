@@ -230,6 +230,8 @@ struct CacheWarmupPolicies {
             switch (policy) {
                 case CacheWarmupPolicy::CacheWarmupPolicy_Sync:
                     return "Sync";
+                case CacheWarmupPolicy::CacheWarmupPolicy_Async:
+                    return "Async";
                 case CacheWarmupPolicy::CacheWarmupPolicy_Disable:
                     return "Disable";
                 default:
