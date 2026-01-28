@@ -71,7 +71,8 @@ enum ErrorCode {
     TextIndexNotFound = 2041,
     InvalidParameter = 2042,
     InsufficientResource = 2043,
-
+    NcsUploadError = 2044,
+    
     KnowhereError = 2099
 };
 
