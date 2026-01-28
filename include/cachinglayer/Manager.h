@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include <folly/executors/CPUThreadPoolExecutor.h>
+
 #include <memory>
 
 #include "cachinglayer/CacheSlot.h"
@@ -32,7 +34,9 @@ class Manager {
     static void
     ConfigureTieredStorage(CacheWarmupPolicies warmup_policies, CacheLimit cache_limit,
                            bool storage_usage_tracking_enabled, bool eviction_enabled, EvictionConfig eviction_config,
-                           std::chrono::milliseconds loading_timeout);
+                           std::chrono::milliseconds loading_timeout, uint32_t prefetch_pool_threads = 0);
+
+    ~Manager();
 
     Manager(const Manager&) = delete;
     Manager&
@@ -54,7 +58,7 @@ class Manager {
         auto cache_slot =
             std::make_shared<CacheSlot<CellT>>(std::move(translator), dlist_.get(), evictable, self_reserve,
                                                storage_usage_tracking_enabled_, loading_timeout_);
-        cache_slot->Warmup(ctx);
+        cache_slot->Warmup(ctx, prefetch_pool_);
         return cache_slot;
     }
 
@@ -123,10 +127,16 @@ class Manager {
         return eviction_enabled_;
     }
 
+    [[nodiscard]] std::shared_ptr<folly::CPUThreadPoolExecutor>
+    GetPrefetchPool() const {
+        return prefetch_pool_;
+    }
+
  private:
     Manager() = default;
 
     std::shared_ptr<internal::DList> dlist_{nullptr};
+    std::shared_ptr<folly::CPUThreadPoolExecutor> prefetch_pool_{nullptr};
     CacheWarmupPolicies warmup_policies_{};
     bool storage_usage_tracking_enabled_{false};
     bool eviction_enabled_{false};

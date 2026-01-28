@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <future>
 #include <memory>
 #include <random>
 #include <stdexcept>
@@ -1053,7 +1054,16 @@ class MockTranslatorWithWarmup : public Translator<TestCell> {
     std::vector<std::pair<cid_t, std::unique_ptr<TestCell>>>
     get_cells(milvus::OpContext* ctx, const std::vector<cid_t>& cids) override {
         get_cells_call_count_++;
+        if (shared_call_counter_) {
+            shared_call_counter_->fetch_add(1);
+        }
         last_ctx_ = ctx;
+
+        // Signal that loading has started
+        if (load_started_promise_) {
+            load_started_promise_->set_value();
+            load_started_promise_ = nullptr;
+        }
 
         std::vector<std::pair<cid_t, std::unique_ptr<TestCell>>> result;
         for (cid_t cid : cids) {
@@ -1069,6 +1079,13 @@ class MockTranslatorWithWarmup : public Translator<TestCell> {
             result.emplace_back(cid, std::make_unique<TestCell>(static_cast<int>(cid * 10), cid,
                                                                 estimated_byte_size_of_cell(cid).first));
         }
+
+        // Signal that loading has completed
+        if (load_completed_promise_) {
+            load_completed_promise_->set_value();
+            load_completed_promise_ = nullptr;
+        }
+
         return result;
     }
 
@@ -1089,6 +1106,24 @@ class MockTranslatorWithWarmup : public Translator<TestCell> {
         return last_ctx_;
     }
 
+    // Set a promise that will be signaled when loading starts
+    void
+    SetLoadStartedPromise(std::promise<void>* promise) {
+        load_started_promise_ = promise;
+    }
+
+    // Set a promise that will be signaled when loading completes
+    void
+    SetLoadCompletedPromise(std::promise<void>* promise) {
+        load_completed_promise_ = promise;
+    }
+
+    // Set a shared counter for tracking calls that outlives the translator
+    void
+    SetSharedCallCounter(std::shared_ptr<std::atomic<int>> counter) {
+        shared_call_counter_ = std::move(counter);
+    }
+
  private:
     std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map_;
     std::unordered_map<cid_t, int64_t> cell_sizes_;
@@ -1099,6 +1134,9 @@ class MockTranslatorWithWarmup : public Translator<TestCell> {
     std::unordered_map<cid_t, int> cid_load_delay_ms_;
     std::atomic<int> get_cells_call_count_ = 0;
     milvus::OpContext* last_ctx_ = nullptr;
+    std::promise<void>* load_started_promise_ = nullptr;
+    std::promise<void>* load_completed_promise_ = nullptr;
+    std::shared_ptr<std::atomic<int>> shared_call_counter_;
 };
 
 // Test that CreateCacheSlot throws when OpContext has a cancelled token
@@ -1279,4 +1317,287 @@ TEST(CacheSlotConstructionTest, CacheCellConstructionExceptionDoesNotCauseDouble
         std::runtime_error);
 
     // If we reach here without crashing, the fix is working
+}
+
+// ==================== Async Warmup Tests ====================
+
+// Test that async warmup with prefetch pool loads cells in background
+TEST(AsyncWarmupTest, AsyncWarmupWithPrefetchPoolLoadsInBackground) {
+    auto limit = ResourceUsage{10000, 0};
+    auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
+
+    std::vector<std::pair<cid_t, int64_t>> cell_sizes = {{0, 100}, {1, 100}, {2, 100}};
+    std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map = {{0, 0}, {1, 1}, {2, 2}};
+    auto translator =
+        std::make_unique<MockTranslatorWithWarmup>(cell_sizes, uid_to_cid_map, "async_warmup_slot", StorageType::MEMORY,
+                                                   CacheWarmupPolicy::CacheWarmupPolicy_Async);
+    auto* translator_ptr = translator.get();
+
+    // Set up promise to signal when loading completes
+    std::promise<void> load_completed;
+    auto load_completed_future = load_completed.get_future();
+    translator->SetLoadCompletedPromise(&load_completed);
+
+    // Create prefetch pool
+    auto prefetch_pool = std::make_shared<folly::CPUThreadPoolExecutor>(2);
+
+    // Create CacheSlot
+    auto cache_slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                                            std::chrono::milliseconds(100000));
+
+    // Warmup should return immediately (async)
+    cache_slot->Warmup(nullptr, prefetch_pool);
+
+    // Wait for async warmup to complete using synchronization
+    ASSERT_EQ(load_completed_future.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+
+    // Verify cells were loaded
+    EXPECT_EQ(translator_ptr->GetCellsCallCount(), 1);
+
+    // Verify cells are accessible
+    auto op_ctx = std::make_unique<milvus::OpContext>();
+    auto accessor = cache_slot->PinCellsDirect(op_ctx.get(), {0, 1, 2});
+    ASSERT_NE(accessor, nullptr);
+
+    for (cid_t cid = 0; cid < 3; ++cid) {
+        TestCell* cell = accessor->get_ith_cell(cid);
+        ASSERT_NE(cell, nullptr);
+        EXPECT_EQ(cell->cid, cid);
+    }
+
+    prefetch_pool->join();
+}
+
+// Test that async warmup without prefetch pool falls back to sync
+TEST(AsyncWarmupTest, AsyncWarmupWithoutPoolFallsBackToSync) {
+    auto limit = ResourceUsage{10000, 0};
+    auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
+
+    std::vector<std::pair<cid_t, int64_t>> cell_sizes = {{0, 100}, {1, 100}};
+    std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map = {{0, 0}, {1, 1}};
+    auto translator =
+        std::make_unique<MockTranslatorWithWarmup>(cell_sizes, uid_to_cid_map, "async_fallback_slot",
+                                                   StorageType::MEMORY, CacheWarmupPolicy::CacheWarmupPolicy_Async);
+    auto* translator_ptr = translator.get();
+
+    // Add delay to measure sync behavior - use longer delay to be robust on slow CI
+    translator->SetCidLoadDelay({{0, 100}, {1, 100}});
+
+    auto cache_slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                                            std::chrono::milliseconds(100000));
+
+    // Warmup with nullptr pool should fall back to sync and block
+    auto start = std::chrono::steady_clock::now();
+    cache_slot->Warmup(nullptr, nullptr);  // No prefetch pool
+    auto warmup_duration = std::chrono::steady_clock::now() - start;
+
+    // Should have blocked for the load duration (sync fallback)
+    // Use a conservative lower bound (half the expected delay) for CI robustness
+    EXPECT_GE(std::chrono::duration_cast<std::chrono::milliseconds>(warmup_duration).count(), 100);
+
+    // Verify cells were loaded synchronously
+    EXPECT_EQ(translator_ptr->GetCellsCallCount(), 1);
+}
+
+// Test that async warmup does not capture ctx (passes nullptr to get_cells)
+TEST(AsyncWarmupTest, AsyncWarmupDoesNotCaptureCtx) {
+    auto limit = ResourceUsage{10000, 0};
+    auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
+
+    std::vector<std::pair<cid_t, int64_t>> cell_sizes = {{0, 100}};
+    std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map = {{0, 0}};
+    auto translator =
+        std::make_unique<MockTranslatorWithWarmup>(cell_sizes, uid_to_cid_map, "async_no_ctx_slot", StorageType::MEMORY,
+                                                   CacheWarmupPolicy::CacheWarmupPolicy_Async);
+    auto* translator_ptr = translator.get();
+
+    // Set up promise to signal when loading completes
+    std::promise<void> load_completed;
+    auto load_completed_future = load_completed.get_future();
+    translator->SetLoadCompletedPromise(&load_completed);
+
+    auto prefetch_pool = std::make_shared<folly::CPUThreadPoolExecutor>(1);
+
+    auto cache_slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                                            std::chrono::milliseconds(100000));
+
+    // Create a context (should NOT be passed to async warmup)
+    auto op_ctx = std::make_unique<milvus::OpContext>();
+
+    cache_slot->Warmup(op_ctx.get(), prefetch_pool);
+
+    // Wait for async warmup to complete using synchronization
+    ASSERT_EQ(load_completed_future.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+
+    // Verify get_cells was called with nullptr ctx (not the original ctx)
+    EXPECT_EQ(translator_ptr->GetCellsCallCount(), 1);
+    EXPECT_EQ(translator_ptr->GetLastCtx(), nullptr);
+
+    prefetch_pool->join();
+}
+
+// Test that async warmup with weak_ptr skips warmup if slot is destroyed
+TEST(AsyncWarmupTest, AsyncWarmupSkipsIfSlotDestroyed) {
+    auto limit = ResourceUsage{10000, 0};
+    auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
+
+    // Use a shared counter that outlives the translator to track get_cells calls
+    auto get_cells_call_count = std::make_shared<std::atomic<int>>(0);
+
+    auto prefetch_pool = std::make_shared<folly::CPUThreadPoolExecutor>(1);
+
+    // Add a blocking task to hold up the single-threaded executor.
+    // This ensures our warmup task won't run until we release the blocker.
+    std::promise<void> blocker;
+    auto blocker_future = blocker.get_future();
+    prefetch_pool->add([&blocker_future]() { blocker_future.wait(); });
+
+    {
+        std::vector<std::pair<cid_t, int64_t>> cell_sizes = {{0, 100}, {1, 100}};
+        std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map = {{0, 0}, {1, 1}};
+        auto translator =
+            std::make_unique<MockTranslatorWithWarmup>(cell_sizes, uid_to_cid_map, "async_weak_ptr_slot",
+                                                       StorageType::MEMORY, CacheWarmupPolicy::CacheWarmupPolicy_Async);
+        // Set shared counter for tracking calls after translator is destroyed
+        translator->SetSharedCallCounter(get_cells_call_count);
+
+        auto cache_slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                                                std::chrono::milliseconds(100000));
+
+        // Start async warmup - task is queued behind the blocking task
+        cache_slot->Warmup(nullptr, prefetch_pool);
+
+        // The slot will be destroyed here, while the warmup task is still queued
+    }  // cache_slot destroyed here, translator destroyed too
+
+    // Now release the blocker - the warmup task can run
+    blocker.set_value();
+
+    // Wait for all tasks to complete
+    prefetch_pool->join();
+
+    // get_cells should NOT have been called because slot was destroyed
+    // before the warmup task had a chance to run (weak_ptr::lock() returned nullptr)
+    EXPECT_EQ(get_cells_call_count->load(), 0);
+}
+
+// Test that access to cells during async warmup blocks until loaded
+TEST(AsyncWarmupTest, AccessDuringAsyncWarmupBlocks) {
+    auto limit = ResourceUsage{10000, 0};
+    auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
+
+    std::vector<std::pair<cid_t, int64_t>> cell_sizes = {{0, 100}, {1, 100}};
+    std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map = {{0, 0}, {1, 1}};
+    auto translator =
+        std::make_unique<MockTranslatorWithWarmup>(cell_sizes, uid_to_cid_map, "async_blocking_slot",
+                                                   StorageType::MEMORY, CacheWarmupPolicy::CacheWarmupPolicy_Async);
+
+    // Set up promise to signal when loading starts (so we know warmup is in progress)
+    std::promise<void> load_started;
+    auto load_started_future = load_started.get_future();
+    translator->SetLoadStartedPromise(&load_started);
+
+    // Add delay to ensure warmup takes time - use longer delay for CI robustness
+    translator->SetCidLoadDelay({{0, 200}, {1, 200}});
+
+    auto prefetch_pool = std::make_shared<folly::CPUThreadPoolExecutor>(1);
+
+    auto cache_slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                                            std::chrono::milliseconds(100000));
+
+    // Start async warmup
+    cache_slot->Warmup(nullptr, prefetch_pool);
+
+    // Wait for loading to actually start before accessing
+    ASSERT_EQ(load_started_future.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+
+    // Now try to access cells - should block until loading completes
+    auto op_ctx = std::make_unique<milvus::OpContext>();
+    auto start = std::chrono::steady_clock::now();
+    auto accessor = cache_slot->PinCellsDirect(op_ctx.get(), {0, 1});
+    auto access_duration = std::chrono::steady_clock::now() - start;
+
+    ASSERT_NE(accessor, nullptr);
+
+    // Access should have blocked waiting for warmup to complete
+    // Use conservative lower bound for CI robustness
+    EXPECT_GE(std::chrono::duration_cast<std::chrono::milliseconds>(access_duration).count(), 100);
+
+    // Verify cells are valid
+    TestCell* cell0 = accessor->get_ith_cell(0);
+    TestCell* cell1 = accessor->get_ith_cell(1);
+    ASSERT_NE(cell0, nullptr);
+    ASSERT_NE(cell1, nullptr);
+    EXPECT_EQ(cell0->cid, 0);
+    EXPECT_EQ(cell1->cid, 1);
+
+    prefetch_pool->join();
+}
+
+// Test sync warmup still works (regression test)
+TEST(AsyncWarmupTest, SyncWarmupStillWorks) {
+    auto limit = ResourceUsage{10000, 0};
+    auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
+
+    std::vector<std::pair<cid_t, int64_t>> cell_sizes = {{0, 100}, {1, 100}};
+    std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map = {{0, 0}, {1, 1}};
+    auto translator = std::make_unique<MockTranslatorWithWarmup>(
+        cell_sizes, uid_to_cid_map, "sync_warmup_slot", StorageType::MEMORY, CacheWarmupPolicy::CacheWarmupPolicy_Sync);
+    auto* translator_ptr = translator.get();
+
+    auto prefetch_pool = std::make_shared<folly::CPUThreadPoolExecutor>(1);
+
+    auto cache_slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                                            std::chrono::milliseconds(100000));
+
+    auto op_ctx = std::make_unique<milvus::OpContext>();
+
+    // Sync warmup should load cells synchronously (even with prefetch pool provided)
+    cache_slot->Warmup(op_ctx.get(), prefetch_pool);
+
+    // Cells should be loaded immediately after Warmup returns
+    EXPECT_EQ(translator_ptr->GetCellsCallCount(), 1);
+    EXPECT_EQ(translator_ptr->GetLastCtx(), op_ctx.get());  // ctx should be passed for sync
+
+    // Access should be immediate (no waiting)
+    auto accessor = cache_slot->PinCellsDirect(op_ctx.get(), {0, 1});
+    ASSERT_NE(accessor, nullptr);
+
+    TestCell* cell0 = accessor->get_ith_cell(0);
+    ASSERT_NE(cell0, nullptr);
+    EXPECT_EQ(cell0->cid, 0);
+
+    prefetch_pool->join();
+}
+
+// Test disabled warmup still works (regression test)
+TEST(AsyncWarmupTest, DisabledWarmupStillWorks) {
+    auto limit = ResourceUsage{10000, 0};
+    auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
+
+    std::vector<std::pair<cid_t, int64_t>> cell_sizes = {{0, 100}, {1, 100}};
+    std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map = {{0, 0}, {1, 1}};
+    auto translator =
+        std::make_unique<MockTranslatorWithWarmup>(cell_sizes, uid_to_cid_map, "disabled_warmup_slot",
+                                                   StorageType::MEMORY, CacheWarmupPolicy::CacheWarmupPolicy_Disable);
+    auto* translator_ptr = translator.get();
+
+    auto prefetch_pool = std::make_shared<folly::CPUThreadPoolExecutor>(1);
+
+    auto cache_slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                                            std::chrono::milliseconds(100000));
+
+    // Disabled warmup should not load any cells
+    cache_slot->Warmup(nullptr, prefetch_pool);
+
+    EXPECT_EQ(translator_ptr->GetCellsCallCount(), 0);
+
+    // Cells should be loaded on-demand
+    auto op_ctx = std::make_unique<milvus::OpContext>();
+    auto accessor = cache_slot->PinCellsDirect(op_ctx.get(), {0});
+    ASSERT_NE(accessor, nullptr);
+
+    EXPECT_EQ(translator_ptr->GetCellsCallCount(), 1);
+
+    prefetch_pool->join();
 }
