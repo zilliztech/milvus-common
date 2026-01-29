@@ -215,8 +215,8 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         if (std::holds_alternative<internal::ListNode::NodePin>(result)) {
             std::vector<internal::ListNode::NodePin> pins;
             pins.push_back(std::get<internal::ListNode::NodePin>(std::move(result)));
-            if (ctx && storage_usage_tracking_enabled_) {
-                ctx->storage_usage.scanned_total_bytes.fetch_add(cell_storage_bytes);
+            if (storage_usage_tracking_enabled_ && ctx && ctx->storage_usage) {
+                ctx->storage_usage->scanned_total_bytes.fetch_add(cell_storage_bytes);
             }
             return std::make_shared<CellAccessor<CellT>>(this->shared_from_this(), std::move(pins));
         } else {
@@ -226,9 +226,9 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             }
             std::vector<internal::ListNode::NodePin> pins;
             pins.push_back(SemiInlineGet(std::move(pin_future)));
-            if (ctx && storage_usage_tracking_enabled_) {
-                ctx->storage_usage.scanned_cold_bytes.fetch_add(cell_storage_bytes);
-                ctx->storage_usage.scanned_total_bytes.fetch_add(cell_storage_bytes);
+            if (storage_usage_tracking_enabled_ && ctx && ctx->storage_usage) {
+                ctx->storage_usage->scanned_cold_bytes.fetch_add(cell_storage_bytes);
+                ctx->storage_usage->scanned_total_bytes.fetch_add(cell_storage_bytes);
             }
             return std::make_shared<CellAccessor<CellT>>(this->shared_from_this(), std::move(pins));
         }
@@ -369,12 +369,12 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             }
         }
 
-        if (ctx && storage_usage_tracking_enabled_) {
+        if (storage_usage_tracking_enabled_ && ctx && ctx->storage_usage) {
             if (!need_load_cids.empty()) {
                 std::vector<cid_t> need_load_cids_vec(need_load_cids.begin(), need_load_cids.end());
-                ctx->storage_usage.scanned_cold_bytes.fetch_add(translator_->cells_storage_bytes(need_load_cids_vec));
+                ctx->storage_usage->scanned_cold_bytes.fetch_add(translator_->cells_storage_bytes(need_load_cids_vec));
             }
-            ctx->storage_usage.scanned_total_bytes.fetch_add(translator_->cells_storage_bytes(cids));
+            ctx->storage_usage->scanned_total_bytes.fetch_add(translator_->cells_storage_bytes(cids));
         }
 
         return std::make_shared<CellAccessor<CellT>>(this->shared_from_this(), std::move(all_pins));
