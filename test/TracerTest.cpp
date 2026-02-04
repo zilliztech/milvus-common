@@ -170,6 +170,8 @@ TEST(Tracer, OTLPInvalidMethod) {
     initTelemetry(*config);
     auto span = StartSpan("test_otlp_invalid");
     // Should fall back to noop provider when export creation fails
+    // Span should never be nullptr, but should be non-recording
+    ASSERT_NE(span, nullptr);
     ASSERT_FALSE(span->IsRecording());
 }
 
@@ -199,6 +201,8 @@ TEST(Tracer, OTLPEmptyExporter) {
     initTelemetry(*config);
     auto span = StartSpan("test_empty_exporter");
     // Should fall back to noop provider
+    // Span should never be nullptr, but should be non-recording
+    ASSERT_NE(span, nullptr);
     ASSERT_FALSE(span->IsRecording());
 }
 
@@ -210,6 +214,8 @@ TEST(Tracer, OTLPInvalidExporter) {
     initTelemetry(*config);
     auto span = StartSpan("test_invalid_exporter");
     // Should fall back to noop provider
+    // Span should never be nullptr, but should be non-recording
+    ASSERT_NE(span, nullptr);
     ASSERT_FALSE(span->IsRecording());
 }
 
@@ -235,4 +241,147 @@ TEST(Tracer, OTLPHeadersParsingEdgeCases) {
     std::string null_json = "null";
     headers_map = parseHeaders(null_json);
     ASSERT_TRUE(headers_map.empty());
+}
+
+TEST(Tracer, IsTraceEnabled) {
+    // Enable tracing
+    auto config = std::make_shared<TraceConfig>();
+    config->exporter = "stdout";
+    config->nodeID = 1;
+    initTelemetry(*config);
+    ASSERT_TRUE(IsTraceEnabled());
+
+    // Disable tracing with noop exporter
+    config = std::make_shared<TraceConfig>();
+    config->exporter = "noop";
+    config->nodeID = 1;
+    initTelemetry(*config);
+    ASSERT_FALSE(IsTraceEnabled());
+
+    // Disable tracing with empty exporter
+    config = std::make_shared<TraceConfig>();
+    config->exporter = "";
+    config->nodeID = 1;
+    initTelemetry(*config);
+    ASSERT_FALSE(IsTraceEnabled());
+}
+
+TEST(Tracer, DisabledTracingReturnsNoopSpan) {
+    // Disable tracing
+    auto config = std::make_shared<TraceConfig>();
+    config->exporter = "noop";
+    config->nodeID = 1;
+    initTelemetry(*config);
+    ASSERT_FALSE(IsTraceEnabled());
+
+    // StartSpan should return noop span, not nullptr
+    auto span = StartSpan("test_disabled");
+    ASSERT_NE(span, nullptr);
+    ASSERT_FALSE(span->IsRecording());
+
+    // Should be safe to call methods on the noop span
+    span->SetAttribute("key", "value");
+    span->AddEvent("event");
+    span->End();
+
+    // StartSpan with TraceContext should also return noop span
+    auto ctx = std::make_shared<TraceContext>();
+    ctx->traceID = new uint8_t[16]{0};
+    ctx->spanID = new uint8_t[8]{0};
+    ctx->traceFlags = 0;
+    span = StartSpan("test_disabled_with_ctx", ctx.get());
+    ASSERT_NE(span, nullptr);
+    ASSERT_FALSE(span->IsRecording());
+    delete[] ctx->traceID;
+    delete[] ctx->spanID;
+
+    // StartSpan with parent span should also return noop span
+    auto parent = StartSpan("parent");
+    auto child = StartSpan("child", parent);
+    ASSERT_NE(child, nullptr);
+    ASSERT_FALSE(child->IsRecording());
+}
+
+TEST(Tracer, AutoSpanGetSpanReturnsNoopWhenDisabled) {
+    // Disable tracing
+    auto config = std::make_shared<TraceConfig>();
+    config->exporter = "noop";
+    config->nodeID = 1;
+    initTelemetry(*config);
+    ASSERT_FALSE(IsTraceEnabled());
+
+    // AutoSpan::GetSpan should return noop span, not nullptr
+    {
+        AutoSpan span("test_auto_span", nullptr, false);
+        auto inner_span = span.GetSpan();
+        ASSERT_NE(inner_span, nullptr);
+        ASSERT_FALSE(inner_span->IsRecording());
+
+        // Should be safe to call methods - this is the critical test
+        // that prevents NPE in code like: span.GetSpan()->SetAttribute(...)
+        inner_span->SetAttribute("data_type", 1);
+        inner_span->SetAttribute("key", "value");
+        inner_span->AddEvent("event");
+    }
+
+    // Test with parent span parameter
+    {
+        auto parent = StartSpan("parent");
+        AutoSpan span("test_auto_span_with_parent", parent, false);
+        auto inner_span = span.GetSpan();
+        ASSERT_NE(inner_span, nullptr);
+        ASSERT_FALSE(inner_span->IsRecording());
+        inner_span->SetAttribute("test", 123);
+    }
+
+    // Test with root span flag
+    {
+        AutoSpan span("test_root_span", nullptr, true);
+        auto inner_span = span.GetSpan();
+        ASSERT_NE(inner_span, nullptr);
+        inner_span->SetAttribute("is_root", true);
+    }
+}
+
+TEST(Tracer, AutoSpanGetSpanReturnsRealSpanWhenEnabled) {
+    // Enable tracing
+    auto config = std::make_shared<TraceConfig>();
+    config->exporter = "stdout";
+    config->nodeID = 1;
+    initTelemetry(*config);
+    ASSERT_TRUE(IsTraceEnabled());
+
+    // AutoSpan::GetSpan should return real recording span
+    {
+        AutoSpan span("test_enabled_auto_span", nullptr, false);
+        auto inner_span = span.GetSpan();
+        ASSERT_NE(inner_span, nullptr);
+        ASSERT_TRUE(inner_span->IsRecording());
+        inner_span->SetAttribute("data_type", 1);
+    }
+}
+
+TEST(Tracer, NoopSpanMethodsAreSafe) {
+    // Disable tracing
+    auto config = std::make_shared<TraceConfig>();
+    config->exporter = "";
+    config->nodeID = 1;
+    initTelemetry(*config);
+
+    auto span = StartSpan("noop_test");
+    ASSERT_NE(span, nullptr);
+
+    // All these operations should be safe (no crash, no side effects)
+    span->SetAttribute("string_attr", "value");
+    span->SetAttribute("int_attr", 42);
+    span->SetAttribute("double_attr", 3.14);
+    span->SetAttribute("bool_attr", true);
+    span->AddEvent("test_event");
+    span->SetStatus(opentelemetry::trace::StatusCode::kOk, "ok");
+    span->UpdateName("new_name");
+
+    auto ctx = span->GetContext();
+    ASSERT_FALSE(ctx.IsValid());
+
+    span->End();
 }

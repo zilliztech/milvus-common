@@ -52,6 +52,12 @@ namespace otlp = opentelemetry::exporter::otlp;
 static std::atomic<bool> enable_trace = true;
 static std::shared_ptr<trace::TracerProvider> noop_trace_provider =
     std::make_shared<opentelemetry::trace::NoopTracerProvider>();
+static std::shared_ptr<trace::Span> noop_span = noop_trace_provider->GetTracer("noop")->StartSpan("noop");
+
+bool
+IsTraceEnabled() {
+    return enable_trace.load(std::memory_order_relaxed);
+}
 
 void
 initTelemetry(const TraceConfig& cfg) {
@@ -120,8 +126,11 @@ GetTracer() {
 
 std::shared_ptr<trace::Span>
 StartSpan(const std::string& name, TraceContext* parentCtx) {
+    if (!IsTraceEnabled()) {
+        return noop_span;
+    }
     trace::StartSpanOptions opts;
-    if (enable_trace.load() && parentCtx != nullptr && parentCtx->traceID != nullptr && parentCtx->spanID != nullptr) {
+    if (parentCtx != nullptr && parentCtx->traceID != nullptr && parentCtx->spanID != nullptr) {
         if (EmptyTraceID(parentCtx) || EmptySpanID(parentCtx)) {
             return noop_trace_provider->GetTracer("noop")->StartSpan("noop");
         }
@@ -134,6 +143,9 @@ StartSpan(const std::string& name, TraceContext* parentCtx) {
 
 std::shared_ptr<trace::Span>
 StartSpan(const std::string& name, const std::shared_ptr<trace::Span>& span) {
+    if (!IsTraceEnabled()) {
+        return noop_span;
+    }
     trace::StartSpanOptions opts;
     if (span != nullptr) {
         opts.parent = span->GetContext();
@@ -253,7 +265,11 @@ GetSpanIDAsHexStr(const TraceContext* ctx) {
     }
 }
 
-AutoSpan::AutoSpan(const std::string& name, TraceContext* ctx, bool is_root_span) : is_root_span_(is_root_span) {
+AutoSpan::AutoSpan(const std::string& name, TraceContext* ctx, bool is_root_span)
+    : span_(nullptr), is_root_span_(is_root_span) {
+    if (!IsTraceEnabled()) {
+        return;
+    }
     span_ = StartSpan(name, ctx);
     if (is_root_span) {
         SetRootSpan(span_);
@@ -261,9 +277,13 @@ AutoSpan::AutoSpan(const std::string& name, TraceContext* ctx, bool is_root_span
 }
 
 AutoSpan::AutoSpan(const std::string& name, const std::shared_ptr<trace::Span>& parent, bool set_as_temp_root)
-    : is_root_span_(false), set_as_temp_root_(set_as_temp_root) {
+    : span_(nullptr), is_root_span_(false), set_as_temp_root_(false) {
+    if (!IsTraceEnabled()) {
+        return;
+    }
+    set_as_temp_root_ = set_as_temp_root;
     span_ = StartSpan(name, parent);
-    if (set_as_temp_root_ && enable_trace.load()) {
+    if (set_as_temp_root_) {
         previous_root_ = GetRootSpan();
         SetRootSpan(span_);
     }
@@ -271,6 +291,9 @@ AutoSpan::AutoSpan(const std::string& name, const std::shared_ptr<trace::Span>& 
 
 std::shared_ptr<trace::Span>
 AutoSpan::GetSpan() {
+    if (span_ == nullptr) {
+        return noop_span;
+    }
     return span_;
 }
 

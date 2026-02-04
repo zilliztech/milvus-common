@@ -44,6 +44,9 @@ namespace trace = opentelemetry::trace;
 void
 initTelemetry(const TraceConfig& cfg);
 
+bool
+IsTraceEnabled();
+
 std::shared_ptr<trace::Tracer>
 GetTracer();
 
