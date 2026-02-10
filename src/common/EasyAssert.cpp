@@ -20,7 +20,7 @@
 #include <iostream>
 #include <sstream>
 
-#include "fmt/core.h"
+#include "fmt/format.h"
 
 namespace milvus::impl {
 

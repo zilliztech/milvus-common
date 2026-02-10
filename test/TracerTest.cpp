@@ -17,6 +17,16 @@ TEST(Tracer, Init) {
     auto span = StartSpan("test");
     ASSERT_TRUE(span->IsRecording());
 
+    // "jaeger" exporter falls back to otlp http, using otlpEndpoint
+    config = std::make_shared<TraceConfig>();
+    config->exporter = "jaeger";
+    config->otlpEndpoint = "http://localhost:4318/v1/traces";
+    config->nodeID = 1;
+    initTelemetry(*config);
+    span = StartSpan("test");
+    ASSERT_TRUE(span->IsRecording());
+
+    // "jaeger" exporter falls back to otlp http, using jaegerURL as fallback
     config = std::make_shared<TraceConfig>();
     config->exporter = "jaeger";
     config->jaegerURL = "http://localhost:14268/api/traces";
@@ -119,6 +129,7 @@ TEST(Tracer, OTLPHttpExporter) {
     ASSERT_TRUE(span->IsRecording());
 }
 
+#ifdef HAVE_OTLP_GRPC_EXPORTER
 TEST(Tracer, OTLPGrpcExporter) {
     auto config = std::make_shared<TraceConfig>();
     config->exporter = "otlp";
@@ -145,11 +156,13 @@ TEST(Tracer, OTLPGrpcExporter) {
     span = StartSpan("test_otlp_grpc_empty_headers");
     ASSERT_TRUE(span->IsRecording());
 }
+#endif
 
+#ifdef HAVE_OTLP_GRPC_EXPORTER
 TEST(Tracer, OTLPLegacyConfiguration) {
     auto config = std::make_shared<TraceConfig>();
     config->exporter = "otlp";
-    config->otlpMethod = "";  // legacy configuration
+    config->otlpMethod = "";  // legacy configuration defaults to gRPC
     config->otlpEndpoint = "localhost:4317";
     config->otlpHeaders = R"({"legacy": "header"})";
     config->oltpSecure = false;
@@ -159,6 +172,7 @@ TEST(Tracer, OTLPLegacyConfiguration) {
     auto span = StartSpan("test_otlp_legacy");
     ASSERT_TRUE(span->IsRecording());
 }
+#endif
 
 TEST(Tracer, OTLPInvalidMethod) {
     auto config = std::make_shared<TraceConfig>();

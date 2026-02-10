@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <exception>
 #include <flat_hash_map/flat_hash_map.hpp>
+#include <fmt/ranges.h>
 #include <memory>
 #include <numeric>
 #include <type_traits>

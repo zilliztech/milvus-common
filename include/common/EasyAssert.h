@@ -23,7 +23,7 @@
 #include <string_view>
 
 #include "common/common_type_c.h"
-#include "fmt/core.h"
+#include "fmt/format.h"
 
 /* Paste this on the file if you want to debug. */
 namespace milvus {

@@ -10,7 +10,7 @@
 // or implied. See the License for the specific language governing permissions and limitations under the License
 #include "cachinglayer/lrucache/ListNode.h"
 
-#include <fmt/core.h>
+#include <fmt/format.h>
 #include <folly/ExceptionWrapper.h>
 #include <folly/futures/Future.h>
 #include <folly/futures/SharedPromise.h>

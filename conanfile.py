@@ -14,19 +14,21 @@ required_conan_version = ">=1.55.0"
 class MilvusCommonConan(ConanFile):
     settings = "os", "compiler", "build_type", "arch"
     requires = (
-        "gtest/1.13.0#f9548be18a41ccc6367efcb8146e92be",
-        "glog/0.6.0#d22ebf9111fed68de86b0fa6bf6f9c3f",
-        "fmt/9.1.0#95259249fb7ef8c6b5674a40b00abba3",
-        "prometheus-cpp/1.1.0#ea9b101cb785943adb40ad82eda7856c",
-        "libcurl/7.86.0#bbc887fae3341b3cb776c601f814df05",
-        "gflags/2.2.2#b15c28c567c7ade7449cf994168a559f",
-        "opentelemetry-cpp/1.8.1.1@milvus/2.4#7345034855d593047826b0c74d9a0ced",
-        "xz_utils/5.4.0#a6d90890193dc851fa0d470163271c7a",
-        "zlib/1.2.13#df233e6bed99052f285331b9f54d9070",
-        "libevent/2.1.12#4fd19d10d3bed63b3a8952c923454bc0",
-        "openssl/3.1.2#02594c4c0a6e2b4feb3cd15119993597",
-        "folly/2023.10.30.10@milvus/dev",
-        "boost/1.82.0"
+        "gtest/1.15.0",
+        "glog/0.7.1",
+        "fmt/11.0.2",
+        "prometheus-cpp/1.2.4",
+        "libcurl/8.10.1",
+        "gflags/2.2.2",
+        "opentelemetry-cpp/1.23.0@milvus/dev",
+        "grpc/1.67.1@milvus/dev",
+        "abseil/20250127.0",
+        "xz_utils/5.4.5",
+        "zlib/1.3.1",
+        "libevent/2.1.12",
+        "openssl/3.3.2",
+        "folly/2024.08.12.00",
+        "boost/1.83.0"
     )
 
     options = {
@@ -40,7 +42,8 @@ class MilvusCommonConan(ConanFile):
         "glog:with_gflags": True,
         "glog:shared": True,
         "prometheus-cpp:with_pull": False,
-        "fmt:header_only": True,
+        "fmt:header_only": False,
+        "opentelemetry-cpp:with_stl": True,
         "with_ut": False,
         "with_asan": False,
     }
@@ -48,14 +51,13 @@ class MilvusCommonConan(ConanFile):
     def configure(self):
         if self.settings.arch not in ("x86_64", "x86"):
             del self.options["folly"].use_sse4_2
-        if self.settings.os == "Macos":
-            # By default abseil use static link but can not be compatible with macos X86
-            self.options["abseil"].shared = True
-            self.options["arrow"].with_jemalloc = False
 
     def requirements(self):
+        # Force all dependencies to use protobuf from milvus/dev channel
+        # This is needed to resolve conflicts between opentelemetry-cpp and grpc
+        self.requires("protobuf/5.27.0@milvus/dev", force=True, override=True)
         if self.settings.os != "Macos":
-            self.requires("libunwind/1.7.2")
+            self.requires("libunwind/1.8.1")
 
     @property
     def _minimum_cpp_standard(self):
@@ -69,6 +71,8 @@ class MilvusCommonConan(ConanFile):
         )
         # Relocatable shared lib on Macos
         tc.cache_variables["CMAKE_POLICY_DEFAULT_CMP0042"] = "NEW"
+        # CMake 4.x removed compatibility with cmake_minimum_required < 3.5
+        tc.cache_variables["CMAKE_POLICY_VERSION_MINIMUM"] = "3.5"
         # Honor BUILD_SHARED_LIBS from conan_toolchain (see https://github.com/conan-io/conan/issues/11840)
         tc.cache_variables["CMAKE_POLICY_DEFAULT_CMP0077"] = "NEW"
 

@@ -10,8 +10,6 @@
 # or implied. See the License for the specific language governing permissions and limitations under the License
 
 
-find_package(GTest CONFIG REQUIRED)
-find_package(OpenMP REQUIRED)
 find_package(BLAS REQUIRED)
 
 set(CACHINGLAYER_TEST_FILES
@@ -36,9 +34,10 @@ target_link_libraries(cachinglayer_test
     milvus-common
     ${COMMON_LINKER_LIBS}
     pthread
-    atomic
-    gomp
-    openblas
+    ${BLAS_LIBRARIES}
 )
+if(NOT APPLE)
+    target_link_libraries(cachinglayer_test atomic gomp)
+endif()
 
 install(TARGETS cachinglayer_test DESTINATION unittest)

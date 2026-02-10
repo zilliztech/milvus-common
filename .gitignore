@@ -55,6 +55,28 @@ coverage/
 *.bin
 
 CMakeUserPresets.json
+CMakePresets.json
+
+# Conan generated files
+conan.lock
+conan_toolchain.cmake
+conanbuildinfo.txt
+conaninfo.txt
+cmakedeps_macros.cmake
+graph_info.json
+*.pc
+*-Target-release.cmake
+*-release-*-data.cmake
+*-config.cmake
+*-config-version.cmake
+*Config.cmake
+*ConfigVersion.cmake
+*Targets.cmake
+Find*.cmake
+
+# Build cache
+.cache/
+.build/
 
 # python
 .eggs

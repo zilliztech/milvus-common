@@ -549,7 +549,7 @@ DList::removeItem(ListNode* list_node, ResourceUsage size) {
 void
 DList::freezeItem(ListNode* list_node [[maybe_unused]], ResourceUsage size) {
     AssertInfo(list_node->pin_count_ > 0, "[MCL] freezeItem should be called on a cell with pin_count_ > 0, but got {}",
-               list_node->pin_count_);
+               list_node->pin_count_.load());
     evictable_size_ -= size;
     ClampNonNegative(evictable_size_, [&](const ResourceUsage& curr) {
         LOG_ERROR(

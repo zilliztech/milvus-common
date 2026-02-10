@@ -17,7 +17,7 @@
 #include "log/Log.h"
 
 #include "common/EasyAssert.h"
-#include "fmt/core.h"
+#include "fmt/format.h"
 
 /*
  * INITIALIZE_EASYLOGGINGPP will create a global variable whose name is same to that already created in knowhere,
