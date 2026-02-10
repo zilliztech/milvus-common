@@ -1399,8 +1399,8 @@ TEST(AsyncWarmupTest, AsyncWarmupWithoutPoolFallsBackToSync) {
     EXPECT_EQ(translator_ptr->GetCellsCallCount(), 1);
 }
 
-// Test that async warmup does not capture ctx (passes nullptr to get_cells)
-TEST(AsyncWarmupTest, AsyncWarmupDoesNotCaptureCtx) {
+// Test that async warmup does not capture the caller's ctx (uses its own warmup ctx)
+TEST(AsyncWarmupTest, AsyncWarmupDoesNotCaptureCallerCtx) {
     auto limit = ResourceUsage{10000, 0};
     auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
 
@@ -1429,9 +1429,10 @@ TEST(AsyncWarmupTest, AsyncWarmupDoesNotCaptureCtx) {
     // Wait for async warmup to complete using synchronization
     ASSERT_EQ(load_completed_future.wait_for(std::chrono::seconds(5)), std::future_status::ready);
 
-    // Verify get_cells was called with nullptr ctx (not the original ctx)
+    // Verify get_cells was called with its own warmup ctx, not the caller's ctx
     EXPECT_EQ(translator_ptr->GetCellsCallCount(), 1);
-    EXPECT_EQ(translator_ptr->GetLastCtx(), nullptr);
+    EXPECT_NE(translator_ptr->GetLastCtx(), nullptr);
+    EXPECT_NE(translator_ptr->GetLastCtx(), op_ctx.get());
 
     prefetch_pool->join();
 }
@@ -1532,6 +1533,86 @@ TEST(AsyncWarmupTest, AccessDuringAsyncWarmupBlocks) {
     EXPECT_EQ(cell1->cid, 1);
 
     prefetch_pool->join();
+}
+
+// Test that CancelWarmup stops an in-progress async warmup
+TEST(AsyncWarmupTest, CancelWarmupStopsAsyncWarmup) {
+    auto limit = ResourceUsage{10000, 0};
+    auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
+
+    std::vector<std::pair<cid_t, int64_t>> cell_sizes = {{0, 100}, {1, 100}, {2, 100}};
+    std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map = {{0, 0}, {1, 1}, {2, 2}};
+    auto translator =
+        std::make_unique<MockTranslatorWithWarmup>(cell_sizes, uid_to_cid_map, "cancel_warmup_slot",
+                                                   StorageType::MEMORY, CacheWarmupPolicy::CacheWarmupPolicy_Async);
+
+    // Set up promise to signal when loading starts
+    std::promise<void> load_started;
+    auto load_started_future = load_started.get_future();
+    translator->SetLoadStartedPromise(&load_started);
+
+    // Add significant delay so we can cancel mid-warmup
+    translator->SetCidLoadDelay({{0, 50}, {1, 500}, {2, 500}});
+
+    auto prefetch_pool = std::make_shared<folly::CPUThreadPoolExecutor>(1);
+
+    auto cache_slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                                            std::chrono::milliseconds(100000));
+
+    // Start async warmup
+    cache_slot->Warmup(nullptr, prefetch_pool);
+
+    // Wait for loading to start
+    ASSERT_EQ(load_started_future.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+
+    // Cancel the warmup while it's in progress
+    cache_slot->CancelWarmup();
+
+    // The warmup task should finish quickly (cancelled, not waiting for remaining cells)
+    auto start = std::chrono::steady_clock::now();
+    prefetch_pool->join();
+    auto duration = std::chrono::steady_clock::now() - start;
+
+    // Should complete much faster than the full 1000ms+ of delays
+    EXPECT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(duration).count(), 800);
+}
+
+// Test that CancelWarmup before async warmup starts prevents loading
+TEST(AsyncWarmupTest, CancelWarmupBeforeStartPreventsLoading) {
+    auto limit = ResourceUsage{10000, 0};
+    auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
+
+    auto get_cells_call_count = std::make_shared<std::atomic<int>>(0);
+
+    auto prefetch_pool = std::make_shared<folly::CPUThreadPoolExecutor>(1);
+
+    // Add a blocking task to hold up the single-threaded executor
+    std::promise<void> blocker;
+    auto blocker_future = blocker.get_future();
+    prefetch_pool->add([&blocker_future]() { blocker_future.wait(); });
+
+    std::vector<std::pair<cid_t, int64_t>> cell_sizes = {{0, 100}, {1, 100}};
+    std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map = {{0, 0}, {1, 1}};
+    auto translator =
+        std::make_unique<MockTranslatorWithWarmup>(cell_sizes, uid_to_cid_map, "cancel_before_start_slot",
+                                                   StorageType::MEMORY, CacheWarmupPolicy::CacheWarmupPolicy_Async);
+    translator->SetSharedCallCounter(get_cells_call_count);
+
+    auto cache_slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                                            std::chrono::milliseconds(100000));
+
+    // Queue async warmup (blocked behind the blocker task)
+    cache_slot->Warmup(nullptr, prefetch_pool);
+
+    // Cancel before the warmup task gets to run
+    cache_slot->CancelWarmup();
+
+    // Release the blocker - warmup task should see cancellation and skip loading
+    blocker.set_value();
+    prefetch_pool->join();
+
+    // get_cells should NOT have been called because cancellation was requested before the task ran
+    EXPECT_EQ(get_cells_call_count->load(), 0);
 }
 
 // Test sync warmup still works (regression test)

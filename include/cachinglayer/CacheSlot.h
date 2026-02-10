@@ -84,6 +84,11 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     // Access to cells before warmup completes will block until the cell is loaded.
     void
     Warmup(OpContext* ctx, const std::shared_ptr<folly::CPUThreadPoolExecutor>& prefetch_pool = nullptr) {
+        bool expected = false;
+        if (!warmup_called_.compare_exchange_strong(expected, true)) {
+            LOG_WARN("[MCL] Warmup called more than once, ignoring. key={}", translator_->key());
+            return;
+        }
         auto warmup_policy = translator_->meta()->cache_warmup_policy;
 
         switch (warmup_policy) {
@@ -95,19 +100,21 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
 
                 if (prefetch_pool) {
                     std::weak_ptr<CacheSlot<CellT>> weak_self = this->shared_from_this();
-                    prefetch_pool->add([weak_self, cids = std::move(cids)]() {
+                    auto token = warmup_cancel_source_.getToken();
+                    prefetch_pool->add([weak_self, cids = std::move(cids), token]() {
                         try {
                             auto self = weak_self.lock();
-                            if (!self) {
-                                // CacheSlot was destroyed, skip warmup
+                            if (!self || token.isCancellationRequested()) {
                                 return;
                             }
-                            // Note: ctx is not captured - async warmup doesn't track storage usage
-                            self->PinCellsDirect(nullptr, cids);
+                            OpContext warmup_ctx(token);
+                            self->PinCellsDirect(&warmup_ctx, cids);
                             // If the slot is not evictable, we don't need to pin the cells anymore after warmup.
                             self->skip_pin_.store(!self->evictable_, std::memory_order_release);
                         } catch (const std::exception& e) {
-                            LOG_ERROR("[MCL] Async warmup failed: {}", e.what());
+                            if (!token.isCancellationRequested()) {
+                                LOG_ERROR("[MCL] Async warmup failed: {}", e.what());
+                            }
                         }
                     });
                     return;
@@ -131,6 +138,11 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                 return;
             }
         }
+    }
+
+    void
+    CancelWarmup() {
+        warmup_cancel_source_.requestCancellation();
     }
 
     folly::SemiFuture<std::shared_ptr<CellAccessor<CellT>>>
@@ -621,6 +633,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     };
 
     const std::unique_ptr<Translator<CellT>> translator_;
+    folly::CancellationSource warmup_cancel_source_;
     // Each CacheCell's cid_t is its index in vector.
     // Using unique_ptr because CacheCell is non-movable (inherits from ListNode).
     // Once initialized, cells_ should never be resized.
@@ -633,6 +646,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     const bool self_reserve_;
     const bool storage_usage_tracking_enabled_;
     std::chrono::milliseconds loading_timeout_{100000};
+    std::atomic<bool> warmup_called_{false};
     std::atomic<bool> skip_pin_{false};
 };
 
