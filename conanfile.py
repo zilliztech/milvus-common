@@ -55,7 +55,8 @@ class MilvusCommonConan(ConanFile):
     def requirements(self):
         # Force all dependencies to use protobuf from milvus/dev channel
         # This is needed to resolve conflicts between opentelemetry-cpp and grpc
-        self.requires("protobuf/5.27.0@milvus/dev", force=True, override=True)
+        self.requires("protobuf/5.27.0", force=True, override=True)
+        self.requires("lz4/1.9.4", force=True, override=True)
         if self.settings.os != "Macos":
             self.requires("libunwind/1.8.1")
 
