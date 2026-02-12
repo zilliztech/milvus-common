@@ -24,11 +24,6 @@ add_executable(all_tests
     ${ALL_TEST_FILES}
 )
 
-# Ensure SSE4.2 CRC intrinsics are available to match Folly build (x86_64)
-if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64" AND NOT MSVC)
-    target_compile_options(all_tests PRIVATE -msse4.2)
-endif()
-
 
 target_link_libraries(all_tests
     GTest::gtest
@@ -39,7 +34,7 @@ target_link_libraries(all_tests
     ${BLAS_LIBRARIES}
 )
 if(NOT APPLE)
-    target_link_libraries(all_tests atomic)
+    target_link_libraries(all_tests atomic gomp)
 endif()
 
 add_test(NAME all_tests COMMAND all_tests)

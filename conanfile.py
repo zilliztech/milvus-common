@@ -20,8 +20,9 @@ class MilvusCommonConan(ConanFile):
         "prometheus-cpp/1.2.4",
         "libcurl/8.10.1",
         "gflags/2.2.2",
-        "opentelemetry-cpp/1.14.2",
-        "abseil/20240722.0",
+        "opentelemetry-cpp/1.23.0@milvus/dev",
+        "grpc/1.67.1@milvus/dev",
+        "abseil/20250127.0",
         "xz_utils/5.4.5",
         "zlib/1.3.1",
         "libevent/2.1.12",
@@ -47,15 +48,11 @@ class MilvusCommonConan(ConanFile):
         "with_asan": False,
     }
 
-    def configure(self):
-        if self.settings.arch not in ("x86_64", "x86"):
-            del self.options["folly"].use_sse4_2
-        if self.settings.os == "Macos":
-            # By default abseil use static link but can not be compatible with macos X86
-            self.options["abseil"].shared = True
-            self.options["arrow"].with_jemalloc = False
-
     def requirements(self):
+        # Force all dependencies to use protobuf from milvus/dev channel
+        # This is needed to resolve conflicts between opentelemetry-cpp and grpc
+        self.requires("protobuf/5.27.0@milvus/dev", force=True, override=True)
+        self.requires("lz4/1.9.4", force=True, override=True)
         if self.settings.os != "Macos":
             self.requires("libunwind/1.8.1")
 

@@ -10,6 +10,7 @@
 // or implied. See the License for the specific language governing permissions and limitations under the License
 #pragma once
 
+#include <fmt/ranges.h>
 #include <folly/Synchronized.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/futures/Future.h>
@@ -22,7 +23,6 @@
 #include <cstddef>
 #include <exception>
 #include <flat_hash_map/flat_hash_map.hpp>
-#include <fmt/ranges.h>
 #include <memory>
 #include <numeric>
 #include <type_traits>

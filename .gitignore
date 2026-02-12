@@ -66,17 +66,17 @@ cmakedeps_macros.cmake
 graph_info.json
 *.pc
 *-Target-release.cmake
-*-release-armv8-data.cmake
+*-release-*-data.cmake
 *-config.cmake
 *-config-version.cmake
 *Config.cmake
 *ConfigVersion.cmake
 *Targets.cmake
 Find*.cmake
-Makefile
 
 # Build cache
 .cache/
+.build/
 
 # python
 .eggs

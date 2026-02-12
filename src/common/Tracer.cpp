@@ -103,6 +103,20 @@ initTelemetry(const TraceConfig& cfg) {
             exporter = otlp::OtlpGrpcExporterFactory::Create(opts);
             LOG_INFO("init otlp grpc exporter, endpoint: {}", opts.endpoint);
         }
+#else
+        else if (cfg.otlpMethod == "grpc" || cfg.otlpMethod == "") {
+            // gRPC exporter not available, fall back to OTLP HTTP
+            auto opts = otlp::OtlpHttpExporterOptions{};
+            opts.url = cfg.otlpEndpoint;
+            auto headers_map = parseHeaders(cfg.otlpHeaders);
+            if (!headers_map.empty()) {
+                for (const auto& pair : headers_map) {
+                    opts.http_headers.insert(std::pair<std::string, std::string>(pair.first, pair.second));
+                }
+            }
+            exporter = otlp::OtlpHttpExporterFactory::Create(opts);
+            LOG_INFO("gRPC exporter unavailable, falling back to otlp http exporter, endpoint: {}", opts.url);
+        }
 #endif
         else {
             LOG_INFO("unknown otlp exporter method: {}", cfg.otlpMethod);

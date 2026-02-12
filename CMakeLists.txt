@@ -31,8 +31,6 @@ if (WITH_ASAN)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -fno-omit-frame-pointer -fno-stack-protector -fno-var-tracking")
 endif()
 
-include(CheckSymbolExists)
-check_symbol_exists(__x86_64__ "" __X86_64)
 
 find_package(opentelemetry-cpp REQUIRED)
 find_package(folly REQUIRED)
@@ -41,6 +39,24 @@ find_package(gflags REQUIRED)
 find_package(glog REQUIRED)
 find_package(fmt REQUIRED)
 find_package(prometheus-cpp REQUIRED)
+
+# OpenMP is required for thread pool OMP setter
+if(APPLE)
+    # Apple Clang needs Homebrew libomp: brew install libomp
+    find_program(_BREW_CMD brew)
+    if(_BREW_CMD)
+        execute_process(COMMAND ${_BREW_CMD} --prefix libomp OUTPUT_VARIABLE LIBOMP_PREFIX OUTPUT_STRIP_TRAILING_WHITESPACE)
+    endif()
+    if(LIBOMP_PREFIX)
+        set(OpenMP_C_FLAGS "-Xpreprocessor -fopenmp -I${LIBOMP_PREFIX}/include")
+        set(OpenMP_CXX_FLAGS "-Xpreprocessor -fopenmp -I${LIBOMP_PREFIX}/include")
+        set(OpenMP_C_LIB_NAMES "omp")
+        set(OpenMP_CXX_LIB_NAMES "omp")
+        set(OpenMP_omp_LIBRARY "${LIBOMP_PREFIX}/lib/libomp.dylib")
+    endif()
+endif()
+find_package(OpenMP REQUIRED)
+
 if(APPLE)
     # On macOS, transitive find_package calls (CURL, ZLIB, etc.) resolve to the
     # SDK sysroot (e.g. .../MacOSX.sdk/usr/include). When CMake adds that path
@@ -83,11 +99,6 @@ if(TARGET opentelemetry-cpp::opentelemetry_exporter_otlp_grpc)
 endif()
 
 file(GLOB_RECURSE SRC_FILES src/*.cpp src/*.cc)
-if(__X86_64)
-   set_source_files_properties(src/knowhere/thread_pool.cc PROPERTIES
-     COMPILE_OPTIONS "-msse4.2"
-   )
-endif()
 
 # Check for libaio library and conditionally include aio_context_pool.cc
 find_library(LIBAIO_LIBRARY NAMES aio)
@@ -109,7 +120,7 @@ if(APPLE)
 endif()
 
 if(HAVE_OTLP_GRPC_EXPORTER)
-    target_compile_definitions(milvus-common PRIVATE HAVE_OTLP_GRPC_EXPORTER)
+    target_compile_definitions(milvus-common PUBLIC HAVE_OTLP_GRPC_EXPORTER)
 endif()
 
 if (ENABLE_SYNCPOINT)
@@ -119,6 +130,8 @@ endif()
 target_link_libraries(milvus-common PUBLIC
     ${COMMON_LINKER_LIBS}
 )
+
+target_link_libraries(milvus-common PUBLIC OpenMP::OpenMP_CXX)
 
 if(WITH_COMMON_UT)
     # Enable unit-test-only helpers for caching layer
