@@ -28,7 +28,7 @@ class MilvusCommonConan(ConanFile):
         "libevent/2.1.12",
         "openssl/3.3.2",
         "folly/2024.08.12.00",
-        "boost/1.86.0"
+        "boost/1.83.0"
     )
 
     options = {
