@@ -89,7 +89,6 @@ list(APPEND COMMON_LINKER_LIBS prometheus-cpp::core prometheus-cpp::push)
 list(APPEND COMMON_LINKER_LIBS fmt::fmt)
 list(APPEND COMMON_LINKER_LIBS Folly::folly)
 list(APPEND COMMON_LINKER_LIBS gflags::gflags)
-
 list(APPEND COMMON_LINKER_LIBS opentelemetry-cpp::opentelemetry_trace)
 list(APPEND COMMON_LINKER_LIBS opentelemetry-cpp::opentelemetry_exporter_ostream_span)
 list(APPEND COMMON_LINKER_LIBS opentelemetry-cpp::opentelemetry_exporter_otlp_http)
@@ -128,7 +127,7 @@ if (ENABLE_SYNCPOINT)
 endif()
 
 target_link_libraries(milvus-common PUBLIC
-    ${COMMON_LINKER_LIBS}
+    ${COMMON_LINKER_LIBS} atomic
 )
 
 target_link_libraries(milvus-common PUBLIC OpenMP::OpenMP_CXX)
