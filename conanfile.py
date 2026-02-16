@@ -27,7 +27,7 @@ class MilvusCommonConan(ConanFile):
         "zlib/1.3.1",
         "libevent/2.1.12",
         "openssl/3.3.2",
-        "folly/2024.08.12.00",
+        "folly/2024.08.12.00@milvus/dev",
         "boost/1.83.0"
     )
 

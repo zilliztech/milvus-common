@@ -27,6 +27,11 @@ include_directories(${MILVUS_COMMON_WORKSPACE}/include)
 
 set(CMAKE_CXX_FLAGS "-Wall -fPIC ${CMAKE_CXX_FLAGS}")
 
+# folly's F14 hash tables require SSE4.2 CRC intrinsics on x86_64
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|amd64|AMD64)")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -msse4.2")
+endif()
+
 if (WITH_ASAN)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -fno-omit-frame-pointer -fno-stack-protector -fno-var-tracking")
 endif()
