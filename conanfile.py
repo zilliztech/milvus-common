@@ -20,14 +20,14 @@ class MilvusCommonConan(ConanFile):
         "prometheus-cpp/1.2.4",
         "libcurl/8.10.1",
         "gflags/2.2.2",
-        "opentelemetry-cpp/1.23.0@milvus/dev",
-        "grpc/1.67.1@milvus/dev",
+        "opentelemetry-cpp/1.23.0@milvus/dev#bcd65b63b8db8447178ed93bbc94dcc0",
+        "grpc/1.67.1@milvus/dev#5aa62c51bced448b83d7db9e5b3a13c7",
         "abseil/20250127.0",
         "xz_utils/5.4.5",
         "zlib/1.3.1",
         "libevent/2.1.12",
         "openssl/3.3.2",
-        "folly/2024.08.12.00@milvus/dev",
+        "folly/2024.08.12.00@milvus/dev#e09fc71826ce6b4568441910665f0889",
         "boost/1.83.0"
     )
 
@@ -39,6 +39,8 @@ class MilvusCommonConan(ConanFile):
     default_options = {
         "folly:shared": True,
         "gtest:build_gmock": True,
+        "openssl:shared": True,
+        "gflags:shared": True,
         "glog:with_gflags": True,
         "glog:shared": True,
         "prometheus-cpp:with_pull": False,
@@ -51,7 +53,7 @@ class MilvusCommonConan(ConanFile):
     def requirements(self):
         # Force all dependencies to use protobuf from milvus/dev channel
         # This is needed to resolve conflicts between opentelemetry-cpp and grpc
-        self.requires("protobuf/5.27.0@milvus/dev", force=True, override=True)
+        self.requires("protobuf/5.27.0@milvus/dev#6fff8583e2fe32babef04a9097f1d581", force=True, override=True)
         self.requires("lz4/1.9.4", force=True, override=True)
         if self.settings.os != "Macos":
             self.requires("libunwind/1.8.1")
