@@ -98,6 +98,77 @@ class DListTestFriend {
         }
     }
 
+    // Access waiting queue size for testing race conditions
+    static size_t
+    get_waiting_queue_size(DList* dlist) {
+        std::unique_lock<std::mutex> lock(dlist->list_mtx_);
+        return dlist->waiting_queue_.size();
+    }
+
+    // Access waiting requests map size for testing race conditions
+    static size_t
+    get_waiting_requests_map_size(DList* dlist) {
+        std::unique_lock<std::mutex> lock(dlist->list_mtx_);
+        return dlist->waiting_requests_map_.size();
+    }
+
+    // Manually call handleWaitingRequests (must hold lock externally or use this which acquires lock)
+    static void
+    test_notify_waiting_requests(DList* dlist) {
+        std::vector<std::unique_ptr<DList::WaitingRequest>> to_destroy;
+        {
+            std::unique_lock<std::mutex> lock(dlist->list_mtx_);
+            to_destroy = dlist->handleWaitingRequests();
+        }
+        // Destroy requests outside lock to avoid deadlock with cancel callbacks
+    }
+
+    // Get the event base for manual control in tests
+    static folly::EventBase*
+    get_event_base(DList* dlist) {
+        return dlist->event_base_thread_->getEventBase();
+    }
+
+    // Simulate timeout handler behavior: remove request from map but leave it in queue
+    // Returns true if a request was removed from map
+    // This simulates the race condition where timeout handler runs first
+    static bool
+    simulate_timeout_handler_remove_from_map(DList* dlist, uint64_t request_id) {
+        std::unique_lock<std::mutex> lock(dlist->list_mtx_);
+        auto it = dlist->waiting_requests_map_.find(request_id);
+        if (it != dlist->waiting_requests_map_.end()) {
+            // Set promise to false (like timeout handler does)
+            it->second->promise.setValue(false);
+            dlist->waiting_requests_map_.erase(it);
+            return true;
+        }
+        return false;
+    }
+
+    // Get the next request ID that will be assigned
+    static uint64_t
+    get_next_request_id(DList* dlist) {
+        return dlist->next_request_id_.load();
+    }
+
+    // Check if a request ID exists in the map
+    static bool
+    request_exists_in_map(DList* dlist, uint64_t request_id) {
+        std::unique_lock<std::mutex> lock(dlist->list_mtx_);
+        return dlist->waiting_requests_map_.count(request_id) > 0;
+    }
+
+    // Manually extend deadline of the top request in queue to simulate clock skew
+    // This allows us to trigger the success path even after timeout handler ran
+    static void
+    extend_top_request_deadline(DList* dlist, std::chrono::milliseconds extension) {
+        std::unique_lock<std::mutex> lock(dlist->list_mtx_);
+        if (!dlist->waiting_queue_.empty()) {
+            auto& request_ptr = const_cast<std::unique_ptr<DList::WaitingRequest>&>(dlist->waiting_queue_.top());
+            request_ptr->deadline = std::chrono::steady_clock::now() + extension;
+        }
+    }
+
     // nodes are from tail to head
     static void
     verify_list(DList* dlist, std::vector<ListNode*> nodes) {

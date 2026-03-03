@@ -53,6 +53,12 @@ class DListTest : public ::testing::Test {
     TearDown() override {
         managed_nodes.clear();
         loading_nodes.clear();
+        // Drain event base to ensure all callbacks complete before destroying DList.
+        // This prevents the DList destructor from running on the event base thread
+        // (which would happen if a callback held the last shared_ptr reference).
+        if (dlist) {
+            DLF::get_event_base(dlist.get())->runInEventBaseThreadAndWait([]() {});
+        }
         dlist.reset();
     }
 
@@ -1097,4 +1103,168 @@ TEST_F(DListTest, ReserveWithZeroTimeoutSucceedsWhenResourcesFreed) {
     EXPECT_TRUE(std::move(future).get());
     EXPECT_EQ(get_loading_memory(), reserve_size);
     EXPECT_EQ(get_used_memory(), node2->loaded_size());
+}
+
+// Concurrent stress test: multiple reservation requests with short timeouts
+// Validates thread safety of timeout handling and resource reservation
+TEST_F(DListTest, ConcurrentReservation_TimeoutStress) {
+    initial_limit = {100, 50};
+    low_watermark = {80, 40};
+    high_watermark = {90, 45};
+
+    dlist = std::make_unique<DList>(true, initial_limit, low_watermark, high_watermark, eviction_config_);
+
+    // Fill cache to near capacity to force requests to wait
+    DLF::test_add_used_memory(dlist.get(), {95, 47});
+    ASSERT_EQ(get_used_memory(), (ResourceUsage{95, 47}));
+
+    constexpr int kNumAttempts = 50;
+    constexpr auto kShortTimeout = std::chrono::milliseconds(1);
+
+    std::atomic<int> timeout_count{0};
+    std::atomic<int> success_count{0};
+    std::atomic<int> exception_count{0};
+
+    for (int i = 0; i < kNumAttempts; ++i) {
+        ResourceUsage request_size{20, 10};
+
+        auto future = dlist->ReserveLoadingResourceWithTimeout(request_size, kShortTimeout);
+
+        // Wait for timeout
+        std::this_thread::sleep_for(kShortTimeout + std::chrono::milliseconds(2));
+
+        // Trigger handleWaitingRequests to test concurrent access
+        DLF::test_notify_waiting_requests(dlist.get());
+
+        try {
+            bool result = std::move(future).get();
+            if (result) {
+                success_count++;
+                dlist->ReleaseLoadingResource(request_size);
+            } else {
+                timeout_count++;
+            }
+        } catch (const std::exception& e) {
+            exception_count++;
+            ADD_FAILURE() << "Unexpected exception: " << e.what();
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    EXPECT_EQ(exception_count.load(), 0) << "Concurrency issue detected";
+}
+
+// Multi-threaded concurrent reservation stress test
+// Validates thread safety when multiple threads compete for resources
+TEST_F(DListTest, ConcurrentReservation_MultiThreaded) {
+    initial_limit = {100, 50};
+    low_watermark = {80, 40};
+    high_watermark = {90, 45};
+
+    dlist = std::make_unique<DList>(true, initial_limit, low_watermark, high_watermark, eviction_config_);
+
+    // Fill cache to near capacity
+    DLF::test_add_used_memory(dlist.get(), {95, 47});
+    ASSERT_EQ(get_used_memory(), (ResourceUsage{95, 47}));
+
+    std::atomic<int> exception_count{0};
+    std::atomic<int> completed{0};
+
+    constexpr int kNumThreads = 10;
+    constexpr int kIterationsPerThread = 20;
+    constexpr auto kShortTimeout = std::chrono::milliseconds(1);
+
+    std::vector<std::thread> threads;
+    threads.reserve(kNumThreads);
+
+    for (int t = 0; t < kNumThreads; ++t) {
+        threads.emplace_back([&, t]() {
+            for (int i = 0; i < kIterationsPerThread; ++i) {
+                try {
+                    ResourceUsage request_size{5, 3};
+                    auto future = dlist->ReserveLoadingResourceWithTimeout(request_size, kShortTimeout);
+
+                    // Vary timing to exercise different interleavings
+                    std::this_thread::sleep_for(std::chrono::microseconds(100 + (t * 50) + (i % 10) * 10));
+
+                    // Trigger handleWaitingRequests concurrently
+                    DLF::test_notify_waiting_requests(dlist.get());
+
+                    bool result = std::move(future).get();
+                    if (result) {
+                        dlist->ReleaseLoadingResource(request_size);
+                    }
+                } catch (const std::exception& e) {
+                    exception_count++;
+                }
+                completed++;
+            }
+        });
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    EXPECT_EQ(exception_count.load(), 0) << "Concurrency issue detected in multi-threaded test";
+}
+
+// Test timeout and notify interaction: validates that after a request times out,
+// subsequent handleWaitingRequests calls handle it correctly without issues
+TEST_F(DListTest, ConcurrentReservation_TimeoutThenNotify) {
+    initial_limit = {100, 50};
+    low_watermark = {80, 40};
+    high_watermark = {90, 45};
+    dlist = std::make_unique<DList>(true, initial_limit, low_watermark, high_watermark, eviction_config_);
+
+    // Fill cache to near capacity
+    DLF::test_add_used_memory(dlist.get(), {95, 47});
+    ASSERT_EQ(get_used_memory(), (ResourceUsage{95, 47}));
+
+    uint64_t expected_request_id = DLF::get_next_request_id(dlist.get());
+
+    // Start a reservation request that will wait due to insufficient resources
+    ResourceUsage request_size{10, 5};
+    auto future = dlist->ReserveLoadingResourceWithTimeout(request_size, std::chrono::milliseconds(60000));
+
+    // Verify request is queued
+    ASSERT_EQ(DLF::get_waiting_queue_size(dlist.get()), 1);
+    ASSERT_EQ(DLF::get_waiting_requests_map_size(dlist.get()), 1);
+    ASSERT_TRUE(DLF::request_exists_in_map(dlist.get(), expected_request_id));
+
+    // Simulate the request being removed from map (e.g., by timeout handler)
+    bool removed = DLF::simulate_timeout_handler_remove_from_map(dlist.get(), expected_request_id);
+    ASSERT_TRUE(removed);
+
+    // Verify inconsistent state: request in queue but not in map
+    EXPECT_EQ(DLF::get_waiting_queue_size(dlist.get()), 1);
+    EXPECT_EQ(DLF::get_waiting_requests_map_size(dlist.get()), 0);
+    EXPECT_FALSE(DLF::request_exists_in_map(dlist.get(), expected_request_id));
+
+    // Extend deadline to simulate non-expired request from queue's perspective
+    DLF::extend_top_request_deadline(dlist.get(), std::chrono::milliseconds(10000));
+
+    // Make resources available
+    DLF::test_sub_used_memory(dlist.get(), {20, 10});
+
+    // Trigger handleWaitingRequests - should handle this state gracefully
+    DLF::test_notify_waiting_requests(dlist.get());
+
+    // Allow async operations to complete
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    bool result = false;
+    bool future_exception = false;
+
+    try {
+        result = std::move(future).get();
+    } catch (const std::exception& e) {
+        future_exception = true;
+        ADD_FAILURE() << "Unexpected exception: " << e.what();
+    }
+
+    EXPECT_FALSE(future_exception);
+    // Result should be false since we simulated the timeout
+    EXPECT_FALSE(result);
 }
