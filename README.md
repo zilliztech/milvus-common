@@ -17,10 +17,12 @@ Milvus Common is a core component library that serves as a bridge between Milvus
 ## Build from source
 
 ```
-pip install conan==1.64.0
+pip install conan==2.25.1
+conan profile detect
+conan remote add default-conan-local2 https://milvus01.jfrog.io/artifactory/api/conan/default-conan-local2
 mkdir build && cd build
-conan install .. --build=missing -o with_ut=True -s compiler.libcxx=libstdc++11 -s compiler.version=12 -s build_type=Release
-conan build ..
+conan install .. --build=missing -o "&:with_ut=True" -s compiler.cppstd=17 -s build_type=Release -of .
+conan build .. -of .
 
 # run ut
 ./test/test_cachinglayer/cachinglayer_test
