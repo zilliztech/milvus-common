@@ -13,6 +13,8 @@
 #include <folly/CancellationToken.h>
 
 #include <atomic>
+#include <cstdint>
+#include <optional>
 
 namespace milvus {
 
@@ -31,6 +33,10 @@ struct OpContext {
     } storage_usage;
 
     folly::CancellationToken cancellation_token;
+
+    // Runtime load priority that overrides the translator's cached priority.
+    // Maps to proto::common::LoadPriority (milvus-proto): HIGH = 0, LOW = 1.
+    std::optional<int32_t> runtime_load_priority;
 
     OpContext() = default;
     OpContext(const folly::CancellationToken& cancellation_token) : cancellation_token(cancellation_token) {
