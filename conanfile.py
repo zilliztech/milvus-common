@@ -1,34 +1,31 @@
+required_conan_version = ">=2.0"
+
 from conan.tools.microsoft import is_msvc, msvc_runtime_flag
-from conan.tools.build import check_min_cppstd
+from conan.tools.build import check_min_cppstd, cppstd_flag
 from conan.tools.scm import Version
 from conan.tools import files
 from conan import ConanFile
 from conan.tools.cmake import CMake, CMakeDeps, CMakeToolchain, cmake_layout
 from conan.tools.gnu import PkgConfigDeps
 from conan.errors import ConanInvalidConfiguration
-from conans import tools
 import os
-
-required_conan_version = ">=1.55.0"
 
 class MilvusCommonConan(ConanFile):
     settings = "os", "compiler", "build_type", "arch"
     requires = (
         "gtest/1.15.0",
-        "glog/0.7.1",
-        "fmt/11.0.2",
-        "prometheus-cpp/1.2.4",
-        "libcurl/8.10.1",
-        "gflags/2.2.2",
-        "opentelemetry-cpp/1.23.0@milvus/dev#bcd65b63b8db8447178ed93bbc94dcc0",
-        "grpc/1.67.1@milvus/dev#5aa62c51bced448b83d7db9e5b3a13c7",
-        "abseil/20250127.0",
-        "xz_utils/5.4.5",
-        "zlib/1.3.1",
-        "libevent/2.1.12",
-        "openssl/3.3.2",
-        "folly/2024.08.12.00@milvus/dev#e09fc71826ce6b4568441910665f0889",
-        "boost/1.83.0"
+        "glog/0.7.1#a306e61d7b8311db8cb148ad62c48030",
+        "fmt/11.0.2#eb98daa559c7c59d591f4720dde4cd5c",
+        "prometheus-cpp/1.2.4#0918d66c13f97acb7809759f9de49b3f",
+        "gflags/2.2.2#7671803f1dc19354cc90bd32874dcfda",
+        "opentelemetry-cpp/1.23.0@milvus/dev#11bc565ec6e82910ae8f7471da756720",
+        "grpc/1.67.1@milvus/dev#e05fe4470d8577922d7cb0a4356dc082",
+        "abseil/20250127.0#481edcc75deb0efb16500f511f0f0a1c",
+        "xz_utils/5.4.5#fc4e36861e0a47ecd4a40a00e6d29ac8",
+        "zlib/1.3.1#8045430172a5f8d56ba001b14561b4ea",
+        "libevent/2.1.12#95065aaefcd58d3956d6dfbfc5631d97",
+        "folly/2024.08.12.00@milvus/dev#5b757647ed9c1961f857c5afaae133b1",
+        "boost/1.83.0#4e8a94ac1b88312af95eded83cd81ca8",
     )
 
     options = {
@@ -37,15 +34,15 @@ class MilvusCommonConan(ConanFile):
     }
 
     default_options = {
-        "folly:shared": True,
-        "gtest:build_gmock": True,
-        "openssl:shared": True,
-        "gflags:shared": True,
-        "glog:with_gflags": True,
-        "glog:shared": True,
-        "prometheus-cpp:with_pull": False,
-        "fmt:header_only": False,
-        "opentelemetry-cpp:with_stl": True,
+        "folly/*:shared": True,
+        "gtest/*:build_gmock": True,
+        "openssl/*:shared": True,
+        "gflags/*:shared": True,
+        "glog/*:with_gflags": True,
+        "glog/*:shared": True,
+        "prometheus-cpp/*:with_pull": False,
+        "fmt/*:header_only": False,
+        "opentelemetry-cpp/*:with_stl": True,
         "with_ut": False,
         "with_asan": False,
     }
@@ -53,10 +50,14 @@ class MilvusCommonConan(ConanFile):
     def requirements(self):
         # Force all dependencies to use protobuf from milvus/dev channel
         # This is needed to resolve conflicts between opentelemetry-cpp and grpc
-        self.requires("protobuf/5.27.0@milvus/dev#6fff8583e2fe32babef04a9097f1d581", force=True, override=True)
-        self.requires("lz4/1.9.4", force=True, override=True)
+        self.requires("protobuf/5.27.0@milvus/dev#42f031a96d21c230a6e05bcac4bdd633", force=True, override=True)
+        self.requires("lz4/1.9.4#7f0b5851453198536c14354ee30ca9ae", force=True, override=True)
+        # Force overrides openssl to resolve opentelemetry-cpp's transitive deps
+        self.requires("openssl/3.3.2#9f9f130d58e7c13e76bb8a559f0a6a8b", force=True, override=True)
+        self.requires("libcurl/8.10.1#a3113369c86086b0e84231844e7ed0a9", force=True, override=True)
+        self.requires("nlohmann_json/3.11.3#ffb9e9236619f1c883e36662f944345d", force=True)
         if self.settings.os != "Macos":
-            self.requires("libunwind/1.8.1")
+            self.requires("libunwind/1.8.1#748a981ace010b80163a08867b732e71")
 
     @property
     def _minimum_cpp_standard(self):
@@ -75,7 +76,7 @@ class MilvusCommonConan(ConanFile):
         # Honor BUILD_SHARED_LIBS from conan_toolchain (see https://github.com/conan-io/conan/issues/11840)
         tc.cache_variables["CMAKE_POLICY_DEFAULT_CMP0077"] = "NEW"
 
-        cxx_std_flag = tools.cppstd_flag(self.settings)
+        cxx_std_flag = cppstd_flag(self)
         cxx_std_value = (
             cxx_std_flag.split("=")[1]
             if cxx_std_flag
