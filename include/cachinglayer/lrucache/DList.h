@@ -106,6 +106,10 @@ class DList : public std::enable_shared_from_this<DList> {
     IsEmpty() const;
 
     // Reserve loading resource with timeout, called before loading a cell.
+    // When timeout > 0, the request will fail after the specified duration.
+    // When timeout == 0, the request will wait indefinitely (no timeout).
+    // Note: timeout=0 requests use time_point::max() as their deadline, which
+    // means they sort after all finite-deadline requests in the waiting queue.
     folly::SemiFuture<bool>
     ReserveLoadingResourceWithTimeout(const ResourceUsage& size, std::chrono::milliseconds timeout,
                                       OpContext* ctx = nullptr);
