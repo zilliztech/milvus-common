@@ -84,9 +84,9 @@ class MockTranslator : public Translator<TestCell> {
     estimated_byte_size_of_cell(cid_t cid) const override {
         auto it = cell_sizes_.find(cid);
         if (it != cell_sizes_.end()) {
-            return {{it->second, 0}, {it->second, 0}};
+            return {{it->second, 0}, {loading_overhead_bytes_, 0}};
         }
-        return {{1, 0}, {1, 0}};
+        return {{1, 0}, {loading_overhead_bytes_, 0}};
     }
 
     int64_t
@@ -179,6 +179,10 @@ class MockTranslator : public Translator<TestCell> {
     SetExtraReturnCids(std::unordered_map<cid_t, std::vector<cid_t>> extra_cids) {
         extra_cids_ = extra_cids;
     }
+    void
+    SetLoadingOverheadBytes(int64_t bytes) {
+        loading_overhead_bytes_ = bytes;
+    }
     int
     GetCellsCallCount() const {
         EXPECT_FALSE(for_concurrent_test_);
@@ -210,6 +214,7 @@ class MockTranslator : public Translator<TestCell> {
     std::unordered_map<cid_t, std::vector<cid_t>> extra_cids_;
     std::atomic<int> get_cells_call_count_ = 0;
     std::vector<std::vector<cid_t>> requested_cids_;
+    int64_t loading_overhead_bytes_ = 0;
 
     // this class is not concurrent safe, so if for concurrent test, do not track usage
     bool for_concurrent_test_ = false;
@@ -241,8 +246,9 @@ class CacheSlotTest : public ::testing::Test {
         auto temp_translator_uptr =
             std::make_unique<MockTranslator>(cell_sizes_, uid_to_cid_map_, SLOT_KEY, StorageType::MEMORY);
         translator_ = temp_translator_uptr.get();
-        cache_slot_ = std::make_shared<CacheSlot<TestCell>>(std::move(temp_translator_uptr), dlist_.get(), true, true,
-                                                            true, std::chrono::milliseconds(100000));
+        cache_slot_ =
+            std::make_shared<CacheSlot<TestCell>>(std::move(temp_translator_uptr), dlist_.get(), true, true, true,
+                                                  std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
     }
 
     void
@@ -661,9 +667,9 @@ TEST_F(CacheSlotTest, PinCellsWithShortTimeout) {
     // Create a CacheSlot with a short timeout
     auto translator_short_timeout =
         std::make_unique<MockTranslator>(cell_sizes_, uid_to_cid_map_, "short_timeout_slot", StorageType::MEMORY);
-    auto cache_slot_short_timeout =
-        std::make_shared<CacheSlot<TestCell>>(std::move(translator_short_timeout), dlist_.get(), true, true, true,
-                                              std::chrono::milliseconds(50));  // 50ms timeout
+    auto cache_slot_short_timeout = std::make_shared<CacheSlot<TestCell>>(
+        std::move(translator_short_timeout), dlist_.get(), true, true, true, std::chrono::milliseconds(50),
+        std::chrono::milliseconds(0));  // 50ms timeout
 
     auto op_ctx = std::make_unique<milvus::OpContext>();
 
@@ -765,7 +771,7 @@ TEST_P(CacheSlotConcurrentTest, ConcurrentAccessMultipleSlots) {
                                                              /*for_concurrent_test*/ true);
     MockTranslator* translator_1 = translator_1_ptr.get();
     auto slot1 = std::make_shared<CacheSlot<TestCell>>(std::move(translator_1_ptr), dlist_.get(), true, true, true,
-                                                       std::chrono::milliseconds(100000));
+                                                       std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
 
     std::vector<std::pair<cid_t, int64_t>> cell_sizes_2 = {{0, 55}, {1, 65}, {2, 75}, {3, 85}, {4, 95}};
     std::unordered_map<cl_uid_t, cid_t> uid_map_2 = {{2000, 0}, {2001, 1}, {2002, 2}, {2003, 3}, {2004, 4}};
@@ -773,7 +779,7 @@ TEST_P(CacheSlotConcurrentTest, ConcurrentAccessMultipleSlots) {
                                                              /*for_concurrent_test*/ true);
     MockTranslator* translator_2 = translator_2_ptr.get();
     auto slot2 = std::make_shared<CacheSlot<TestCell>>(std::move(translator_2_ptr), dlist_.get(), true, true, true,
-                                                       std::chrono::milliseconds(100000));
+                                                       std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
 
     bool with_bonus_cells = GetParam();
     if (with_bonus_cells) {
@@ -883,7 +889,8 @@ TEST_P(CacheSlotConcurrentTest, ConcurrentAccessMultipleSlots) {
         auto translator_3_ptr = std::make_unique<MockTranslator>(cell_sizes_3, uid_map_3, "slot3", StorageType::MEMORY,
                                                                  /*for_concurrent_test*/ true);
         auto sl = std::make_shared<CacheSlot<TestCell>>(std::move(translator_3_ptr), dlist_ptr, dlist_ptr != nullptr,
-                                                        dlist_ptr != nullptr, true, std::chrono::milliseconds(100000));
+                                                        dlist_ptr != nullptr, true, std::chrono::milliseconds(100000),
+                                                        std::chrono::milliseconds(0));
         return sl;
     };
     std::shared_ptr<CacheSlot<TestCell>> slot3 = create_new_slot3();
@@ -1022,9 +1029,9 @@ class MockTranslatorWithWarmup : public Translator<TestCell> {
     estimated_byte_size_of_cell(cid_t cid) const override {
         auto it = cell_sizes_.find(cid);
         if (it != cell_sizes_.end()) {
-            return {{it->second, 0}, {it->second, 0}};
+            return {{it->second, 0}, {0, 0}};
         }
-        return {{1, 0}, {1, 0}};
+        return {{1, 0}, {0, 0}};
     }
 
     int64_t
@@ -1185,8 +1192,9 @@ TEST(ManagerCreateCacheSlotTest, NullCtxWorksNormally) {
         cell_sizes, uid_to_cid_map, "test_slot", StorageType::MEMORY, CacheWarmupPolicy::CacheWarmupPolicy_Disable);
 
     // Create CacheSlot with nullptr ctx - should work fine
-    auto cache_slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
-                                                            std::chrono::milliseconds(100000));
+    auto cache_slot =
+        std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                              std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
     cache_slot->Warmup(nullptr);
 
     EXPECT_EQ(cache_slot->num_cells(), 2);
@@ -1207,8 +1215,9 @@ TEST(ManagerCreateCacheSlotTest, ValidCtxWorksNormally) {
     EXPECT_FALSE(op_ctx->cancellation_token.isCancellationRequested());
 
     // Create CacheSlot with valid ctx
-    auto cache_slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
-                                                            std::chrono::milliseconds(100000));
+    auto cache_slot =
+        std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                              std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
     cache_slot->Warmup(op_ctx.get());
 
     EXPECT_EQ(cache_slot->num_cells(), 2);
@@ -1228,8 +1237,9 @@ TEST(WarmupTest, WarmupPassesCtxToGetCells) {
     auto op_ctx = std::make_unique<milvus::OpContext>();
 
     // Create CacheSlot and call Warmup - this will trigger loading due to EveryLoad policy
-    auto cache_slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
-                                                            std::chrono::milliseconds(100000));
+    auto cache_slot =
+        std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                              std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
     cache_slot->Warmup(op_ctx.get());
 
     // Verify that get_cells was called (warmup loaded the cells)
@@ -1256,8 +1266,9 @@ TEST(WarmupTest, WarmupWithCancelledCtxDuringLoadingThrows) {
     auto cancel_token = cancel_source.getToken();
     auto op_ctx = std::make_unique<milvus::OpContext>(cancel_token);
 
-    auto cache_slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
-                                                            std::chrono::milliseconds(100000));
+    auto cache_slot =
+        std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                              std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
 
     // Cancel the operation before warmup completes
     // Launch warmup in a thread and cancel after a short delay
@@ -1284,8 +1295,9 @@ TEST(WarmupTest, WarmupWithNullCtxAndEveryLoadPolicyWorks) {
     auto* translator_ptr = translator.get();
 
     // Create CacheSlot and call Warmup with nullptr - should not crash
-    auto cache_slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
-                                                            std::chrono::milliseconds(100000));
+    auto cache_slot =
+        std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                              std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
     EXPECT_NO_THROW(cache_slot->Warmup(nullptr));
 
     // Verify that get_cells was called
@@ -1311,8 +1323,9 @@ TEST(CacheSlotConstructionTest, CacheCellConstructionExceptionDoesNotCauseDouble
     // This should throw an exception, but NOT crash due to double destruction
     EXPECT_THROW(
         {
-            auto cache_slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true,
-                                                                    true, std::chrono::milliseconds(100000));
+            auto cache_slot =
+                std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                                      std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
         },
         std::runtime_error);
 
@@ -1342,8 +1355,9 @@ TEST(AsyncWarmupTest, AsyncWarmupWithPrefetchPoolLoadsInBackground) {
     auto prefetch_pool = std::make_shared<folly::CPUThreadPoolExecutor>(2);
 
     // Create CacheSlot
-    auto cache_slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
-                                                            std::chrono::milliseconds(100000));
+    auto cache_slot =
+        std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                              std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
 
     // Warmup should return immediately (async)
     cache_slot->Warmup(nullptr, prefetch_pool);
@@ -1383,8 +1397,9 @@ TEST(AsyncWarmupTest, AsyncWarmupWithoutPoolFallsBackToSync) {
     // Add delay to measure sync behavior - use longer delay to be robust on slow CI
     translator->SetCidLoadDelay({{0, 100}, {1, 100}});
 
-    auto cache_slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
-                                                            std::chrono::milliseconds(100000));
+    auto cache_slot =
+        std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                              std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
 
     // Warmup with nullptr pool should fall back to sync and block
     auto start = std::chrono::steady_clock::now();
@@ -1418,8 +1433,9 @@ TEST(AsyncWarmupTest, AsyncWarmupDoesNotCaptureCallerCtx) {
 
     auto prefetch_pool = std::make_shared<folly::CPUThreadPoolExecutor>(1);
 
-    auto cache_slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
-                                                            std::chrono::milliseconds(100000));
+    auto cache_slot =
+        std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                              std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
 
     // Create a context (should NOT be passed to async warmup)
     auto op_ctx = std::make_unique<milvus::OpContext>();
@@ -1462,8 +1478,9 @@ TEST(AsyncWarmupTest, AsyncWarmupSkipsIfSlotDestroyed) {
         // Set shared counter for tracking calls after translator is destroyed
         translator->SetSharedCallCounter(get_cells_call_count);
 
-        auto cache_slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
-                                                                std::chrono::milliseconds(100000));
+        auto cache_slot =
+            std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                                  std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
 
         // Start async warmup - task is queued behind the blocking task
         cache_slot->Warmup(nullptr, prefetch_pool);
@@ -1503,8 +1520,9 @@ TEST(AsyncWarmupTest, AccessDuringAsyncWarmupBlocks) {
 
     auto prefetch_pool = std::make_shared<folly::CPUThreadPoolExecutor>(1);
 
-    auto cache_slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
-                                                            std::chrono::milliseconds(100000));
+    auto cache_slot =
+        std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                              std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
 
     // Start async warmup
     cache_slot->Warmup(nullptr, prefetch_pool);
@@ -1556,8 +1574,9 @@ TEST(AsyncWarmupTest, CancelWarmupStopsAsyncWarmup) {
 
     auto prefetch_pool = std::make_shared<folly::CPUThreadPoolExecutor>(1);
 
-    auto cache_slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
-                                                            std::chrono::milliseconds(100000));
+    auto cache_slot =
+        std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                              std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
 
     // Start async warmup
     cache_slot->Warmup(nullptr, prefetch_pool);
@@ -1598,8 +1617,9 @@ TEST(AsyncWarmupTest, CancelWarmupBeforeStartPreventsLoading) {
                                                    StorageType::MEMORY, CacheWarmupPolicy::CacheWarmupPolicy_Async);
     translator->SetSharedCallCounter(get_cells_call_count);
 
-    auto cache_slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
-                                                            std::chrono::milliseconds(100000));
+    auto cache_slot =
+        std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                              std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
 
     // Queue async warmup (blocked behind the blocker task)
     cache_slot->Warmup(nullptr, prefetch_pool);
@@ -1628,8 +1648,9 @@ TEST(AsyncWarmupTest, SyncWarmupStillWorks) {
 
     auto prefetch_pool = std::make_shared<folly::CPUThreadPoolExecutor>(1);
 
-    auto cache_slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
-                                                            std::chrono::milliseconds(100000));
+    auto cache_slot =
+        std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                              std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
 
     auto op_ctx = std::make_unique<milvus::OpContext>();
 
@@ -1665,8 +1686,9 @@ TEST(AsyncWarmupTest, DisabledWarmupStillWorks) {
 
     auto prefetch_pool = std::make_shared<folly::CPUThreadPoolExecutor>(1);
 
-    auto cache_slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
-                                                            std::chrono::milliseconds(100000));
+    auto cache_slot =
+        std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                              std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
 
     // Disabled warmup should not load any cells
     cache_slot->Warmup(nullptr, prefetch_pool);
@@ -1828,4 +1850,78 @@ TEST(WarmupTimeoutTest, SyncWarmupBestEffortResourceAvailable) {
         ASSERT_NE(cell, nullptr);
         EXPECT_EQ(cell->cid, cid);
     }
+}
+
+// Test that CacheSlot correctly integrates with LoadingOverheadTracker when
+// the translator reports non-zero loading overhead.
+TEST(CacheSlotTrackerTest, LoadingOverheadTrackerIntegration) {
+    ResourceUsage limit{10000, 0};
+    auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
+
+    LoadingOverheadTracker tracker;
+    tracker.RegisterUpperBound(CellDataType::OTHER, {500, 0});
+
+    const int64_t cell_loaded_size = 100;
+    const int64_t cell_loading_overhead = 200;
+
+    auto translator = std::make_unique<MockTranslator>(
+        std::vector<std::pair<cid_t, int64_t>>{{0, cell_loaded_size}, {1, cell_loaded_size}},
+        std::unordered_map<cl_uid_t, cid_t>{{0, 0}, {1, 1}}, "test_tracker_integration", StorageType::MEMORY);
+    translator->SetLoadingOverheadBytes(cell_loading_overhead);
+    auto* translator_ptr = translator.get();
+
+    auto cache_slot =
+        std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, false,
+                                              std::chrono::milliseconds(5000), std::chrono::milliseconds(0), &tracker);
+
+    auto op_ctx = std::make_unique<milvus::OpContext>();
+
+    // Pin cell 0: should reserve loaded(100) + overhead delta from tracker
+    auto accessor = cache_slot->PinCellsDirect(op_ctx.get(), {0});
+    ASSERT_NE(accessor, nullptr);
+    EXPECT_EQ(accessor->get_cell_of(0)->data, 0);
+
+    // Pin cell 1: should also go through tracker
+    auto accessor2 = cache_slot->PinCellsDirect(op_ctx.get(), {1});
+    ASSERT_NE(accessor2, nullptr);
+    EXPECT_EQ(accessor2->get_cell_of(1)->data, 10);
+
+    EXPECT_EQ(translator_ptr->GetCellsCallCount(), 2);
+}
+
+// Test that tracker state is properly cleaned up when load throws an exception.
+TEST(CacheSlotTrackerTest, LoadingOverheadTrackerCleanupOnException) {
+    ResourceUsage limit{10000, 0};
+    auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
+
+    LoadingOverheadTracker tracker;
+    tracker.RegisterUpperBound(CellDataType::OTHER, {500, 0});
+
+    const int64_t cell_loaded_size = 100;
+    const int64_t cell_loading_overhead = 200;
+
+    auto translator = std::make_unique<MockTranslator>(std::vector<std::pair<cid_t, int64_t>>{{0, cell_loaded_size}},
+                                                       std::unordered_map<cl_uid_t, cid_t>{{0, 0}},
+                                                       "test_tracker_exception", StorageType::MEMORY);
+    translator->SetLoadingOverheadBytes(cell_loading_overhead);
+    translator->SetShouldThrow(true);
+
+    auto cache_slot =
+        std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, false,
+                                              std::chrono::milliseconds(5000), std::chrono::milliseconds(0), &tracker);
+
+    auto op_ctx = std::make_unique<milvus::OpContext>();
+
+    // Pin should fail because translator throws, but tracker state must be cleaned up.
+    // The exception is caught internally by RunLoad and set as error on the cell.
+    EXPECT_ANY_THROW(cache_slot->PinCellsDirect(op_ctx.get(), {0}));
+
+    // After the failed load, tracker state should be clean.
+    // Verify by reserving again — if state leaked, the tracker would have stale sum_of_overhead.
+    // Reserve the full UB amount — should succeed fully if no leak.
+    auto delta = tracker.Reserve(CellDataType::OTHER, {500, 0});
+    EXPECT_EQ(delta.memory_bytes, 500);
+
+    auto release = tracker.Release(CellDataType::OTHER, {500, 0});
+    EXPECT_EQ(release.memory_bytes, 500);
 }
