@@ -58,7 +58,8 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std
     // If immediate reservation fails, add to waiting queue
     std::unique_lock<std::mutex> lock(list_mtx_);
 
-    auto deadline = std::chrono::steady_clock::now() + timeout;
+    auto deadline =
+        timeout.count() > 0 ? std::chrono::steady_clock::now() + timeout : std::chrono::steady_clock::time_point::max();
     auto [promise, future] = folly::makePromiseContract<bool>();
 
     uint64_t request_id = next_request_id_.fetch_add(1);
