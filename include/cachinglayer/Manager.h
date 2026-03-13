@@ -16,6 +16,7 @@
 #include <memory>
 
 #include "cachinglayer/CacheSlot.h"
+#include "cachinglayer/LoadingOverheadTracker.h"
 #include "cachinglayer/Translator.h"
 #include "cachinglayer/Utils.h"
 #include "cachinglayer/lrucache/DList.h"
@@ -55,9 +56,20 @@ class Manager {
         }
         auto evictable = translator->meta()->support_eviction && eviction_enabled_;
         auto self_reserve = eviction_enabled_;
-        auto cache_slot =
-            std::make_shared<CacheSlot<CellT>>(std::move(translator), dlist_.get(), evictable, self_reserve,
-                                               storage_usage_tracking_enabled_, loading_timeout_);
+
+        // Register loading overhead upper bound for this CellDataType.
+        // If the translator specifies a finite UB, use it; otherwise register
+        // with unlimited UB to ensure every type goes through the tracker.
+        if (translator->meta()->loading_overhead_upper_bound.has_value()) {
+            loading_overhead_tracker_.RegisterUpperBound(translator->meta()->cell_data_type,
+                                                         translator->meta()->loading_overhead_upper_bound.value());
+        } else {
+            loading_overhead_tracker_.EnsureRegistered(translator->meta()->cell_data_type);
+        }
+
+        auto cache_slot = std::make_shared<CacheSlot<CellT>>(std::move(translator), dlist_.get(), evictable,
+                                                             self_reserve, storage_usage_tracking_enabled_,
+                                                             loading_timeout_, &loading_overhead_tracker_);
         cache_slot->Warmup(ctx, prefetch_pool_);
         return cache_slot;
     }
@@ -137,6 +149,7 @@ class Manager {
 
     std::shared_ptr<internal::DList> dlist_{nullptr};
     std::shared_ptr<folly::CPUThreadPoolExecutor> prefetch_pool_{nullptr};
+    LoadingOverheadTracker loading_overhead_tracker_;
     CacheWarmupPolicies warmup_policies_{};
     bool storage_usage_tracking_enabled_{false};
     bool eviction_enabled_{false};

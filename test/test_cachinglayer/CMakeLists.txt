@@ -9,7 +9,6 @@
 # is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 # or implied. See the License for the specific language governing permissions and limitations under the License
 
-
 find_package(GTest CONFIG REQUIRED)
 find_package(BLAS REQUIRED)
 
@@ -17,13 +16,13 @@ set(CACHINGLAYER_TEST_FILES
     ../init_gtest.cpp
     test_dlist.cpp
     test_cache_slot.cpp
+    test_loading_overhead_tracker.cpp
     test_utils.cpp
 )
 
 add_executable(cachinglayer_test
     ${CACHINGLAYER_TEST_FILES}
 )
-
 
 target_link_libraries(cachinglayer_test
     GTest::gtest

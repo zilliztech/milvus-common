@@ -138,6 +138,16 @@ target_link_libraries(milvus-common PUBLIC
 
 target_link_libraries(milvus-common PUBLIC OpenMP::OpenMP_CXX)
 
+# thread_pool.cc uses openblas-specific API (openblas_set_num_threads) under OPENBLAS_OS_LINUX
+if(NOT APPLE)
+    find_library(OPENBLAS_LIBRARY NAMES openblas)
+    if(OPENBLAS_LIBRARY)
+        target_link_libraries(milvus-common PUBLIC ${OPENBLAS_LIBRARY})
+    else()
+        message(WARNING "OpenBLAS not found, openblas_set_num_threads will be unavailable")
+    endif()
+endif()
+
 if(WITH_COMMON_UT)
     # Enable unit-test-only helpers for caching layer
     target_compile_definitions(milvus-common PRIVATE MCL_ENABLE_TEST_CGROUP_OVERRIDE)
