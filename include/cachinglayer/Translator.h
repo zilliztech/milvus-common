@@ -12,6 +12,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -31,13 +32,21 @@ struct Meta {
     // Whether the translator supports strategy based eviction.
     // Does not affect manual eviction.
     bool support_eviction;
+    // Upper bound for loading overhead reservation for this CellDataType.
+    // When set, the total loading overhead across all CacheSlots of this type
+    // is capped at this value, preventing over-reservation when many concurrent
+    // loads happen. The real resource usage is bounded by loading_pool_size * cell_size.
+    // If not set, no capping is applied (existing behavior).
+    std::optional<ResourceUsage> loading_overhead_upper_bound;
     explicit Meta(StorageType storage_type, CellIdMappingMode cell_id_mapping_mode, CellDataType cell_data_type,
-                  CacheWarmupPolicy cache_warmup_policy, bool support_eviction)
+                  CacheWarmupPolicy cache_warmup_policy, bool support_eviction,
+                  std::optional<ResourceUsage> loading_overhead_upper_bound = std::nullopt)
         : storage_type(storage_type),
           cell_id_mapping_mode(cell_id_mapping_mode),
           cell_data_type(cell_data_type),
           cache_warmup_policy(cache_warmup_policy),
-          support_eviction(support_eviction) {
+          support_eviction(support_eviction),
+          loading_overhead_upper_bound(loading_overhead_upper_bound) {
     }
 };
 
@@ -51,9 +60,13 @@ class Translator {
     virtual cid_t
     cell_id_of(uid_t uid) const = 0;
     // For resource reservation when a cell is about to be loaded.
-    // There are two types of resource usage for a cell: the first is the usage after it has been loaded,
-    // and the second is the usage during loading. Typically, the loading usage is greater than the loaded usage
-    // due to the preprocessing stage.
+    // Returns {loaded_usage, loading_overhead}:
+    //   - loaded_usage (first): the final resource usage after the cell is fully loaded and in cache.
+    //   - loading_overhead (second): the *temporary* resource usage during loading (e.g., preprocessing buffers),
+    //     excluding the final loaded usage. This is the extra overhead that only exists during the loading phase.
+    // When loading_overhead_upper_bound is set in Meta, the total loading reservation across all CacheSlots
+    // of the same CellDataType is capped at that upper bound, since actual concurrent resource usage is
+    // bounded by loading_pool_size * cell_size.
     // If a cell is about to be pinned and loaded, and there are not enough resource for it, EvictionManager
     // will try to evict some other cells to make space. Thus this estimation should generally be greater
     // than or equal to the actual size. If the estimation is smaller than the actual size, with insufficient

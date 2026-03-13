@@ -84,9 +84,9 @@ class MockTranslator : public Translator<TestCell> {
     estimated_byte_size_of_cell(cid_t cid) const override {
         auto it = cell_sizes_.find(cid);
         if (it != cell_sizes_.end()) {
-            return {{it->second, 0}, {it->second, 0}};
+            return {{it->second, 0}, {loading_overhead_bytes_, 0}};
         }
-        return {{1, 0}, {1, 0}};
+        return {{1, 0}, {loading_overhead_bytes_, 0}};
     }
 
     int64_t
@@ -179,6 +179,10 @@ class MockTranslator : public Translator<TestCell> {
     SetExtraReturnCids(std::unordered_map<cid_t, std::vector<cid_t>> extra_cids) {
         extra_cids_ = extra_cids;
     }
+    void
+    SetLoadingOverheadBytes(int64_t bytes) {
+        loading_overhead_bytes_ = bytes;
+    }
     int
     GetCellsCallCount() const {
         EXPECT_FALSE(for_concurrent_test_);
@@ -210,6 +214,7 @@ class MockTranslator : public Translator<TestCell> {
     std::unordered_map<cid_t, std::vector<cid_t>> extra_cids_;
     std::atomic<int> get_cells_call_count_ = 0;
     std::vector<std::vector<cid_t>> requested_cids_;
+    int64_t loading_overhead_bytes_ = 0;
 
     // this class is not concurrent safe, so if for concurrent test, do not track usage
     bool for_concurrent_test_ = false;
@@ -1022,9 +1027,9 @@ class MockTranslatorWithWarmup : public Translator<TestCell> {
     estimated_byte_size_of_cell(cid_t cid) const override {
         auto it = cell_sizes_.find(cid);
         if (it != cell_sizes_.end()) {
-            return {{it->second, 0}, {it->second, 0}};
+            return {{it->second, 0}, {0, 0}};
         }
-        return {{1, 0}, {1, 0}};
+        return {{1, 0}, {0, 0}};
     }
 
     int64_t
@@ -1681,4 +1686,76 @@ TEST(AsyncWarmupTest, DisabledWarmupStillWorks) {
     EXPECT_EQ(translator_ptr->GetCellsCallCount(), 1);
 
     prefetch_pool->join();
+}
+
+// Test that CacheSlot correctly integrates with LoadingOverheadTracker when
+// the translator reports non-zero loading overhead.
+TEST(CacheSlotTrackerTest, LoadingOverheadTrackerIntegration) {
+    ResourceUsage limit{10000, 0};
+    auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
+
+    LoadingOverheadTracker tracker;
+    tracker.RegisterUpperBound(CellDataType::OTHER, {500, 0});
+
+    const int64_t cell_loaded_size = 100;
+    const int64_t cell_loading_overhead = 200;
+
+    auto translator = std::make_unique<MockTranslator>(
+        std::vector<std::pair<cid_t, int64_t>>{{0, cell_loaded_size}, {1, cell_loaded_size}},
+        std::unordered_map<cl_uid_t, cid_t>{{0, 0}, {1, 1}}, "test_tracker_integration", StorageType::MEMORY);
+    translator->SetLoadingOverheadBytes(cell_loading_overhead);
+    auto* translator_ptr = translator.get();
+
+    auto cache_slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, false,
+                                                            std::chrono::milliseconds(5000), &tracker);
+
+    auto op_ctx = std::make_unique<milvus::OpContext>();
+
+    // Pin cell 0: should reserve loaded(100) + overhead delta from tracker
+    auto accessor = cache_slot->PinCellsDirect(op_ctx.get(), {0});
+    ASSERT_NE(accessor, nullptr);
+    EXPECT_EQ(accessor->get_cell_of(0)->data, 0);
+
+    // Pin cell 1: should also go through tracker
+    auto accessor2 = cache_slot->PinCellsDirect(op_ctx.get(), {1});
+    ASSERT_NE(accessor2, nullptr);
+    EXPECT_EQ(accessor2->get_cell_of(1)->data, 10);
+
+    EXPECT_EQ(translator_ptr->GetCellsCallCount(), 2);
+}
+
+// Test that tracker state is properly cleaned up when load throws an exception.
+TEST(CacheSlotTrackerTest, LoadingOverheadTrackerCleanupOnException) {
+    ResourceUsage limit{10000, 0};
+    auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
+
+    LoadingOverheadTracker tracker;
+    tracker.RegisterUpperBound(CellDataType::OTHER, {500, 0});
+
+    const int64_t cell_loaded_size = 100;
+    const int64_t cell_loading_overhead = 200;
+
+    auto translator = std::make_unique<MockTranslator>(std::vector<std::pair<cid_t, int64_t>>{{0, cell_loaded_size}},
+                                                       std::unordered_map<cl_uid_t, cid_t>{{0, 0}},
+                                                       "test_tracker_exception", StorageType::MEMORY);
+    translator->SetLoadingOverheadBytes(cell_loading_overhead);
+    translator->SetShouldThrow(true);
+
+    auto cache_slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, false,
+                                                            std::chrono::milliseconds(5000), &tracker);
+
+    auto op_ctx = std::make_unique<milvus::OpContext>();
+
+    // Pin should fail because translator throws, but tracker state must be cleaned up.
+    // The exception is caught internally by RunLoad and set as error on the cell.
+    EXPECT_ANY_THROW(cache_slot->PinCellsDirect(op_ctx.get(), {0}));
+
+    // After the failed load, tracker state should be clean.
+    // Verify by reserving again — if state leaked, the tracker would have stale sum_of_overhead.
+    // Reserve the full UB amount — should succeed fully if no leak.
+    auto delta = tracker.Reserve(CellDataType::OTHER, {500, 0});
+    EXPECT_EQ(delta.memory_bytes, 500);
+
+    auto release = tracker.Release(CellDataType::OTHER, {500, 0});
+    EXPECT_EQ(release.memory_bytes, 500);
 }
