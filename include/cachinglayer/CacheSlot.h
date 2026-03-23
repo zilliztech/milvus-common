@@ -56,7 +56,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
 
     CacheSlot(std::unique_ptr<Translator<CellT>> translator, internal::DList* dlist, bool evictable, bool self_reserve,
               bool storage_usage_tracking_enabled, std::chrono::milliseconds loading_timeout,
-              std::chrono::milliseconds warmup_loading_timeout = std::chrono::milliseconds(-1))
+              std::chrono::milliseconds warmup_loading_timeout = std::chrono::milliseconds(0))
         : translator_(std::move(translator)),
           cell_id_mapping_mode_(translator_->meta()->cell_id_mapping_mode),
           cell_data_type_(translator_->meta()->cell_data_type),
@@ -650,7 +650,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     const bool storage_usage_tracking_enabled_;
     std::chrono::milliseconds loading_timeout_{100000};
     std::atomic<bool> warmup_called_{false};
-    std::chrono::milliseconds warmup_loading_timeout_{-1};
+    std::chrono::milliseconds warmup_loading_timeout_{0};
     std::atomic<bool> skip_pin_{false};
 };
 

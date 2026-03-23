@@ -35,7 +35,7 @@ class Manager {
     ConfigureTieredStorage(CacheWarmupPolicies warmup_policies, CacheLimit cache_limit,
                            bool storage_usage_tracking_enabled, bool eviction_enabled, EvictionConfig eviction_config,
                            std::chrono::milliseconds loading_timeout,
-                           std::chrono::milliseconds warmup_loading_timeout = std::chrono::milliseconds(-1),
+                           std::chrono::milliseconds warmup_loading_timeout = std::chrono::milliseconds(0),
                            uint32_t prefetch_pool_threads = 0);
 
     // Update runtime-configurable fields. Can be called from CGO at runtime.
