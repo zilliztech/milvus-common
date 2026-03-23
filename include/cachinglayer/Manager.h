@@ -63,10 +63,9 @@ class Manager {
         auto& config = TieredStorageConfig::GetInstance();
         auto evictable = translator->meta()->support_eviction && config.eviction_enabled();
         auto self_reserve = config.eviction_enabled();
-        auto cache_slot =
-            std::make_shared<CacheSlot<CellT>>(std::move(translator), dlist_.get(), evictable, self_reserve,
-                                               config.storage_usage_tracking_enabled(), config.loading_timeout(),
-                                               config.warmup_loading_timeout());
+        auto cache_slot = std::make_shared<CacheSlot<CellT>>(std::move(translator), dlist_.get(), evictable,
+                                                             self_reserve, config.storage_usage_tracking_enabled(),
+                                                             config.loading_timeout(), config.warmup_loading_timeout());
         cache_slot->Warmup(ctx, prefetch_pool_);
         return cache_slot;
     }

@@ -1123,8 +1123,7 @@ TEST_F(DListTest, ReserveDoesNotMissResourceReleaseNotification) {
         std::atomic<bool> reserve_done{false};
         std::atomic<bool> reserve_result{false};
         std::thread reserve_thread([&]() {
-            auto future =
-                dlist->ReserveLoadingResourceWithTimeout(reserve_size, std::chrono::milliseconds(5000));
+            auto future = dlist->ReserveLoadingResourceWithTimeout(reserve_size, std::chrono::milliseconds(5000));
             reserve_result = std::move(future).get();
             reserve_done = true;
         });

@@ -26,9 +26,11 @@ class TieredStorageConfig {
     }
 
     TieredStorageConfig(const TieredStorageConfig&) = delete;
-    TieredStorageConfig& operator=(const TieredStorageConfig&) = delete;
+    TieredStorageConfig&
+    operator=(const TieredStorageConfig&) = delete;
     TieredStorageConfig(TieredStorageConfig&&) = delete;
-    TieredStorageConfig& operator=(TieredStorageConfig&&) = delete;
+    TieredStorageConfig&
+    operator=(TieredStorageConfig&&) = delete;
 
     // --- Readers (shared lock) ---
 
