@@ -1098,3 +1098,53 @@ TEST_F(DListTest, ReserveWithZeroTimeoutSucceedsWhenResourcesFreed) {
     EXPECT_EQ(get_loading_memory(), reserve_size);
     EXPECT_EQ(get_used_memory(), node2->loaded_size());
 }
+
+// Regression test: verifies that resource release happening concurrently with
+// reserve does not cause the reserve request to miss the notification.
+// Before the fix, there was a race window between reserve failure and enqueue:
+// the lock was released and re-acquired, so a concurrent ReleaseLoadingResource
+// could call handleWaitingRequests() before the request was in the queue.
+TEST_F(DListTest, ReserveDoesNotMissResourceReleaseNotification) {
+    const int kIterations = 200;
+    for (int iter = 0; iter < kIterations; ++iter) {
+        // Reset DList for each iteration
+        managed_nodes.clear();
+        loading_nodes.clear();
+        dlist.reset();
+        dlist = std::make_shared<DList>(true, initial_limit, low_watermark, high_watermark, eviction_config_);
+
+        // Fill all capacity with loading resources so reserve will fail initially
+        ResourceUsage fill_size{100, 50};
+        ASSERT_TRUE(reserveLoadingMemorySync(fill_size));
+
+        ResourceUsage reserve_size{10, 5};
+
+        // Launch reserve in a background thread - it should enter the waiting queue
+        std::atomic<bool> reserve_done{false};
+        std::atomic<bool> reserve_result{false};
+        std::thread reserve_thread([&]() {
+            auto future =
+                dlist->ReserveLoadingResourceWithTimeout(reserve_size, std::chrono::milliseconds(5000));
+            reserve_result = std::move(future).get();
+            reserve_done = true;
+        });
+
+        // Yield to give the reserve thread a chance to enter the waiting queue.
+        // The race window (if the bug existed) is between the failed reserveResourceInternal
+        // and the enqueue; releasing here tries to hit that exact window.
+        std::this_thread::yield();
+
+        // Release enough resources so the waiting request can be satisfied
+        dlist->ReleaseLoadingResource(fill_size);
+
+        // Wait for reserve to complete
+        reserve_thread.join();
+
+        EXPECT_TRUE(reserve_done.load()) << "iteration " << iter;
+        EXPECT_TRUE(reserve_result.load()) << "Reserve timed out on iteration " << iter
+                                           << ". This suggests the request missed the resource release notification.";
+
+        // Clean up: release the reserved loading resource
+        dlist->ReleaseLoadingResource(reserve_size);
+    }
+}
