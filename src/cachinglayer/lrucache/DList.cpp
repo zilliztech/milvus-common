@@ -42,21 +42,18 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std
     // loading_resource_factor to avoid potential problems from bad resource estimation.
     auto size = original_size * eviction_config_.loading_resource_factor;
 
-    // First try immediate reservation
-    {
-        std::unique_lock<std::mutex> list_lock(list_mtx_);
-        if (!max_resource_limit_.load().CanHold(size)) {
-            LOG_ERROR("[MCL] Failed to reserve size={} as it exceeds max_memory_={}.", size.ToString(),
-                      max_resource_limit_.load().ToString());
-            return folly::makeSemiFuture(false);
-        }
-        if (reserveResourceInternal(size)) {
-            return folly::makeSemiFuture(true);
-        }
-    }
-
-    // If immediate reservation fails, add to waiting queue
+    // Try immediate reservation; if it fails, enqueue atomically under the same lock
+    // to avoid a race window where resources could be released and notified between
+    // a failed reserve and the enqueue.
     std::unique_lock<std::mutex> lock(list_mtx_);
+    if (!max_resource_limit_.load().CanHold(size)) {
+        LOG_ERROR("[MCL] Failed to reserve size={} as it exceeds max_memory_={}.", size.ToString(),
+                  max_resource_limit_.load().ToString());
+        return folly::makeSemiFuture(false);
+    }
+    if (reserveResourceInternal(size)) {
+        return folly::makeSemiFuture(true);
+    }
 
     auto deadline =
         timeout.count() > 0 ? std::chrono::steady_clock::now() + timeout : std::chrono::steady_clock::time_point::max();
