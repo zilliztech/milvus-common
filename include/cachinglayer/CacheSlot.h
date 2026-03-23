@@ -24,6 +24,7 @@
 #include <flat_hash_map/flat_hash_map.hpp>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -53,7 +54,8 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                   "representing the memory consumption of the cell");
 
     CacheSlot(std::unique_ptr<Translator<CellT>> translator, internal::DList* dlist, bool evictable, bool self_reserve,
-              bool storage_usage_tracking_enabled, std::chrono::milliseconds loading_timeout)
+              bool storage_usage_tracking_enabled, std::chrono::milliseconds loading_timeout,
+              std::chrono::milliseconds warmup_loading_timeout = std::chrono::milliseconds(-1))
         : translator_(std::move(translator)),
           cell_id_mapping_mode_(translator_->meta()->cell_id_mapping_mode),
           cell_data_type_(translator_->meta()->cell_data_type),
@@ -62,7 +64,8 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
           evictable_(evictable),
           self_reserve_(self_reserve),
           storage_usage_tracking_enabled_(storage_usage_tracking_enabled),
-          loading_timeout_(loading_timeout) {
+          loading_timeout_(loading_timeout),
+          warmup_loading_timeout_(warmup_loading_timeout) {
         cells_.reserve(translator_->num_cells());
         for (cid_t i = 0; i < static_cast<cid_t>(translator_->num_cells()); ++i) {
             cells_.push_back(std::make_unique<CacheCell>(this, i));
@@ -102,7 +105,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                                 return;
                             }
                             // Note: ctx is not captured - async warmup doesn't track storage usage
-                            self->PinCellsDirect(nullptr, cids);
+                            self->PinCellsDirect(nullptr, cids, self->warmup_loading_timeout_);
                             // If the slot is not evictable, we don't need to pin the cells anymore after warmup.
                             self->skip_pin_.store(!self->evictable_, std::memory_order_release);
                         } catch (const std::exception& e) {
@@ -114,8 +117,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                 // Fallback to sync if no pool provided
                 LOG_WARN("[MCL] Async warmup requested but no prefetch pool provided, falling back to sync");
                 // TODO: Warmup is not tracked for now
-                PinCellsDirect(ctx, cids);
-                // If the slot is not evictable, we don't need to pin the cells anymore after warmup.
+                PinCellsDirect(ctx, cids, warmup_loading_timeout_);
                 skip_pin_.store(!evictable_, std::memory_order_release);
                 return;
             }
@@ -124,8 +126,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                 auto cids = AllCellIds();
                 // Sync warmup (original behavior)
                 // TODO: Warmup is not tracked for now
-                PinCellsDirect(ctx, cids);
-                // If the slot is not evictable, we don't need to pin the cells anymore after warmup.
+                PinCellsDirect(ctx, cids, warmup_loading_timeout_);
                 skip_pin_.store(!evictable_, std::memory_order_release);
                 return;
             }
@@ -235,7 +236,8 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     }
 
     std::shared_ptr<CellAccessor<CellT>>
-    PinCellsDirect(OpContext* ctx, const std::vector<uid_t>& uids) {
+    PinCellsDirect(OpContext* ctx, const std::vector<uid_t>& uids,
+                   std::optional<std::chrono::milliseconds> timeout_override = std::nullopt) {
         if (skip_pin_.load(std::memory_order_acquire)) {
             return std::make_shared<CellAccessor<CellT>>(this->shared_from_this(),
                                                          std::vector<internal::ListNode::NodePin>());
@@ -266,7 +268,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         std::vector<cid_t> involved_cids_vec;
         involved_cids_vec.reserve(involved_cids.size());
         std::copy(involved_cids.begin(), involved_cids.end(), std::back_inserter(involved_cids_vec));
-        return PinInternal(ctx, involved_cids_vec, loading_timeout_);
+        return PinInternal(ctx, involved_cids_vec, timeout_override.value_or(loading_timeout_));
     }
 
     // Manually evicts the cell if it is LOADED and not pinned.
@@ -632,6 +634,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     const bool self_reserve_;
     const bool storage_usage_tracking_enabled_;
     std::chrono::milliseconds loading_timeout_{100000};
+    std::chrono::milliseconds warmup_loading_timeout_{-1};
     std::atomic<bool> skip_pin_{false};
 };
 
