@@ -25,27 +25,15 @@ class TieredStorageConfigTest : public ::testing::Test {
     void
     TearDown() override {
         // Reset to defaults after each test
-        config.SetEvictionEnabled(false);
-        config.SetStorageUsageTrackingEnabled(false);
-        config.SetLoadingTimeout(std::chrono::milliseconds(100000));
-        config.SetWarmupLoadingTimeout(std::chrono::milliseconds(0));
-        config.SetWarmupPolicies(CacheWarmupPolicies{});
+        config.UpdateAll(false, std::chrono::milliseconds(100000), std::chrono::milliseconds(0),
+                         CacheWarmupPolicies{});
     }
 };
 
 TEST_F(TieredStorageConfigTest, DefaultValues) {
-    EXPECT_FALSE(config.eviction_enabled());
     EXPECT_FALSE(config.storage_usage_tracking_enabled());
     EXPECT_EQ(config.loading_timeout(), std::chrono::milliseconds(100000));
     EXPECT_EQ(config.warmup_loading_timeout(), std::chrono::milliseconds(0));
-}
-
-TEST_F(TieredStorageConfigTest, SetAndGetEvictionEnabled) {
-    config.SetEvictionEnabled(true);
-    EXPECT_TRUE(config.eviction_enabled());
-
-    config.SetEvictionEnabled(false);
-    EXPECT_FALSE(config.eviction_enabled());
 }
 
 TEST_F(TieredStorageConfigTest, SetAndGetStorageUsageTracking) {
@@ -65,6 +53,7 @@ TEST_F(TieredStorageConfigTest, SetAndGetWarmupLoadingTimeout) {
     config.SetWarmupLoadingTimeout(std::chrono::milliseconds(3000));
     EXPECT_EQ(config.warmup_loading_timeout(), std::chrono::milliseconds(3000));
 
+    // Zero means best-effort (fail immediately, no waiting queue)
     config.SetWarmupLoadingTimeout(std::chrono::milliseconds(0));
     EXPECT_EQ(config.warmup_loading_timeout(), std::chrono::milliseconds(0));
 }
@@ -82,16 +71,48 @@ TEST_F(TieredStorageConfigTest, SetAndGetWarmupPolicies) {
     EXPECT_EQ(result.vectorIndexCacheWarmupPolicy, CacheWarmupPolicy::CacheWarmupPolicy_Async);
 }
 
+TEST_F(TieredStorageConfigTest, SnapshotReturnsConsistentView) {
+    config.UpdateAll(true, std::chrono::milliseconds(5000), std::chrono::milliseconds(200),
+                     CacheWarmupPolicies(CacheWarmupPolicy::CacheWarmupPolicy_Async,
+                                         CacheWarmupPolicy::CacheWarmupPolicy_Async,
+                                         CacheWarmupPolicy::CacheWarmupPolicy_Async,
+                                         CacheWarmupPolicy::CacheWarmupPolicy_Async));
+
+    auto snapshot = config.GetSnapshot();
+    EXPECT_TRUE(snapshot.storage_usage_tracking_enabled);
+    EXPECT_EQ(snapshot.loading_timeout, std::chrono::milliseconds(5000));
+    EXPECT_EQ(snapshot.warmup_loading_timeout, std::chrono::milliseconds(200));
+    EXPECT_EQ(snapshot.warmup_policies.scalarFieldCacheWarmupPolicy, CacheWarmupPolicy::CacheWarmupPolicy_Async);
+}
+
+TEST_F(TieredStorageConfigTest, UpdateAllIsAtomic) {
+    // Set initial values
+    config.UpdateAll(false, std::chrono::milliseconds(100), std::chrono::milliseconds(0), CacheWarmupPolicies{});
+
+    // Update all fields atomically
+    CacheWarmupPolicies new_policies(CacheWarmupPolicy::CacheWarmupPolicy_Disable,
+                                     CacheWarmupPolicy::CacheWarmupPolicy_Disable,
+                                     CacheWarmupPolicy::CacheWarmupPolicy_Disable,
+                                     CacheWarmupPolicy::CacheWarmupPolicy_Disable);
+    config.UpdateAll(true, std::chrono::milliseconds(9999), std::chrono::milliseconds(42), new_policies);
+
+    // Snapshot should see all new values together
+    auto snapshot = config.GetSnapshot();
+    EXPECT_TRUE(snapshot.storage_usage_tracking_enabled);
+    EXPECT_EQ(snapshot.loading_timeout, std::chrono::milliseconds(9999));
+    EXPECT_EQ(snapshot.warmup_loading_timeout, std::chrono::milliseconds(42));
+    EXPECT_EQ(snapshot.warmup_policies.scalarFieldCacheWarmupPolicy, CacheWarmupPolicy::CacheWarmupPolicy_Disable);
+}
+
 TEST_F(TieredStorageConfigTest, ConcurrentReadsAndWrites) {
-    // Smoke test: concurrent readers and a writer don't crash
+    // Smoke test: concurrent snapshot readers and UpdateAll writer don't crash
     std::atomic<bool> stop{false};
 
-    // Readers
     std::vector<std::thread> readers;
     for (int i = 0; i < 4; ++i) {
         readers.emplace_back([&]() {
             while (!stop.load()) {
-                (void)config.eviction_enabled();
+                (void)config.GetSnapshot();
                 (void)config.loading_timeout();
                 (void)config.warmup_loading_timeout();
                 (void)config.storage_usage_tracking_enabled();
@@ -100,13 +121,10 @@ TEST_F(TieredStorageConfigTest, ConcurrentReadsAndWrites) {
         });
     }
 
-    // Writer
     std::thread writer([&]() {
         for (int i = 0; i < 100; ++i) {
-            config.SetEvictionEnabled(i % 2 == 0);
-            config.SetLoadingTimeout(std::chrono::milliseconds(i * 100));
-            config.SetWarmupLoadingTimeout(std::chrono::milliseconds(i));
-            config.SetStorageUsageTrackingEnabled(i % 3 == 0);
+            config.UpdateAll(i % 3 == 0, std::chrono::milliseconds(i * 100), std::chrono::milliseconds(i),
+                             CacheWarmupPolicies{});
         }
         stop.store(true);
     });

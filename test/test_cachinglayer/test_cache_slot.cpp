@@ -1685,7 +1685,7 @@ TEST(AsyncWarmupTest, DisabledWarmupStillWorks) {
 
 // ==================== Warmup Loading Timeout Tests ====================
 
-// Test that sync warmup with best-effort timeout (-1) throws when resources are unavailable
+// Test that sync warmup with best-effort timeout (0) throws when resources are unavailable
 TEST(WarmupTimeoutTest, SyncWarmupBestEffortThrowsOnResourceUnavailable) {
     // Create a very small DList so reservation will fail
     auto limit = ResourceUsage{50, 0};
@@ -1702,7 +1702,7 @@ TEST(WarmupTimeoutTest, SyncWarmupBestEffortThrowsOnResourceUnavailable) {
         std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
                                               std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
 
-    // Warmup should throw immediately (not block) since negative timeout skips queuing
+    // Warmup should throw immediately (not block) since zero timeout skips queuing
     auto start = std::chrono::steady_clock::now();
     EXPECT_THROW(cache_slot->Warmup(nullptr), std::exception);
     auto duration = std::chrono::steady_clock::now() - start;

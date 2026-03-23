@@ -29,8 +29,7 @@ class Manager {
     static Manager&
     GetInstance();
 
-    // This function is not thread safe, must be called exactly once before any CacheSlot is created,
-    // and before any Manager instance method is called.
+    // Must be called exactly once before any CacheSlot is created.
     static void
     ConfigureTieredStorage(CacheWarmupPolicies warmup_policies, CacheLimit cache_limit,
                            bool storage_usage_tracking_enabled, bool eviction_enabled, EvictionConfig eviction_config,
@@ -41,7 +40,7 @@ class Manager {
     // Update runtime-configurable fields. Can be called from CGO at runtime.
     static void
     UpdateConfig(std::chrono::milliseconds loading_timeout, std::chrono::milliseconds warmup_loading_timeout,
-                 bool storage_usage_tracking_enabled, bool eviction_enabled, CacheWarmupPolicies warmup_policies);
+                 bool storage_usage_tracking_enabled, CacheWarmupPolicies warmup_policies);
 
     ~Manager();
 
@@ -60,12 +59,12 @@ class Manager {
         if (ctx && ctx->cancellation_token.isCancellationRequested()) {
             throw std::runtime_error("Operation cancelled, stop creating cache slot");
         }
-        auto& config = TieredStorageConfig::GetInstance();
-        auto evictable = translator->meta()->support_eviction && config.eviction_enabled();
-        auto self_reserve = config.eviction_enabled();
+        auto config = TieredStorageConfig::GetInstance().GetSnapshot();
+        auto evictable = translator->meta()->support_eviction && eviction_enabled_;
+        auto self_reserve = eviction_enabled_;
         auto cache_slot = std::make_shared<CacheSlot<CellT>>(std::move(translator), dlist_.get(), evictable,
-                                                             self_reserve, config.storage_usage_tracking_enabled(),
-                                                             config.loading_timeout(), config.warmup_loading_timeout());
+                                                             self_reserve, config.storage_usage_tracking_enabled,
+                                                             config.loading_timeout, config.warmup_loading_timeout);
         cache_slot->Warmup(ctx, prefetch_pool_);
         return cache_slot;
     }
@@ -132,7 +131,7 @@ class Manager {
 
     [[nodiscard]] bool
     isEvictionEnabled() const {
-        return TieredStorageConfig::GetInstance().eviction_enabled();
+        return eviction_enabled_;
     }
 
     [[nodiscard]] std::shared_ptr<folly::CPUThreadPoolExecutor>
@@ -145,6 +144,7 @@ class Manager {
 
     std::shared_ptr<internal::DList> dlist_{nullptr};
     std::shared_ptr<folly::CPUThreadPoolExecutor> prefetch_pool_{nullptr};
+    bool eviction_enabled_{false};
 };  // class Manager
 
 }  // namespace milvus::cachinglayer
