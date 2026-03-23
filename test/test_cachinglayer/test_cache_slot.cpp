@@ -1613,13 +1613,13 @@ TEST(WarmupTimeoutTest, SyncWarmupBestEffortThrowsOnResourceUnavailable) {
     // Cell sizes are large relative to the DList capacity
     std::vector<std::pair<cid_t, int64_t>> cell_sizes = {{0, 100}, {1, 100}};
     std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map = {{0, 0}, {1, 1}};
-    auto translator = std::make_unique<MockTranslatorWithWarmup>(
-        cell_sizes, uid_to_cid_map, "warmup_timeout_slot", StorageType::MEMORY,
-        CacheWarmupPolicy::CacheWarmupPolicy_Sync);
+    auto translator =
+        std::make_unique<MockTranslatorWithWarmup>(cell_sizes, uid_to_cid_map, "warmup_timeout_slot",
+                                                   StorageType::MEMORY, CacheWarmupPolicy::CacheWarmupPolicy_Sync);
 
-    auto cache_slot = std::make_shared<CacheSlot<TestCell>>(
-        std::move(translator), dlist.get(), true, true, true,
-        std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
+    auto cache_slot =
+        std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                              std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
 
     // Warmup should throw immediately (not block) since negative timeout skips queuing
     auto start = std::chrono::steady_clock::now();
@@ -1636,16 +1636,16 @@ TEST(WarmupTimeoutTest, AsyncWarmupBestEffortResourceUnavailable) {
 
     std::vector<std::pair<cid_t, int64_t>> cell_sizes = {{0, 100}, {1, 100}};
     std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map = {{0, 0}, {1, 1}};
-    auto translator = std::make_unique<MockTranslatorWithWarmup>(
-        cell_sizes, uid_to_cid_map, "async_warmup_timeout_slot", StorageType::MEMORY,
-        CacheWarmupPolicy::CacheWarmupPolicy_Async);
+    auto translator =
+        std::make_unique<MockTranslatorWithWarmup>(cell_sizes, uid_to_cid_map, "async_warmup_timeout_slot",
+                                                   StorageType::MEMORY, CacheWarmupPolicy::CacheWarmupPolicy_Async);
     auto* translator_ptr = translator.get();
 
     auto prefetch_pool = std::make_shared<folly::CPUThreadPoolExecutor>(2);
 
-    auto cache_slot = std::make_shared<CacheSlot<TestCell>>(
-        std::move(translator), dlist.get(), true, true, true,
-        std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
+    auto cache_slot =
+        std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                              std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
 
     // Async warmup dispatches to thread pool, should not throw here
     EXPECT_NO_THROW(cache_slot->Warmup(nullptr, prefetch_pool));
@@ -1666,14 +1666,14 @@ TEST(WarmupTimeoutTest, CellsLoadableAfterWarmupFailure) {
 
     std::vector<std::pair<cid_t, int64_t>> cell_sizes = {{0, 100}, {1, 100}};
     std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map = {{0, 0}, {1, 1}};
-    auto translator = std::make_unique<MockTranslatorWithWarmup>(
-        cell_sizes, uid_to_cid_map, "warmup_then_load_slot", StorageType::MEMORY,
-        CacheWarmupPolicy::CacheWarmupPolicy_Sync);
+    auto translator =
+        std::make_unique<MockTranslatorWithWarmup>(cell_sizes, uid_to_cid_map, "warmup_then_load_slot",
+                                                   StorageType::MEMORY, CacheWarmupPolicy::CacheWarmupPolicy_Sync);
     auto* translator_ptr = translator.get();
 
-    auto cache_slot = std::make_shared<CacheSlot<TestCell>>(
-        std::move(translator), dlist.get(), true, true, true,
-        std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
+    auto cache_slot =
+        std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                              std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
 
     // Warmup throws (resources too small)
     EXPECT_THROW(cache_slot->Warmup(nullptr), std::exception);
@@ -1705,14 +1705,14 @@ TEST(WarmupTimeoutTest, SyncWarmupBestEffortResourceAvailable) {
 
     std::vector<std::pair<cid_t, int64_t>> cell_sizes = {{0, 100}, {1, 100}};
     std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map = {{0, 0}, {1, 1}};
-    auto translator = std::make_unique<MockTranslatorWithWarmup>(
-        cell_sizes, uid_to_cid_map, "warmup_success_slot", StorageType::MEMORY,
-        CacheWarmupPolicy::CacheWarmupPolicy_Sync);
+    auto translator =
+        std::make_unique<MockTranslatorWithWarmup>(cell_sizes, uid_to_cid_map, "warmup_success_slot",
+                                                   StorageType::MEMORY, CacheWarmupPolicy::CacheWarmupPolicy_Sync);
     auto* translator_ptr = translator.get();
 
-    auto cache_slot = std::make_shared<CacheSlot<TestCell>>(
-        std::move(translator), dlist.get(), true, true, true,
-        std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
+    auto cache_slot =
+        std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                              std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
 
     EXPECT_NO_THROW(cache_slot->Warmup(nullptr));
     EXPECT_EQ(translator_ptr->GetCellsCallCount(), 1);

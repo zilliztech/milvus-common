@@ -72,8 +72,7 @@ TEST_F(TieredStorageConfigTest, SetAndGetWarmupLoadingTimeout) {
 TEST_F(TieredStorageConfigTest, SetAndGetWarmupPolicies) {
     CacheWarmupPolicies policies(CacheWarmupPolicy::CacheWarmupPolicy_Async,
                                  CacheWarmupPolicy::CacheWarmupPolicy_Disable,
-                                 CacheWarmupPolicy::CacheWarmupPolicy_Sync,
-                                 CacheWarmupPolicy::CacheWarmupPolicy_Async);
+                                 CacheWarmupPolicy::CacheWarmupPolicy_Sync, CacheWarmupPolicy::CacheWarmupPolicy_Async);
     config.SetWarmupPolicies(policies);
 
     auto result = config.warmup_policies();
@@ -117,4 +116,3 @@ TEST_F(TieredStorageConfigTest, ConcurrentReadsAndWrites) {
         r.join();
     }
 }
-
