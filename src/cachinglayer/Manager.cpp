@@ -41,13 +41,10 @@ Manager::ConfigureTieredStorage(CacheWarmupPolicies warmup_policies, CacheLimit 
     static std::once_flag init_once;
     std::call_once(init_once, [&]() {
         auto& config = TieredStorageConfig::GetInstance();
-        config.SetWarmupPolicies(warmup_policies);
-        config.SetStorageUsageTrackingEnabled(storage_usage_tracking_enabled);
-        config.SetEvictionEnabled(eviction_enabled);
-        config.SetLoadingTimeout(loading_timeout);
-        config.SetWarmupLoadingTimeout(warmup_loading_timeout);
+        config.UpdateAll(storage_usage_tracking_enabled, loading_timeout, warmup_loading_timeout, warmup_policies);
 
         Manager& manager = GetInstance();
+        manager.eviction_enabled_ = eviction_enabled;
 
         if (prefetch_pool_threads > 0) {
             manager.prefetch_pool_ = std::make_shared<folly::CPUThreadPoolExecutor>(
@@ -83,17 +80,13 @@ Manager::ConfigureTieredStorage(CacheWarmupPolicies warmup_policies, CacheLimit 
 
 void
 Manager::UpdateConfig(std::chrono::milliseconds loading_timeout, std::chrono::milliseconds warmup_loading_timeout,
-                      bool storage_usage_tracking_enabled, bool eviction_enabled, CacheWarmupPolicies warmup_policies) {
-    auto& config = TieredStorageConfig::GetInstance();
-    config.SetLoadingTimeout(loading_timeout);
-    config.SetWarmupLoadingTimeout(warmup_loading_timeout);
-    config.SetStorageUsageTrackingEnabled(storage_usage_tracking_enabled);
-    config.SetEvictionEnabled(eviction_enabled);
-    config.SetWarmupPolicies(warmup_policies);
+                      bool storage_usage_tracking_enabled, CacheWarmupPolicies warmup_policies) {
+    TieredStorageConfig::GetInstance().UpdateAll(storage_usage_tracking_enabled, loading_timeout,
+                                                 warmup_loading_timeout, warmup_policies);
     LOG_INFO(
         "[MCL] Config updated: loading_timeout={}ms, warmup_loading_timeout={}ms, "
-        "storage_usage_tracking={}, eviction={}, warmup_policies={}",
-        loading_timeout.count(), warmup_loading_timeout.count(), storage_usage_tracking_enabled, eviction_enabled,
+        "storage_usage_tracking={}, warmup_policies={}",
+        loading_timeout.count(), warmup_loading_timeout.count(), storage_usage_tracking_enabled,
         warmup_policies.ToString());
 }
 

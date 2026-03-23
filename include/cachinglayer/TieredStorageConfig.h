@@ -17,8 +17,19 @@
 
 namespace milvus::cachinglayer {
 
+// Runtime-updatable configuration for the caching layer.
+// Fields here can be changed at runtime via UpdateAll() (called from CGO).
+// Fields that are init-only (eviction_enabled, prefetch_pool, DList) live in Manager.
 class TieredStorageConfig {
  public:
+    // Consistent snapshot of all config fields, read under a single lock hold.
+    struct Snapshot {
+        bool storage_usage_tracking_enabled;
+        std::chrono::milliseconds loading_timeout;
+        std::chrono::milliseconds warmup_loading_timeout;
+        CacheWarmupPolicies warmup_policies;
+    };
+
     static TieredStorageConfig&
     GetInstance() {
         static TieredStorageConfig instance;
@@ -32,13 +43,15 @@ class TieredStorageConfig {
     TieredStorageConfig&
     operator=(TieredStorageConfig&&) = delete;
 
-    // --- Readers (shared lock) ---
+    // --- Snapshot read (single lock hold) ---
 
-    [[nodiscard]] bool
-    eviction_enabled() const {
+    [[nodiscard]] Snapshot
+    GetSnapshot() const {
         std::shared_lock lock(mtx_);
-        return eviction_enabled_;
+        return {storage_usage_tracking_enabled_, loading_timeout_, warmup_loading_timeout_, warmup_policies_};
     }
+
+    // --- Individual readers (shared lock) ---
 
     [[nodiscard]] bool
     storage_usage_tracking_enabled() const {
@@ -64,13 +77,19 @@ class TieredStorageConfig {
         return warmup_policies_;
     }
 
-    // --- Writers (exclusive lock) ---
+    // --- Atomic bulk update (single exclusive lock hold) ---
 
     void
-    SetEvictionEnabled(bool enabled) {
+    UpdateAll(bool storage_usage_tracking_enabled, std::chrono::milliseconds loading_timeout,
+              std::chrono::milliseconds warmup_loading_timeout, CacheWarmupPolicies warmup_policies) {
         std::unique_lock lock(mtx_);
-        eviction_enabled_ = enabled;
+        storage_usage_tracking_enabled_ = storage_usage_tracking_enabled;
+        loading_timeout_ = loading_timeout;
+        warmup_loading_timeout_ = warmup_loading_timeout;
+        warmup_policies_ = warmup_policies;
     }
+
+    // --- Individual writers (exclusive lock) ---
 
     void
     SetStorageUsageTrackingEnabled(bool enabled) {
@@ -100,7 +119,6 @@ class TieredStorageConfig {
     TieredStorageConfig() = default;
 
     mutable std::shared_mutex mtx_;
-    bool eviction_enabled_{false};
     bool storage_usage_tracking_enabled_{false};
     std::chrono::milliseconds loading_timeout_{100000};
     std::chrono::milliseconds warmup_loading_timeout_{0};
