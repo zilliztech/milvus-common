@@ -229,7 +229,11 @@ DList::evictionLoop() {
         const auto min_eviction = ResourceUsage{0, 0};
         const auto evicted =
             tryEvict(eviction_target, min_eviction, eviction_config_.cache_cell_unaccessed_survival_time.count() > 0);
-        if (evicted.AnyGTZero()) {
+        // Always try to handle waiting requests if the queue is non-empty,
+        // not just after successful eviction. Resources may have been freed
+        // by other paths (ReleaseLoadingResource, RefundLoadedResource) between
+        // loop iterations without fully draining the queue.
+        if (evicted.AnyGTZero() || !waiting_queue_empty_) {
             auto to_destroy = handleWaitingRequests();
             lock.unlock();
             // Destroy requests outside lock to avoid deadlock with cancel callbacks
