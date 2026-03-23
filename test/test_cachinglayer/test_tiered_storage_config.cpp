@@ -28,7 +28,7 @@ class TieredStorageConfigTest : public ::testing::Test {
         config.SetEvictionEnabled(false);
         config.SetStorageUsageTrackingEnabled(false);
         config.SetLoadingTimeout(std::chrono::milliseconds(100000));
-        config.SetWarmupLoadingTimeout(std::chrono::milliseconds(-1));
+        config.SetWarmupLoadingTimeout(std::chrono::milliseconds(0));
         config.SetWarmupPolicies(CacheWarmupPolicies{});
     }
 };
@@ -37,7 +37,7 @@ TEST_F(TieredStorageConfigTest, DefaultValues) {
     EXPECT_FALSE(config.eviction_enabled());
     EXPECT_FALSE(config.storage_usage_tracking_enabled());
     EXPECT_EQ(config.loading_timeout(), std::chrono::milliseconds(100000));
-    EXPECT_EQ(config.warmup_loading_timeout(), std::chrono::milliseconds(-1));
+    EXPECT_EQ(config.warmup_loading_timeout(), std::chrono::milliseconds(0));
 }
 
 TEST_F(TieredStorageConfigTest, SetAndGetEvictionEnabled) {
@@ -65,8 +65,8 @@ TEST_F(TieredStorageConfigTest, SetAndGetWarmupLoadingTimeout) {
     config.SetWarmupLoadingTimeout(std::chrono::milliseconds(3000));
     EXPECT_EQ(config.warmup_loading_timeout(), std::chrono::milliseconds(3000));
 
-    config.SetWarmupLoadingTimeout(std::chrono::milliseconds(-1));
-    EXPECT_EQ(config.warmup_loading_timeout(), std::chrono::milliseconds(-1));
+    config.SetWarmupLoadingTimeout(std::chrono::milliseconds(0));
+    EXPECT_EQ(config.warmup_loading_timeout(), std::chrono::milliseconds(0));
 }
 
 TEST_F(TieredStorageConfigTest, SetAndGetWarmupPolicies) {

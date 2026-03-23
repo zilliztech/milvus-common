@@ -1619,7 +1619,7 @@ TEST(WarmupTimeoutTest, SyncWarmupBestEffortThrowsOnResourceUnavailable) {
 
     auto cache_slot = std::make_shared<CacheSlot<TestCell>>(
         std::move(translator), dlist.get(), true, true, true,
-        std::chrono::milliseconds(100000), std::chrono::milliseconds(-1));
+        std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
 
     // Warmup should throw immediately (not block) since negative timeout skips queuing
     auto start = std::chrono::steady_clock::now();
@@ -1645,7 +1645,7 @@ TEST(WarmupTimeoutTest, AsyncWarmupBestEffortResourceUnavailable) {
 
     auto cache_slot = std::make_shared<CacheSlot<TestCell>>(
         std::move(translator), dlist.get(), true, true, true,
-        std::chrono::milliseconds(100000), std::chrono::milliseconds(-1));
+        std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
 
     // Async warmup dispatches to thread pool, should not throw here
     EXPECT_NO_THROW(cache_slot->Warmup(nullptr, prefetch_pool));
@@ -1673,7 +1673,7 @@ TEST(WarmupTimeoutTest, CellsLoadableAfterWarmupFailure) {
 
     auto cache_slot = std::make_shared<CacheSlot<TestCell>>(
         std::move(translator), dlist.get(), true, true, true,
-        std::chrono::milliseconds(100000), std::chrono::milliseconds(-1));
+        std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
 
     // Warmup throws (resources too small)
     EXPECT_THROW(cache_slot->Warmup(nullptr), std::exception);
@@ -1712,7 +1712,7 @@ TEST(WarmupTimeoutTest, SyncWarmupBestEffortResourceAvailable) {
 
     auto cache_slot = std::make_shared<CacheSlot<TestCell>>(
         std::move(translator), dlist.get(), true, true, true,
-        std::chrono::milliseconds(100000), std::chrono::milliseconds(-1));
+        std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
 
     EXPECT_NO_THROW(cache_slot->Warmup(nullptr));
     EXPECT_EQ(translator_ptr->GetCellsCallCount(), 1);

@@ -101,7 +101,7 @@ class TieredStorageConfig {
     bool eviction_enabled_{false};
     bool storage_usage_tracking_enabled_{false};
     std::chrono::milliseconds loading_timeout_{100000};
-    std::chrono::milliseconds warmup_loading_timeout_{-1};
+    std::chrono::milliseconds warmup_loading_timeout_{0};
     CacheWarmupPolicies warmup_policies_{};
 };
 

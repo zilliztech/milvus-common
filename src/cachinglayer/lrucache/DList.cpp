@@ -55,8 +55,8 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std
         return folly::makeSemiFuture(true);
     }
 
-    // Negative timeout means best-effort: fail immediately without entering the waiting queue.
-    if (timeout.count() < 0) {
+    // Zero timeout means best-effort: fail immediately without entering the waiting queue.
+    if (timeout.count() == 0) {
         return folly::makeSemiFuture(false);
     }
 
