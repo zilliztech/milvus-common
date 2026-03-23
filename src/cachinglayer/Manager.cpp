@@ -36,6 +36,7 @@ void
 Manager::ConfigureTieredStorage(CacheWarmupPolicies warmup_policies, CacheLimit cache_limit,
                                 bool storage_usage_tracking_enabled, bool eviction_enabled,
                                 EvictionConfig eviction_config, std::chrono::milliseconds loading_timeout,
+                                std::chrono::milliseconds warmup_loading_timeout,
                                 uint32_t prefetch_pool_threads) {
     static std::once_flag once;
     std::call_once(once, [&]() {
@@ -44,6 +45,7 @@ Manager::ConfigureTieredStorage(CacheWarmupPolicies warmup_policies, CacheLimit 
         manager.storage_usage_tracking_enabled_ = storage_usage_tracking_enabled;
         manager.eviction_enabled_ = eviction_enabled;
         manager.loading_timeout_ = loading_timeout;
+        manager.warmup_loading_timeout_ = warmup_loading_timeout;
 
         if (prefetch_pool_threads > 0) {
             manager.prefetch_pool_ = std::make_shared<folly::CPUThreadPoolExecutor>(

@@ -1148,3 +1148,53 @@ TEST_F(DListTest, ReserveDoesNotMissResourceReleaseNotification) {
         dlist->ReleaseLoadingResource(reserve_size);
     }
 }
+
+TEST_F(DListTest, ReserveWithNegativeTimeoutImmediateSuccess) {
+    // Negative timeout should still succeed if resources are available
+    ResourceUsage size{20, 10};
+    auto future = dlist->ReserveLoadingResourceWithTimeout(size, std::chrono::milliseconds(-1));
+    EXPECT_TRUE(std::move(future).get());
+    EXPECT_EQ(get_loading_memory(), size);
+}
+
+TEST_F(DListTest, ReserveWithNegativeTimeoutImmediateFailure) {
+    // Fill up the cache with pinned nodes so reservation must fail
+    MockListNode* node1 = add_and_load_node({30, 15}, "key1", 0, 1);  // Pinned, cannot evict
+    MockListNode* node2 = add_and_load_node({20, 10}, "key2", 0, 1);  // Pinned, cannot evict
+    ASSERT_EQ(get_used_memory(), node1->loaded_size() + node2->loaded_size());
+
+    EXPECT_CALL(*node1, unload()).Times(0);
+    EXPECT_CALL(*node2, unload()).Times(0);
+
+    auto start = std::chrono::steady_clock::now();
+
+    // Negative timeout: should fail immediately without entering the queue
+    ResourceUsage reserve_size{60, 30};
+    auto future = dlist->ReserveLoadingResourceWithTimeout(reserve_size, std::chrono::milliseconds(-1));
+    EXPECT_FALSE(std::move(future).get());
+
+    auto duration = std::chrono::steady_clock::now() - start;
+
+    // Should return almost instantly (no queuing, no waiting)
+    EXPECT_LT(duration, std::chrono::milliseconds(50));
+    EXPECT_EQ(get_loading_memory(), ResourceUsage{});
+}
+
+TEST_F(DListTest, ReserveWithNegativeTimeoutEvictsAndSucceeds) {
+    // Add evictable (unpinned) nodes
+    MockListNode* node1 = add_and_load_node({30, 15}, "key1", 0, 0);  // Unpinned, can evict
+    MockListNode* node2 = add_and_load_node({20, 10}, "key2", 0, 0);  // Unpinned, can evict
+    ASSERT_EQ(get_used_memory(), node1->loaded_size() + node2->loaded_size());
+
+    // Eviction should happen for the unpinned nodes
+    EXPECT_CALL(*node1, unload()).Times(1);
+    EXPECT_CALL(*node2, unload()).Times(testing::AtMost(1));
+
+    // Need more than available headroom, but eviction can free enough space
+    ResourceUsage reserve_size{60, 30};
+    auto future = dlist->ReserveLoadingResourceWithTimeout(reserve_size, std::chrono::milliseconds(-1));
+    EXPECT_TRUE(std::move(future).get());
+    EXPECT_EQ(get_loading_memory(), reserve_size);
+
+    dlist->ReleaseLoadingResource(reserve_size);
+}

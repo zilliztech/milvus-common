@@ -34,7 +34,9 @@ class Manager {
     static void
     ConfigureTieredStorage(CacheWarmupPolicies warmup_policies, CacheLimit cache_limit,
                            bool storage_usage_tracking_enabled, bool eviction_enabled, EvictionConfig eviction_config,
-                           std::chrono::milliseconds loading_timeout, uint32_t prefetch_pool_threads = 0);
+                           std::chrono::milliseconds loading_timeout,
+                           std::chrono::milliseconds warmup_loading_timeout = std::chrono::milliseconds(-1),
+                           uint32_t prefetch_pool_threads = 0);
 
     ~Manager();
 
@@ -57,7 +59,8 @@ class Manager {
         auto self_reserve = eviction_enabled_;
         auto cache_slot =
             std::make_shared<CacheSlot<CellT>>(std::move(translator), dlist_.get(), evictable, self_reserve,
-                                               storage_usage_tracking_enabled_, loading_timeout_);
+                                               storage_usage_tracking_enabled_, loading_timeout_,
+                                               warmup_loading_timeout_);
         cache_slot->Warmup(ctx, prefetch_pool_);
         return cache_slot;
     }
@@ -141,6 +144,7 @@ class Manager {
     bool storage_usage_tracking_enabled_{false};
     bool eviction_enabled_{false};
     std::chrono::milliseconds loading_timeout_{100000};
+    std::chrono::milliseconds warmup_loading_timeout_{-1};
 };  // class Manager
 
 }  // namespace milvus::cachinglayer
