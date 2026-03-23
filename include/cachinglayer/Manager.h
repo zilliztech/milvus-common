@@ -16,6 +16,7 @@
 #include <memory>
 
 #include "cachinglayer/CacheSlot.h"
+#include "cachinglayer/TieredStorageConfig.h"
 #include "cachinglayer/Translator.h"
 #include "cachinglayer/Utils.h"
 #include "cachinglayer/lrucache/DList.h"
@@ -30,13 +31,17 @@ class Manager {
 
     // This function is not thread safe, must be called exactly once before any CacheSlot is created,
     // and before any Manager instance method is called.
-    // TODO(tiered storage 4): support dynamic update.
     static void
     ConfigureTieredStorage(CacheWarmupPolicies warmup_policies, CacheLimit cache_limit,
                            bool storage_usage_tracking_enabled, bool eviction_enabled, EvictionConfig eviction_config,
                            std::chrono::milliseconds loading_timeout,
                            std::chrono::milliseconds warmup_loading_timeout = std::chrono::milliseconds(-1),
                            uint32_t prefetch_pool_threads = 0);
+
+    // Update runtime-configurable fields. Can be called from CGO at runtime.
+    static void
+    UpdateConfig(std::chrono::milliseconds loading_timeout, std::chrono::milliseconds warmup_loading_timeout,
+                 bool storage_usage_tracking_enabled, bool eviction_enabled, CacheWarmupPolicies warmup_policies);
 
     ~Manager();
 
@@ -55,12 +60,13 @@ class Manager {
         if (ctx && ctx->cancellation_token.isCancellationRequested()) {
             throw std::runtime_error("Operation cancelled, stop creating cache slot");
         }
-        auto evictable = translator->meta()->support_eviction && eviction_enabled_;
-        auto self_reserve = eviction_enabled_;
+        auto& config = TieredStorageConfig::GetInstance();
+        auto evictable = translator->meta()->support_eviction && config.eviction_enabled();
+        auto self_reserve = config.eviction_enabled();
         auto cache_slot =
             std::make_shared<CacheSlot<CellT>>(std::move(translator), dlist_.get(), evictable, self_reserve,
-                                               storage_usage_tracking_enabled_, loading_timeout_,
-                                               warmup_loading_timeout_);
+                                               config.storage_usage_tracking_enabled(), config.loading_timeout(),
+                                               config.warmup_loading_timeout());
         cache_slot->Warmup(ctx, prefetch_pool_);
         return cache_slot;
     }
@@ -107,27 +113,27 @@ class Manager {
 
     [[nodiscard]] CacheWarmupPolicy
     getScalarFieldCacheWarmupPolicy() const {
-        return warmup_policies_.scalarFieldCacheWarmupPolicy;
+        return TieredStorageConfig::GetInstance().warmup_policies().scalarFieldCacheWarmupPolicy;
     }
 
     [[nodiscard]] CacheWarmupPolicy
     getVectorFieldCacheWarmupPolicy() const {
-        return warmup_policies_.vectorFieldCacheWarmupPolicy;
+        return TieredStorageConfig::GetInstance().warmup_policies().vectorFieldCacheWarmupPolicy;
     }
 
     [[nodiscard]] CacheWarmupPolicy
     getScalarIndexCacheWarmupPolicy() const {
-        return warmup_policies_.scalarIndexCacheWarmupPolicy;
+        return TieredStorageConfig::GetInstance().warmup_policies().scalarIndexCacheWarmupPolicy;
     }
 
     [[nodiscard]] CacheWarmupPolicy
     getVectorIndexCacheWarmupPolicy() const {
-        return warmup_policies_.vectorIndexCacheWarmupPolicy;
+        return TieredStorageConfig::GetInstance().warmup_policies().vectorIndexCacheWarmupPolicy;
     }
 
     [[nodiscard]] bool
     isEvictionEnabled() const {
-        return eviction_enabled_;
+        return TieredStorageConfig::GetInstance().eviction_enabled();
     }
 
     [[nodiscard]] std::shared_ptr<folly::CPUThreadPoolExecutor>
@@ -140,11 +146,6 @@ class Manager {
 
     std::shared_ptr<internal::DList> dlist_{nullptr};
     std::shared_ptr<folly::CPUThreadPoolExecutor> prefetch_pool_{nullptr};
-    CacheWarmupPolicies warmup_policies_{};
-    bool storage_usage_tracking_enabled_{false};
-    bool eviction_enabled_{false};
-    std::chrono::milliseconds loading_timeout_{100000};
-    std::chrono::milliseconds warmup_loading_timeout_{-1};
 };  // class Manager
 
 }  // namespace milvus::cachinglayer

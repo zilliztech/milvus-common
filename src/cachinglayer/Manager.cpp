@@ -13,6 +13,7 @@
 #include <folly/executors/thread_factory/NamedThreadFactory.h>
 
 #include <memory>
+#include <mutex>
 
 #include "cachinglayer/Utils.h"
 #include "log/Log.h"
@@ -38,26 +39,22 @@ Manager::ConfigureTieredStorage(CacheWarmupPolicies warmup_policies, CacheLimit 
                                 EvictionConfig eviction_config, std::chrono::milliseconds loading_timeout,
                                 std::chrono::milliseconds warmup_loading_timeout,
                                 uint32_t prefetch_pool_threads) {
-    static std::once_flag once;
-    std::call_once(once, [&]() {
+    static std::once_flag init_once;
+    std::call_once(init_once, [&]() {
+        auto& config = TieredStorageConfig::GetInstance();
+        config.SetWarmupPolicies(warmup_policies);
+        config.SetStorageUsageTrackingEnabled(storage_usage_tracking_enabled);
+        config.SetEvictionEnabled(eviction_enabled);
+        config.SetLoadingTimeout(loading_timeout);
+        config.SetWarmupLoadingTimeout(warmup_loading_timeout);
+
         Manager& manager = GetInstance();
-        manager.warmup_policies_ = warmup_policies;
-        manager.storage_usage_tracking_enabled_ = storage_usage_tracking_enabled;
-        manager.eviction_enabled_ = eviction_enabled;
-        manager.loading_timeout_ = loading_timeout;
-        manager.warmup_loading_timeout_ = warmup_loading_timeout;
 
         if (prefetch_pool_threads > 0) {
             manager.prefetch_pool_ = std::make_shared<folly::CPUThreadPoolExecutor>(
                 prefetch_pool_threads, std::make_shared<folly::NamedThreadFactory>("milvus_prefetch"));
             LOG_INFO("[MCL] Prefetch pool initialized with {} threads", prefetch_pool_threads);
         }
-
-        auto policy_str = warmup_policies.ToString();
-        LOG_INFO(
-            "[MCL] Tiered Storage manager is configured with warmup policies: {}, storage usage tracking enabled: {}, "
-            "eviction enabled: {}",
-            policy_str, storage_usage_tracking_enabled, eviction_enabled);
 
         ResourceUsage max{cache_limit.memory_max_bytes, cache_limit.disk_max_bytes};
         ResourceUsage low_watermark{cache_limit.memory_low_watermark_bytes, cache_limit.disk_low_watermark_bytes};
@@ -81,8 +78,24 @@ Manager::ConfigureTieredStorage(CacheWarmupPolicies warmup_policies, CacheLimit 
             eviction_config.cache_touch_window.count(), eviction_config.background_eviction_enabled,
             eviction_config.eviction_interval.count(), eviction_config.overloaded_memory_threshold_percentage,
             eviction_config.max_disk_usage_percentage, eviction_config.loading_resource_factor,
-            eviction_config.cache_cell_unaccessed_survival_time.count(), policy_str);
+            eviction_config.cache_cell_unaccessed_survival_time.count(), warmup_policies.ToString());
     });
+}
+
+void
+Manager::UpdateConfig(std::chrono::milliseconds loading_timeout, std::chrono::milliseconds warmup_loading_timeout,
+                      bool storage_usage_tracking_enabled, bool eviction_enabled,
+                      CacheWarmupPolicies warmup_policies) {
+    auto& config = TieredStorageConfig::GetInstance();
+    config.SetLoadingTimeout(loading_timeout);
+    config.SetWarmupLoadingTimeout(warmup_loading_timeout);
+    config.SetStorageUsageTrackingEnabled(storage_usage_tracking_enabled);
+    config.SetEvictionEnabled(eviction_enabled);
+    config.SetWarmupPolicies(warmup_policies);
+    LOG_INFO("[MCL] Config updated: loading_timeout={}ms, warmup_loading_timeout={}ms, "
+             "storage_usage_tracking={}, eviction={}, warmup_policies={}",
+             loading_timeout.count(), warmup_loading_timeout.count(),
+             storage_usage_tracking_enabled, eviction_enabled, warmup_policies.ToString());
 }
 
 size_t
