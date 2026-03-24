@@ -72,10 +72,21 @@ class DList : public std::enable_shared_from_this<DList> {
         clearWaitingQueue();
 
         if (event_base_thread_) {
-            // drain event base thread to ensure all in-flight callbacks are processed before stopping the thread
-            event_base_thread_->getEventBase()->runInEventBaseThreadAndWait([]() {});
-            // destroy event base thread
-            event_base_thread_.reset();
+            auto* eb = event_base_thread_->getEventBase();
+            if (eb->isInEventBaseThread()) {
+                // Being destroyed from a callback on our own event base thread (e.g., a
+                // weak_self.lock() callback held the last shared_ptr<DList>).  We cannot
+                // drain or join the thread from itself — that causes EDEADLK.  Move the
+                // ScopedEventBaseThread to a detached thread that will join it after the
+                // current callback finishes and the event loop exits.
+                auto eb_thread = std::move(event_base_thread_);
+                eb_thread->getEventBase()->terminateLoopSoon();
+                std::thread([eb_thread = std::move(eb_thread)]() mutable { eb_thread.reset(); }).detach();
+            } else {
+                // Normal path: drain pending callbacks, then destroy.
+                eb->runInEventBaseThreadAndWait([]() {});
+                event_base_thread_.reset();
+            }
         }
 
         // stop eviction loop thread
@@ -106,10 +117,12 @@ class DList : public std::enable_shared_from_this<DList> {
     IsEmpty() const;
 
     // Reserve loading resource with timeout, called before loading a cell.
-    // When timeout > 0, the request will fail after the specified duration.
-    // When timeout == 0, the request will wait indefinitely (no timeout).
-    // Note: timeout=0 requests use time_point::max() as their deadline, which
-    // means they sort after all finite-deadline requests in the waiting queue.
+    // When timeout > 0, the request will wait up to the specified duration.
+    // When timeout == 0, the request will fail immediately without entering the
+    //   waiting queue (best-effort mode, used for warmup scenarios).
+    // When timeout < 0, the request will wait indefinitely (no timeout).
+    //   Note: negative timeout requests use time_point::max() as their deadline,
+    //   which means they sort after all finite-deadline requests in the waiting queue.
     folly::SemiFuture<bool>
     ReserveLoadingResourceWithTimeout(const ResourceUsage& size, std::chrono::milliseconds timeout,
                                       OpContext* ctx = nullptr);
