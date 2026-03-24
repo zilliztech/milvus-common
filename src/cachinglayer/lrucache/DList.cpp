@@ -42,21 +42,23 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std
     // loading_resource_factor to avoid potential problems from bad resource estimation.
     auto size = original_size * eviction_config_.loading_resource_factor;
 
-    // First try immediate reservation
-    {
-        std::unique_lock<std::mutex> list_lock(list_mtx_);
-        if (!max_resource_limit_.load().CanHold(size)) {
-            LOG_ERROR("[MCL] Failed to reserve size={} as it exceeds max_memory_={}.", size.ToString(),
-                      max_resource_limit_.load().ToString());
-            return folly::makeSemiFuture(false);
-        }
-        if (reserveResourceInternal(size)) {
-            return folly::makeSemiFuture(true);
-        }
+    // Try immediate reservation; if it fails, enqueue atomically under the same lock
+    // to avoid a race window where resources could be released and notified between
+    // a failed reserve and the enqueue.
+    std::unique_lock<std::mutex> lock(list_mtx_);
+    if (!max_resource_limit_.load().CanHold(size)) {
+        LOG_ERROR("[MCL] Failed to reserve size={} as it exceeds max_memory_={}.", size.ToString(),
+                  max_resource_limit_.load().ToString());
+        return folly::makeSemiFuture(false);
+    }
+    if (reserveResourceInternal(size)) {
+        return folly::makeSemiFuture(true);
     }
 
-    // If immediate reservation fails, add to waiting queue
-    std::unique_lock<std::mutex> lock(list_mtx_);
+    // Zero timeout means best-effort: fail immediately without entering the waiting queue.
+    if (timeout.count() == 0) {
+        return folly::makeSemiFuture(false);
+    }
 
     auto deadline =
         timeout.count() > 0 ? std::chrono::steady_clock::now() + timeout : std::chrono::steady_clock::time_point::max();
@@ -232,7 +234,11 @@ DList::evictionLoop() {
         const auto min_eviction = ResourceUsage{0, 0};
         const auto evicted =
             tryEvict(eviction_target, min_eviction, eviction_config_.cache_cell_unaccessed_survival_time.count() > 0);
-        if (evicted.AnyGTZero()) {
+        // Always try to handle waiting requests if the queue is non-empty,
+        // not just after successful eviction. Resources may have been freed
+        // by other paths (ReleaseLoadingResource, RefundLoadedResource) between
+        // loop iterations without fully draining the queue.
+        if (evicted.AnyGTZero() || !waiting_queue_empty_) {
             auto to_destroy = handleWaitingRequests();
             lock.unlock();
             // Destroy requests outside lock to avoid deadlock with cancel callbacks

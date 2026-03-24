@@ -1029,16 +1029,16 @@ TEST_F(DListTest, ReserveWithAlreadyCancelledToken) {
     EXPECT_EQ(get_loading_memory(), ResourceUsage{});
 }
 
-TEST_F(DListTest, ReserveWithZeroTimeoutImmediateSuccess) {
-    // Test that timeout=0 works for immediate reservation (no waiting needed)
+TEST_F(DListTest, ReserveWithNegativeTimeoutImmediateSuccess) {
+    // Test that negative timeout works for immediate reservation (no waiting needed)
     ResourceUsage size{20, 10};
-    auto future = dlist->ReserveLoadingResourceWithTimeout(size, std::chrono::milliseconds(0));
+    auto future = dlist->ReserveLoadingResourceWithTimeout(size, std::chrono::milliseconds(-1));
     EXPECT_TRUE(std::move(future).get());
     EXPECT_EQ(get_loading_memory(), size);
 }
 
-TEST_F(DListTest, ReserveWithZeroTimeoutWaitsIndefinitelyUntilCancelled) {
-    // Test that timeout=0 means no timeout callback is scheduled.
+TEST_F(DListTest, ReserveWithNegativeTimeoutWaitsIndefinitelyUntilCancelled) {
+    // Test that negative timeout means no timeout callback is scheduled.
     // The request will wait indefinitely until cancelled or resources become available.
 
     // Fill up the cache so new requests must wait
@@ -1053,9 +1053,9 @@ TEST_F(DListTest, ReserveWithZeroTimeoutWaitsIndefinitelyUntilCancelled) {
     auto cancel_token = cancel_source.getToken();
     auto op_ctx = std::make_unique<milvus::OpContext>(cancel_token);
 
-    // Request with timeout=0 (no timeout scheduled)
+    // Request with negative timeout (no timeout scheduled, wait indefinitely)
     ResourceUsage reserve_size{50, 30};
-    auto future = dlist->ReserveLoadingResourceWithTimeout(reserve_size, std::chrono::milliseconds(0), op_ctx.get());
+    auto future = dlist->ReserveLoadingResourceWithTimeout(reserve_size, std::chrono::milliseconds(-1), op_ctx.get());
 
     auto start = std::chrono::steady_clock::now();
 
@@ -1079,8 +1079,8 @@ TEST_F(DListTest, ReserveWithZeroTimeoutWaitsIndefinitelyUntilCancelled) {
     EXPECT_EQ(get_loading_memory(), ResourceUsage{});
 }
 
-TEST_F(DListTest, ReserveWithZeroTimeoutSucceedsWhenResourcesFreed) {
-    // Test that timeout=0 request succeeds when resources become available
+TEST_F(DListTest, ReserveWithNegativeTimeoutSucceedsWhenResourcesFreed) {
+    // Test that negative timeout request succeeds when resources become available
 
     // Fill up the cache with an unpinned node that can be evicted
     MockListNode* node1 = add_and_load_node({30, 15}, "key1");        // Unpinned, can evict
@@ -1090,11 +1090,110 @@ TEST_F(DListTest, ReserveWithZeroTimeoutSucceedsWhenResourcesFreed) {
     EXPECT_CALL(*node1, unload()).Times(1);  // Will be evicted
     EXPECT_CALL(*node2, unload()).Times(0);
 
-    // Request with timeout=0 - should succeed after evicting node1
+    // Request with negative timeout - should succeed after evicting node1
     ResourceUsage reserve_size{60, 30};
-    auto future = dlist->ReserveLoadingResourceWithTimeout(reserve_size, std::chrono::milliseconds(0));
+    auto future = dlist->ReserveLoadingResourceWithTimeout(reserve_size, std::chrono::milliseconds(-1));
 
     EXPECT_TRUE(std::move(future).get());
     EXPECT_EQ(get_loading_memory(), reserve_size);
     EXPECT_EQ(get_used_memory(), node2->loaded_size());
+}
+
+// Regression test: verifies that resource release happening concurrently with
+// reserve does not cause the reserve request to miss the notification.
+// Before the fix, there was a race window between reserve failure and enqueue:
+// the lock was released and re-acquired, so a concurrent ReleaseLoadingResource
+// could call handleWaitingRequests() before the request was in the queue.
+TEST_F(DListTest, ReserveDoesNotMissResourceReleaseNotification) {
+    const int kIterations = 200;
+    for (int iter = 0; iter < kIterations; ++iter) {
+        // Reset DList for each iteration
+        managed_nodes.clear();
+        loading_nodes.clear();
+        dlist.reset();
+        dlist = std::make_shared<DList>(true, initial_limit, low_watermark, high_watermark, eviction_config_);
+
+        // Fill all capacity with loading resources so reserve will fail initially
+        ResourceUsage fill_size{100, 50};
+        ASSERT_TRUE(reserveLoadingMemorySync(fill_size));
+
+        ResourceUsage reserve_size{10, 5};
+
+        // Launch reserve in a background thread - it should enter the waiting queue
+        std::atomic<bool> reserve_done{false};
+        std::atomic<bool> reserve_result{false};
+        std::thread reserve_thread([&]() {
+            auto future = dlist->ReserveLoadingResourceWithTimeout(reserve_size, std::chrono::milliseconds(5000));
+            reserve_result = std::move(future).get();
+            reserve_done = true;
+        });
+
+        // Yield to give the reserve thread a chance to enter the waiting queue.
+        // The race window (if the bug existed) is between the failed reserveResourceInternal
+        // and the enqueue; releasing here tries to hit that exact window.
+        std::this_thread::yield();
+
+        // Release enough resources so the waiting request can be satisfied
+        dlist->ReleaseLoadingResource(fill_size);
+
+        // Wait for reserve to complete
+        reserve_thread.join();
+
+        EXPECT_TRUE(reserve_done.load()) << "iteration " << iter;
+        EXPECT_TRUE(reserve_result.load()) << "Reserve timed out on iteration " << iter
+                                           << ". This suggests the request missed the resource release notification.";
+
+        // Clean up: release the reserved loading resource
+        dlist->ReleaseLoadingResource(reserve_size);
+    }
+}
+
+TEST_F(DListTest, ReserveWithZeroTimeoutImmediateSuccess) {
+    // Zero timeout should still succeed if resources are available
+    ResourceUsage size{20, 10};
+    auto future = dlist->ReserveLoadingResourceWithTimeout(size, std::chrono::milliseconds(0));
+    EXPECT_TRUE(std::move(future).get());
+    EXPECT_EQ(get_loading_memory(), size);
+}
+
+TEST_F(DListTest, ReserveWithZeroTimeoutImmediateFailure) {
+    // Fill up the cache with pinned nodes so reservation must fail
+    MockListNode* node1 = add_and_load_node({30, 15}, "key1", 0, 1);  // Pinned, cannot evict
+    MockListNode* node2 = add_and_load_node({20, 10}, "key2", 0, 1);  // Pinned, cannot evict
+    ASSERT_EQ(get_used_memory(), node1->loaded_size() + node2->loaded_size());
+
+    EXPECT_CALL(*node1, unload()).Times(0);
+    EXPECT_CALL(*node2, unload()).Times(0);
+
+    auto start = std::chrono::steady_clock::now();
+
+    // Zero timeout: should fail immediately without entering the queue
+    ResourceUsage reserve_size{60, 30};
+    auto future = dlist->ReserveLoadingResourceWithTimeout(reserve_size, std::chrono::milliseconds(0));
+    EXPECT_FALSE(std::move(future).get());
+
+    auto duration = std::chrono::steady_clock::now() - start;
+
+    // Should return almost instantly (no queuing, no waiting)
+    EXPECT_LT(duration, std::chrono::milliseconds(50));
+    EXPECT_EQ(get_loading_memory(), ResourceUsage{});
+}
+
+TEST_F(DListTest, ReserveWithZeroTimeoutEvictsAndSucceeds) {
+    // Add evictable (unpinned) nodes
+    MockListNode* node1 = add_and_load_node({30, 15}, "key1", 0, 0);  // Unpinned, can evict
+    MockListNode* node2 = add_and_load_node({20, 10}, "key2", 0, 0);  // Unpinned, can evict
+    ASSERT_EQ(get_used_memory(), node1->loaded_size() + node2->loaded_size());
+
+    // Eviction should happen for the unpinned nodes
+    EXPECT_CALL(*node1, unload()).Times(1);
+    EXPECT_CALL(*node2, unload()).Times(testing::AtMost(1));
+
+    // Need more than available headroom, but eviction can free enough space
+    ResourceUsage reserve_size{60, 30};
+    auto future = dlist->ReserveLoadingResourceWithTimeout(reserve_size, std::chrono::milliseconds(0));
+    EXPECT_TRUE(std::move(future).get());
+    EXPECT_EQ(get_loading_memory(), reserve_size);
+
+    dlist->ReleaseLoadingResource(reserve_size);
 }
