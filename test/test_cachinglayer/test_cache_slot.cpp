@@ -1685,35 +1685,52 @@ TEST(AsyncWarmupTest, DisabledWarmupStillWorks) {
 
 // ==================== Warmup Loading Timeout Tests ====================
 
-// Test that sync warmup with best-effort timeout (0) throws when resources are unavailable
-TEST(WarmupTimeoutTest, SyncWarmupBestEffortThrowsOnResourceUnavailable) {
-    // Create a very small DList so reservation will fail
-    auto limit = ResourceUsage{50, 0};
+// Test that sync warmup with zero timeout (best-effort) exercises the zero-timeout
+// path in DList::ReserveLoadingResourceWithTimeout. Cell sizes fit within max capacity
+// but resources are pre-reserved so reservation fails at the zero-timeout check.
+TEST(WarmupTimeoutTest, SyncWarmupBestEffortFailsAtZeroTimeout) {
+    // Capacity 500: cells (100 each, 200 total) fit within max.
+    // Pre-reserve 400 so only 100 is free — not enough for 200.
+    auto limit = ResourceUsage{500, 0};
     auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
 
-    // Cell sizes are large relative to the DList capacity
+    // Pre-fill: reserve loading resources to exhaust available space
+    ResourceUsage pre_reserve{400, 0};
+    auto reserve_ok = dlist->ReserveLoadingResourceWithTimeout(pre_reserve, std::chrono::milliseconds(1000));
+    ASSERT_TRUE(std::move(reserve_ok).get());
+
     std::vector<std::pair<cid_t, int64_t>> cell_sizes = {{0, 100}, {1, 100}};
     std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map = {{0, 0}, {1, 1}};
     auto translator =
         std::make_unique<MockTranslatorWithWarmup>(cell_sizes, uid_to_cid_map, "warmup_timeout_slot",
                                                    StorageType::MEMORY, CacheWarmupPolicy::CacheWarmupPolicy_Sync);
+    auto* translator_ptr = translator.get();
 
     auto cache_slot =
         std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
                                               std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
 
-    // Warmup should throw immediately (not block) since zero timeout skips queuing
+    // Warmup should fail immediately (zero timeout = no queue) and throw
     auto start = std::chrono::steady_clock::now();
     EXPECT_THROW(cache_slot->Warmup(nullptr), std::exception);
     auto duration = std::chrono::steady_clock::now() - start;
     EXPECT_LT(duration, std::chrono::milliseconds(50));
+
+    // get_cells should NOT have been called since reservation failed
+    EXPECT_EQ(translator_ptr->GetCellsCallCount(), 0);
+
+    dlist->ReleaseLoadingResource(pre_reserve);
 }
 
-// Test that async warmup with best-effort timeout handles resource shortage in background
+// Test that async warmup with zero timeout handles resource shortage in background
 TEST(WarmupTimeoutTest, AsyncWarmupBestEffortResourceUnavailable) {
-    // Create a very small DList so reservation will fail
-    auto limit = ResourceUsage{50, 0};
+    auto limit = ResourceUsage{500, 0};
     auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
+
+    // Pre-fill to exhaust available space
+    ResourceUsage pre_reserve{400, 0};
+    auto reserve_ok = dlist->ReserveLoadingResourceWithTimeout(pre_reserve, std::chrono::milliseconds(1000));
+    ASSERT_TRUE(std::move(reserve_ok).get());
 
     std::vector<std::pair<cid_t, int64_t>> cell_sizes = {{0, 100}, {1, 100}};
     std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map = {{0, 0}, {1, 1}};
@@ -1734,16 +1751,22 @@ TEST(WarmupTimeoutTest, AsyncWarmupBestEffortResourceUnavailable) {
     // Wait for async task to complete
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-    // get_cells should NOT have been called since reservation failed
+    // get_cells should NOT have been called since reservation failed at zero-timeout
     EXPECT_EQ(translator_ptr->GetCellsCallCount(), 0);
 
+    dlist->ReleaseLoadingResource(pre_reserve);
     prefetch_pool->join();
 }
 
-// Test that warmup failure doesn't prevent subsequent normal loading
+// Test that warmup failure leaves cells in NOT_LOADED state, loadable on-demand
 TEST(WarmupTimeoutTest, CellsLoadableAfterWarmupFailure) {
-    auto limit = ResourceUsage{50, 0};
+    auto limit = ResourceUsage{500, 0};
     auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
+
+    // Pre-fill to cause warmup failure
+    ResourceUsage pre_reserve{400, 0};
+    auto reserve_ok = dlist->ReserveLoadingResourceWithTimeout(pre_reserve, std::chrono::milliseconds(1000));
+    ASSERT_TRUE(std::move(reserve_ok).get());
 
     std::vector<std::pair<cid_t, int64_t>> cell_sizes = {{0, 100}, {1, 100}};
     std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map = {{0, 0}, {1, 1}};
@@ -1756,14 +1779,12 @@ TEST(WarmupTimeoutTest, CellsLoadableAfterWarmupFailure) {
         std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
                                               std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
 
-    // Warmup throws (resources too small)
+    // Warmup fails (zero timeout, resources unavailable)
     EXPECT_THROW(cache_slot->Warmup(nullptr), std::exception);
     EXPECT_EQ(translator_ptr->GetCellsCallCount(), 0);
 
-    // Expand DList capacity so normal loading works
-    dlist->UpdateMaxLimit(ResourceUsage{10000, 0});
-    dlist->UpdateHighWatermark(ResourceUsage{10000, 0});
-    dlist->UpdateLowWatermark(ResourceUsage{10000, 0});
+    // Free pre-reserved resources so normal loading can proceed
+    dlist->ReleaseLoadingResource(pre_reserve);
 
     // Cells should still be loadable — warmup failure leaves them in NOT_LOADED state
     auto op_ctx = std::make_unique<milvus::OpContext>();
@@ -1779,7 +1800,7 @@ TEST(WarmupTimeoutTest, CellsLoadableAfterWarmupFailure) {
     }
 }
 
-// Test that warmup with sufficient resources and best-effort timeout succeeds normally
+// Test that warmup with sufficient resources and zero timeout succeeds normally
 TEST(WarmupTimeoutTest, SyncWarmupBestEffortResourceAvailable) {
     auto limit = ResourceUsage{10000, 0};
     auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
