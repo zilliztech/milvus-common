@@ -25,8 +25,7 @@ class TieredStorageConfigTest : public ::testing::Test {
     void
     TearDown() override {
         // Reset to defaults after each test
-        config.UpdateAll(false, std::chrono::milliseconds(100000), std::chrono::milliseconds(0),
-                         CacheWarmupPolicies{});
+        config.UpdateAll(false, std::chrono::milliseconds(100000), std::chrono::milliseconds(0), CacheWarmupPolicies{});
     }
 };
 
@@ -72,11 +71,10 @@ TEST_F(TieredStorageConfigTest, SetAndGetWarmupPolicies) {
 }
 
 TEST_F(TieredStorageConfigTest, SnapshotReturnsConsistentView) {
-    config.UpdateAll(true, std::chrono::milliseconds(5000), std::chrono::milliseconds(200),
-                     CacheWarmupPolicies(CacheWarmupPolicy::CacheWarmupPolicy_Async,
-                                         CacheWarmupPolicy::CacheWarmupPolicy_Async,
-                                         CacheWarmupPolicy::CacheWarmupPolicy_Async,
-                                         CacheWarmupPolicy::CacheWarmupPolicy_Async));
+    config.UpdateAll(
+        true, std::chrono::milliseconds(5000), std::chrono::milliseconds(200),
+        CacheWarmupPolicies(CacheWarmupPolicy::CacheWarmupPolicy_Async, CacheWarmupPolicy::CacheWarmupPolicy_Async,
+                            CacheWarmupPolicy::CacheWarmupPolicy_Async, CacheWarmupPolicy::CacheWarmupPolicy_Async));
 
     auto snapshot = config.GetSnapshot();
     EXPECT_TRUE(snapshot.storage_usage_tracking_enabled);
@@ -90,10 +88,9 @@ TEST_F(TieredStorageConfigTest, UpdateAllIsAtomic) {
     config.UpdateAll(false, std::chrono::milliseconds(100), std::chrono::milliseconds(0), CacheWarmupPolicies{});
 
     // Update all fields atomically
-    CacheWarmupPolicies new_policies(CacheWarmupPolicy::CacheWarmupPolicy_Disable,
-                                     CacheWarmupPolicy::CacheWarmupPolicy_Disable,
-                                     CacheWarmupPolicy::CacheWarmupPolicy_Disable,
-                                     CacheWarmupPolicy::CacheWarmupPolicy_Disable);
+    CacheWarmupPolicies new_policies(
+        CacheWarmupPolicy::CacheWarmupPolicy_Disable, CacheWarmupPolicy::CacheWarmupPolicy_Disable,
+        CacheWarmupPolicy::CacheWarmupPolicy_Disable, CacheWarmupPolicy::CacheWarmupPolicy_Disable);
     config.UpdateAll(true, std::chrono::milliseconds(9999), std::chrono::milliseconds(42), new_policies);
 
     // Snapshot should see all new values together
