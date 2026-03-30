@@ -417,17 +417,9 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         // loading_resource: the estimated temporary overhead during loading (from .second),
         //   capped at per-type UB via LoadingOverheadTracker. The tracker returns the incremental
         //   delta to reserve from DList, so total loading in DList = min(sum, UB) per type.
-        ResourceUsage essential_loaded_resource{};
-        ResourceUsage essential_loading_resource{};
-        ResourceUsage bonus_loaded_resource{};
-        ResourceUsage bonus_loading_resource{};
         std::vector<cid_t> loading_cids;
-        // Tracks the loading overhead currently reserved in the tracker but not yet
-        // guarded by defer_release. Used to clean up tracker state on exception.
-        ResourceUsage tracker_pending_loading{};
         try {
             auto start = std::chrono::steady_clock::now();
-            bool reservation_success = false;
 
             loading_cids = std::vector<cid_t>(cids.begin(), cids.end());
 
@@ -453,12 +445,16 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             // bonus cells should be empty if self_reserve_ is false.
             auto bonus_cids = translator_->bonus_cells_to_be_loaded(loading_cids);
 
+            ResourceUsage essential_loaded_resource{};
+            ResourceUsage essential_loading_resource{};
             for (auto& cid : loading_cids) {
                 auto [loaded, loading] = translator_->estimated_byte_size_of_cell(cid);
                 essential_loaded_resource += loaded;
                 essential_loading_resource += loading;
             }
 
+            ResourceUsage bonus_loaded_resource{};
+            ResourceUsage bonus_loading_resource{};
             for (auto& cid : bonus_cids) {
                 auto [loaded, loading] = translator_->estimated_byte_size_of_cell(cid);
                 bonus_loaded_resource += loaded;
@@ -470,51 +466,81 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             auto loaded_resource = essential_loaded_resource + bonus_loaded_resource;
             auto loading_resource = essential_loading_resource + bonus_loading_resource;
 
-            auto loading_delta = loading_resource;
-            if (loading_overhead_tracker_) {
-                loading_delta = loading_overhead_tracker_->Reserve(cell_data_type_, loading_resource);
-                tracker_pending_loading = loading_resource;
-            }
-            auto actual_dlist_reserve = loaded_resource + loading_delta;
+            // Reserve tracker + DList atomically. On success, returns a guard that
+            // releases both on destruction. On failure, tracker state is rolled back
+            // before returning. No resource is left dangling in either case.
+            auto try_reserve = [this](const ResourceUsage& loaded, const ResourceUsage& loading,
+                                      std::chrono::milliseconds timeout,
+                                      OpContext* ctx) -> std::pair<bool, ResourceUsage /*actual_dlist_reserve*/> {
+                auto loading_delta = loading;
+                if (loading_overhead_tracker_) {
+                    loading_delta = loading_overhead_tracker_->Reserve(cell_data_type_, loading);
+                }
+                auto actual_dlist_reserve = loaded + loading_delta;
 
-            reservation_success =
-                SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(actual_dlist_reserve, timeout, ctx));
+                bool success =
+                    SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(actual_dlist_reserve, timeout, ctx));
+                if (!success) {
+                    if (loading_overhead_tracker_) {
+                        loading_overhead_tracker_->Release(cell_data_type_, loading);
+                    }
+                    return {false, {}};
+                }
+                return {true, actual_dlist_reserve};
+            };
+
+            auto reserve_result = try_reserve(loaded_resource, loading_resource, timeout, ctx);
+            bool reservation_success = reserve_result.first;
+            ResourceUsage actual_dlist_reserve = reserve_result.second;
+
+            // Guard created immediately after reserve — all by-ref so bonus retry
+            // and metrics setup are automatically reflected. No gap, no handoff.
+            bool metrics_tracked = false;
+            size_t loading_cids_count = 0;
+            auto defer_release = folly::makeGuard([&]() {
+                if (!reservation_success) {
+                    return;
+                }
+                try {
+                    auto release_delta = loading_resource;
+                    if (loading_overhead_tracker_) {
+                        release_delta = loading_overhead_tracker_->Release(cell_data_type_, loading_resource);
+                    }
+                    auto dlist_release = loaded_resource + release_delta;
+                    dlist_->ReleaseLoadingResource(dlist_release);
+                    if (metrics_tracked) {
+                        monitor::cache_cell_loading_count(cell_data_type_, storage_type_).Decrement(loading_cids_count);
+                        monitor::cache_loading_bytes(cell_data_type_, StorageType::MEMORY)
+                            .Decrement(dlist_release.memory_bytes);
+                        monitor::cache_loading_bytes(cell_data_type_, StorageType::DISK)
+                            .Decrement(dlist_release.file_bytes);
+                    }
+                } catch (...) {
+                    auto ew = folly::exception_wrapper(std::current_exception());
+                    LOG_ERROR(
+                        "[MCL] CacheSlot failed to release loading resource for cells with exception, something "
+                        "must be wrong: key={}, loading_cids_count={}, error={}",
+                        translator_->key(), loading_cids_count, ew.what());
+                }
+            });
 
             if (!bonus_cids.empty()) {
-                // if the reservation failed, try to reserve only the essential loading resource
                 if (!reservation_success) {
+                    // Bonus+essential failed — retry with essential only
                     LOG_WARN(
                         "[MCL] CacheSlot reserve loading resource with bonus cells failed, try to reserve only "
-                        "essential "
-                        "loading resource");
-                    // Undo the tracker state for the full reservation
-                    if (loading_overhead_tracker_) {
-                        loading_overhead_tracker_->Release(cell_data_type_, loading_resource);
-                        tracker_pending_loading = {};
-                    }
+                        "essential loading resource");
                     loaded_resource = essential_loaded_resource;
                     loading_resource = essential_loading_resource;
-                    if (loading_overhead_tracker_) {
-                        loading_delta = loading_overhead_tracker_->Reserve(cell_data_type_, loading_resource);
-                        tracker_pending_loading = loading_resource;
-                    } else {
-                        loading_delta = loading_resource;
-                    }
-                    actual_dlist_reserve = loaded_resource + loading_delta;
-                    reservation_success =
-                        SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(actual_dlist_reserve, timeout, ctx));
+                    auto retry = try_reserve(loaded_resource, loading_resource, timeout, ctx);
+                    reservation_success = retry.first;
+                    actual_dlist_reserve = retry.second;
                 } else {
-                    // if the reservation succeeded, we can load the bonus cells
                     loading_cids.insert(loading_cids.end(), bonus_cids.begin(), bonus_cids.end());
                 }
             }
 
             if (!reservation_success) {
-                // Undo tracker state on failure
-                if (loading_overhead_tracker_) {
-                    loading_overhead_tracker_->Release(cell_data_type_, loading_resource);
-                    tracker_pending_loading = {};
-                }
                 LOG_ERROR(
                     "[MCL] CacheSlot failed to reserve resource for "
                     "cells: key={}, cell_ids=[{}], "
@@ -532,37 +558,9 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             monitor::cache_loading_bytes(cell_data_type_, StorageType::MEMORY)
                 .Increment(actual_dlist_reserve.memory_bytes);
             monitor::cache_loading_bytes(cell_data_type_, StorageType::DISK).Increment(actual_dlist_reserve.file_bytes);
-            monitor::cache_cell_loading_count(cell_data_type_, storage_type_).Increment(loading_cids.size());
-
-            // defer release: loaded_resource + loading delta from tracker.
-            // Once created, defer_release owns the tracker cleanup — clear tracker_pending_loading.
-            auto loading_cids_count = loading_cids.size();
-            auto defer_release = folly::makeGuard([this, loaded_resource, loading_resource, loading_cids_count]() {
-                try {
-                    auto release_delta = loading_resource;
-                    if (loading_overhead_tracker_) {
-                        release_delta = loading_overhead_tracker_->Release(cell_data_type_, loading_resource);
-                    }
-                    auto dlist_release = loaded_resource + release_delta;
-                    dlist_->ReleaseLoadingResource(dlist_release);
-                    monitor::cache_cell_loading_count(cell_data_type_, storage_type_).Decrement(loading_cids_count);
-                    monitor::cache_loading_bytes(cell_data_type_, StorageType::MEMORY)
-                        .Decrement(dlist_release.memory_bytes);
-                    monitor::cache_loading_bytes(cell_data_type_, StorageType::DISK)
-                        .Decrement(dlist_release.file_bytes);
-                } catch (...) {
-                    auto exception = std::current_exception();
-                    auto ew = folly::exception_wrapper(exception);
-                    LOG_ERROR(
-                        "[MCL] CacheSlot failed to release loading resource for cells with exception, something "
-                        "must "
-                        "be wrong: "
-                        "key={}, "
-                        "loading_cids_count={}, error={}",
-                        translator_->key(), loading_cids_count, ew.what());
-                }
-            });
-            tracker_pending_loading = {};
+            loading_cids_count = loading_cids.size();
+            monitor::cache_cell_loading_count(cell_data_type_, storage_type_).Increment(loading_cids_count);
+            metrics_tracked = true;
 
             LOG_TRACE(
                 "[MCL] CacheSlot reserveLoadingResourceWithTimeout {} sec "
@@ -577,10 +575,6 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
 
             run_load_internal();
         } catch (...) {
-            // Clean up tracker state if not yet taken over by defer_release
-            if (loading_overhead_tracker_ && tracker_pending_loading.AnyGTZero()) {
-                loading_overhead_tracker_->Release(cell_data_type_, tracker_pending_loading);
-            }
             auto exception = std::current_exception();
             auto ew = folly::exception_wrapper(exception);
             monitor::cache_load_event_fail_total(cell_data_type_, storage_type_).Increment();
