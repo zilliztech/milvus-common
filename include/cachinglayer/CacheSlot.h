@@ -30,6 +30,7 @@
 #include <utility>
 #include <vector>
 
+#include "cachinglayer/LoadingOverheadTracker.h"
 #include "cachinglayer/Metrics.h"
 #include "cachinglayer/Translator.h"
 #include "cachinglayer/Utils.h"
@@ -56,7 +57,8 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
 
     CacheSlot(std::unique_ptr<Translator<CellT>> translator, internal::DList* dlist, bool evictable, bool self_reserve,
               bool storage_usage_tracking_enabled, std::chrono::milliseconds loading_timeout,
-              std::chrono::milliseconds warmup_loading_timeout = std::chrono::milliseconds(0))
+              std::chrono::milliseconds warmup_loading_timeout,
+              LoadingOverheadTracker* loading_overhead_tracker = nullptr)
         : translator_(std::move(translator)),
           cell_id_mapping_mode_(translator_->meta()->cell_id_mapping_mode),
           cell_data_type_(translator_->meta()->cell_data_type),
@@ -66,7 +68,8 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
           self_reserve_(self_reserve),
           storage_usage_tracking_enabled_(storage_usage_tracking_enabled),
           loading_timeout_(loading_timeout),
-          warmup_loading_timeout_(warmup_loading_timeout) {
+          warmup_loading_timeout_(warmup_loading_timeout),
+          loading_overhead_tracker_(loading_overhead_tracker) {
         cells_.reserve(translator_->num_cells());
         for (cid_t i = 0; i < static_cast<cid_t>(translator_->num_cells()); ++i) {
             cells_.push_back(std::make_unique<CacheCell>(this, i));
@@ -410,12 +413,13 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
 
     void
     RunLoad(OpContext* ctx, std::unordered_set<cid_t>&& cids, std::chrono::milliseconds timeout) {
-        ResourceUsage essential_loading_resource{};
-        ResourceUsage bonus_loading_resource{};
+        // loaded_resource: the estimated final resource usage (from .first), reserved unconditionally.
+        // loading_overhead: the estimated temporary overhead during loading (from .second),
+        //   capped at per-type UB via LoadingOverheadTracker. The tracker returns the incremental
+        //   delta to reserve from DList, so total loading in DList = min(sum, UB) per type.
         std::vector<cid_t> loading_cids;
         try {
             auto start = std::chrono::steady_clock::now();
-            bool reservation_success = false;
 
             loading_cids = std::vector<cid_t>(cids.begin(), cids.end());
 
@@ -441,30 +445,97 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             // bonus cells should be empty if self_reserve_ is false.
             auto bonus_cids = translator_->bonus_cells_to_be_loaded(loading_cids);
 
+            ResourceUsage essential_loaded_resource{};
+            ResourceUsage essential_loading_overhead{};
             for (auto& cid : loading_cids) {
-                essential_loading_resource += translator_->estimated_byte_size_of_cell(cid).second;
+                auto [loaded, loading] = translator_->estimated_byte_size_of_cell(cid);
+                essential_loaded_resource += loaded;
+                essential_loading_overhead += loading;
             }
 
+            ResourceUsage bonus_loaded_resource{};
+            ResourceUsage bonus_loading_overhead{};
             for (auto& cid : bonus_cids) {
-                bonus_loading_resource += translator_->estimated_byte_size_of_cell(cid).second;
+                auto [loaded, loading] = translator_->estimated_byte_size_of_cell(cid);
+                bonus_loaded_resource += loaded;
+                bonus_loading_overhead += loading;
             }
 
-            auto resource_needed_for_loading = essential_loading_resource + bonus_loading_resource;
-            reservation_success =
-                SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(resource_needed_for_loading, timeout, ctx));
+            // loaded_resource is reserved unconditionally from DList (no capping).
+            // loading_overhead goes through the tracker: returns delta = change in min(sum, UB).
+            auto loaded_resource = essential_loaded_resource + bonus_loaded_resource;
+            auto loading_overhead = essential_loading_overhead + bonus_loading_overhead;
+
+            // Reserve tracker + DList atomically. On success, returns a guard that
+            // releases both on destruction. On failure, tracker state is rolled back
+            // before returning. No resource is left dangling in either case.
+            auto try_reserve = [this](const ResourceUsage& loaded, const ResourceUsage& loading,
+                                      std::chrono::milliseconds timeout,
+                                      OpContext* ctx) -> std::pair<bool, ResourceUsage /*actual_dlist_reserve*/> {
+                auto loading_delta = loading;
+                if (loading_overhead_tracker_) {
+                    loading_delta = loading_overhead_tracker_->Reserve(cell_data_type_, loading);
+                }
+                auto actual_dlist_reserve = loaded + loading_delta;
+
+                bool success =
+                    SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(actual_dlist_reserve, timeout, ctx));
+                if (!success) {
+                    if (loading_overhead_tracker_) {
+                        loading_overhead_tracker_->Release(cell_data_type_, loading);
+                    }
+                    return {false, {}};
+                }
+                return {true, actual_dlist_reserve};
+            };
+
+            auto reserve_result = try_reserve(loaded_resource, loading_overhead, timeout, ctx);
+            bool reservation_success = reserve_result.first;
+            ResourceUsage actual_dlist_reserve = reserve_result.second;
+
+            // Guard created immediately after reserve — all by-ref so bonus retry
+            // and metrics setup are automatically reflected. No gap, no handoff.
+            bool metrics_tracked = false;
+            size_t loading_cids_count = 0;
+            auto defer_release = folly::makeGuard([&]() {
+                if (!reservation_success) {
+                    return;
+                }
+                try {
+                    auto release_delta = loading_overhead;
+                    if (loading_overhead_tracker_) {
+                        release_delta = loading_overhead_tracker_->Release(cell_data_type_, loading_overhead);
+                    }
+                    auto dlist_release = loaded_resource + release_delta;
+                    dlist_->ReleaseLoadingResource(dlist_release);
+                    if (metrics_tracked) {
+                        monitor::cache_cell_loading_count(cell_data_type_, storage_type_).Decrement(loading_cids_count);
+                        monitor::cache_loading_bytes(cell_data_type_, StorageType::MEMORY)
+                            .Decrement(dlist_release.memory_bytes);
+                        monitor::cache_loading_bytes(cell_data_type_, StorageType::DISK)
+                            .Decrement(dlist_release.file_bytes);
+                    }
+                } catch (...) {
+                    auto ew = folly::exception_wrapper(std::current_exception());
+                    LOG_ERROR(
+                        "[MCL] CacheSlot failed to release loading resource for cells with exception, something "
+                        "must be wrong: key={}, loading_cids_count={}, error={}",
+                        translator_->key(), loading_cids_count, ew.what());
+                }
+            });
 
             if (!bonus_cids.empty()) {
-                // if the reservation failed, try to reserve only the essential loading resource
                 if (!reservation_success) {
+                    // Bonus+essential failed — retry with essential only
                     LOG_WARN(
                         "[MCL] CacheSlot reserve loading resource with bonus cells failed, try to reserve only "
-                        "essential "
-                        "loading resource");
-                    resource_needed_for_loading = essential_loading_resource;
-                    reservation_success = SemiInlineGet(
-                        dlist_->ReserveLoadingResourceWithTimeout(resource_needed_for_loading, timeout, ctx));
+                        "essential loading resource");
+                    loaded_resource = essential_loaded_resource;
+                    loading_overhead = essential_loading_overhead;
+                    auto retry = try_reserve(loaded_resource, loading_overhead, timeout, ctx);
+                    reservation_success = retry.first;
+                    actual_dlist_reserve = retry.second;
                 } else {
-                    // if the reservation succeeded, we can load the bonus cells
                     loading_cids.insert(loading_cids.end(), bonus_cids.begin(), bonus_cids.end());
                 }
             }
@@ -472,51 +543,35 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             if (!reservation_success) {
                 LOG_ERROR(
                     "[MCL] CacheSlot failed to reserve resource for "
-                    "cells: key={}, cell_ids=[{}], total "
-                    "resource_needed_for_loading={}",
-                    translator_->key(), fmt::join(loading_cids, ","), resource_needed_for_loading.ToString());
+                    "cells: key={}, cell_ids=[{}], "
+                    "loaded_resource={}, loading_overhead={}, actual_dlist_reserve={}",
+                    translator_->key(), fmt::join(loading_cids, ","), loaded_resource.ToString(),
+                    loading_overhead.ToString(), actual_dlist_reserve.ToString());
                 ThrowInfo(ErrorCode::InsufficientResource,
                           "[MCL] CacheSlot failed to reserve resource for "
-                          "cells: key={}, cell_ids=[{}], total "
-                          "resource_needed_for_loading={}",
-                          translator_->key(), fmt::join(loading_cids, ","), resource_needed_for_loading.ToString());
+                          "cells: key={}, cell_ids=[{}], "
+                          "loaded_resource={}, loading_overhead={}, actual_dlist_reserve={}",
+                          translator_->key(), fmt::join(loading_cids, ","), loaded_resource.ToString(),
+                          loading_overhead.ToString(), actual_dlist_reserve.ToString());
             }
 
             monitor::cache_loading_bytes(cell_data_type_, StorageType::MEMORY)
-                .Increment(resource_needed_for_loading.memory_bytes);
-            monitor::cache_loading_bytes(cell_data_type_, StorageType::DISK)
-                .Increment(resource_needed_for_loading.file_bytes);
-            monitor::cache_cell_loading_count(cell_data_type_, storage_type_).Increment(loading_cids.size());
-
-            // defer release resource_needed_for_loading
-            auto defer_release = folly::makeGuard([this, &resource_needed_for_loading, &loading_cids]() {
-                try {
-                    dlist_->ReleaseLoadingResource(resource_needed_for_loading);
-                    monitor::cache_cell_loading_count(cell_data_type_, storage_type_).Decrement(loading_cids.size());
-                    monitor::cache_loading_bytes(cell_data_type_, StorageType::MEMORY)
-                        .Decrement(resource_needed_for_loading.memory_bytes);
-                    monitor::cache_loading_bytes(cell_data_type_, StorageType::DISK)
-                        .Decrement(resource_needed_for_loading.file_bytes);
-                } catch (...) {
-                    auto exception = std::current_exception();
-                    auto ew = folly::exception_wrapper(exception);
-                    LOG_ERROR(
-                        "[MCL] CacheSlot failed to release loading resource for cells with exception, something must "
-                        "be wrong: "
-                        "key={}, "
-                        "loading_cids=[{}], error={}",
-                        translator_->key(), fmt::join(loading_cids, ","), ew.what());
-                }
-            });
+                .Increment(actual_dlist_reserve.memory_bytes);
+            monitor::cache_loading_bytes(cell_data_type_, StorageType::DISK).Increment(actual_dlist_reserve.file_bytes);
+            loading_cids_count = loading_cids.size();
+            monitor::cache_cell_loading_count(cell_data_type_, storage_type_).Increment(loading_cids_count);
+            metrics_tracked = true;
 
             LOG_TRACE(
                 "[MCL] CacheSlot reserveLoadingResourceWithTimeout {} sec "
-                "result: {} time: {} sec, resource_needed: {}, key: {}",
+                "result: {} time: {} sec, loaded_resource: {}, loading_overhead: {}, "
+                "actual_dlist_reserve: {}, key: {}",
                 timeout.count() / 1000.0, reservation_success ? "success" : "failed",
                 std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start)
                         .count() *
                     1.0 / 1000,
-                resource_needed_for_loading.ToString(), translator_->key());
+                loaded_resource.ToString(), loading_overhead.ToString(), actual_dlist_reserve.ToString(),
+                translator_->key());
 
             run_load_internal();
         } catch (...) {
@@ -649,8 +704,9 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     const bool self_reserve_;
     const bool storage_usage_tracking_enabled_;
     std::chrono::milliseconds loading_timeout_{100000};
-    std::atomic<bool> warmup_called_{false};
     std::chrono::milliseconds warmup_loading_timeout_{0};
+    LoadingOverheadTracker* loading_overhead_tracker_{nullptr};
+    std::atomic<bool> warmup_called_{false};
     std::atomic<bool> skip_pin_{false};
 };
 
