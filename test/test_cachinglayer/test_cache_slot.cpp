@@ -1858,8 +1858,8 @@ TEST(CacheSlotTrackerTest, LoadingOverheadTrackerIntegration) {
     ResourceUsage limit{10000, 0};
     auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
 
-    LoadingOverheadTracker tracker;
-    tracker.RegisterUpperBound(CellDataType::OTHER, {500, 0});
+    auto tracker = std::make_shared<LoadingOverheadTracker>();
+    auto handle = tracker->Register("test_group", {500, 0});
 
     const int64_t cell_loaded_size = 100;
     const int64_t cell_loading_overhead = 200;
@@ -1870,9 +1870,12 @@ TEST(CacheSlotTrackerTest, LoadingOverheadTrackerIntegration) {
     translator->SetLoadingOverheadBytes(cell_loading_overhead);
     auto* translator_ptr = translator.get();
 
+    dlist->SetLoadingOverheadTracker(tracker);
+
     auto cache_slot =
         std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, false,
-                                              std::chrono::milliseconds(5000), std::chrono::milliseconds(0), &tracker);
+                                              std::chrono::milliseconds(5000), std::chrono::milliseconds(0),
+                                              handle);
 
     auto op_ctx = std::make_unique<milvus::OpContext>();
 
@@ -1894,8 +1897,8 @@ TEST(CacheSlotTrackerTest, LoadingOverheadTrackerCleanupOnException) {
     ResourceUsage limit{10000, 0};
     auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
 
-    LoadingOverheadTracker tracker;
-    tracker.RegisterUpperBound(CellDataType::OTHER, {500, 0});
+    auto tracker = std::make_shared<LoadingOverheadTracker>();
+    auto handle = tracker->Register("test_group", {500, 0});
 
     const int64_t cell_loaded_size = 100;
     const int64_t cell_loading_overhead = 200;
@@ -1906,22 +1909,22 @@ TEST(CacheSlotTrackerTest, LoadingOverheadTrackerCleanupOnException) {
     translator->SetLoadingOverheadBytes(cell_loading_overhead);
     translator->SetShouldThrow(true);
 
+    dlist->SetLoadingOverheadTracker(tracker);
+
     auto cache_slot =
         std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, false,
-                                              std::chrono::milliseconds(5000), std::chrono::milliseconds(0), &tracker);
+                                              std::chrono::milliseconds(5000), std::chrono::milliseconds(0),
+                                              handle);
 
     auto op_ctx = std::make_unique<milvus::OpContext>();
 
     // Pin should fail because translator throws, but tracker state must be cleaned up.
-    // The exception is caught internally by RunLoad and set as error on the cell.
     EXPECT_ANY_THROW(cache_slot->PinCellsDirect(op_ctx.get(), {0}));
 
-    // After the failed load, tracker state should be clean.
-    // Verify by reserving again — if state leaked, the tracker would have stale sum_of_overhead.
-    // Reserve the full UB amount — should succeed fully if no leak.
-    auto delta = tracker.Reserve(CellDataType::OTHER, {500, 0});
+    // Verify tracker state is clean by reserving the full UB.
+    auto delta = tracker->Reserve(handle, {500, 0});
     EXPECT_EQ(delta.memory_bytes, 500);
 
-    auto release = tracker.Release(CellDataType::OTHER, {500, 0});
+    auto release = tracker->Release(handle, {500, 0});
     EXPECT_EQ(release.memory_bytes, 500);
 }

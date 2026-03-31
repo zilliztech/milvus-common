@@ -35,6 +35,84 @@ ClampNonNegative(std::atomic<ResourceUsage>& counter, LogFn&& log_fn) {
     }
 }
 
+folly::SemiFuture<ResourceUsage>
+DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& loaded, const ResourceUsage& overhead,
+                                         uint64_t overhead_handle,
+                                         std::chrono::milliseconds timeout, OpContext* ctx) {
+    // Quick reject: if even loaded alone (minimum possible) exceeds capacity, fail fast.
+    auto min_possible = loaded * eviction_config_.loading_resource_factor;
+    std::unique_lock<std::mutex> lock(list_mtx_);
+    if (!max_resource_limit_.load().CanHold(min_possible)) {
+        LOG_ERROR("[MCL] Failed to reserve loaded={} as it exceeds max_memory_={}.",
+                  loaded.ToString(), max_resource_limit_.load().ToString());
+        return folly::makeSemiFuture(ResourceUsage{});
+    }
+    auto [success, actual] =
+        reserveResourceInternalWithTracker(loaded, overhead, overhead_handle, loading_overhead_tracker_.get());
+    if (success) {
+        return folly::makeSemiFuture(actual);
+    }
+
+    if (timeout.count() == 0) {
+        return folly::makeSemiFuture(ResourceUsage{});
+    }
+
+    auto deadline =
+        timeout.count() > 0 ? std::chrono::steady_clock::now() + timeout : std::chrono::steady_clock::time_point::max();
+    auto [promise, future] = folly::makePromiseContract<ResourceUsage>();
+    uint64_t request_id = next_request_id_.fetch_add(1);
+
+    auto waiting_request = std::make_unique<WaitingRequest>(
+        loaded, overhead, overhead_handle, deadline, std::move(promise), request_id);
+    WaitingRequest* request_ptr = waiting_request.get();
+    waiting_requests_map_[request_id] = request_ptr;
+    waiting_queue_.push(std::move(waiting_request));
+    waiting_queue_empty_ = false;
+    std::weak_ptr<DList> weak_self = shared_from_this();
+
+    if (timeout.count() > 0) {
+        LOG_DEBUG("[MCL] Request {} loaded={} overhead={} added to waiting queue, timeout={}ms",
+                  request_id, loaded.ToString(), overhead.ToString(), timeout.count());
+
+        event_base_thread_->getEventBase()->runInEventBaseThread([weak_self, request_id, timeout]() {
+            auto self = weak_self.lock();
+            if (!self) return;
+            self->event_base_thread_->getEventBase()->runAfterDelay(
+                [weak_self, request_id]() {
+                    auto self = weak_self.lock();
+                    if (!self) return;
+                    std::unique_lock<std::mutex> lock(self->list_mtx_);
+                    auto it = self->waiting_requests_map_.find(request_id);
+                    if (it != self->waiting_requests_map_.end()) {
+                        LOG_WARN("[MCL] Reserve Request {} timed out.", request_id);
+                        it->second->setValue(false);
+                        self->waiting_requests_map_.erase(it);
+                    }
+                },
+                static_cast<uint32_t>(timeout.count()));
+        });
+    }
+
+    if (ctx && ctx->cancellation_token.canBeCancelled()) {
+        request_ptr->cancel_cb.emplace(ctx->cancellation_token, [weak_self, request_id]() {
+            auto self = weak_self.lock();
+            if (!self) return;
+            self->event_base_thread_->getEventBase()->runInEventBaseThread([weak_self, request_id]() {
+                auto self = weak_self.lock();
+                if (!self) return;
+                std::unique_lock<std::mutex> lock(self->list_mtx_);
+                auto it = self->waiting_requests_map_.find(request_id);
+                if (it == self->waiting_requests_map_.end()) return;
+                LOG_WARN("[MCL] Request {} cancelled.", request_id);
+                it->second->setValue(false);
+                self->waiting_requests_map_.erase(it);
+            });
+        });
+    }
+
+    return std::move(future);
+}
+
 folly::SemiFuture<bool>
 DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std::chrono::milliseconds timeout,
                                          OpContext* ctx) {
@@ -97,7 +175,7 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std
                             "[MCL] Reserve Request {} of size {} timed out, "
                             "notifying failure.",
                             request_id, it->second->required_size.ToString());
-                        it->second->promise.setValue(false);
+                        it->second->setValue(false);
                         self->waiting_requests_map_.erase(it);
                     }
                 },
@@ -125,7 +203,7 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std
                     return;
                 }
                 LOG_WARN("[MCL] Request {} cancelled, notifying failure.", request_id);
-                it->second->promise.setValue(false);
+                it->second->setValue(false);
                 self->waiting_requests_map_.erase(it);
             });
         });
@@ -211,6 +289,68 @@ DList::reserveResourceInternal(const ResourceUsage& size) {
               size.ToString(), total_loading_size_.load().ToString(), total_loaded_size_.load().ToString());
 
     return true;
+}
+
+std::pair<bool, ResourceUsage>
+DList::reserveResourceInternalWithTracker(const ResourceUsage& loaded, const ResourceUsage& overhead,
+                                          uint64_t overhead_handle, LoadingOverheadTracker* tracker) {
+    // Compute tracker delta first so space check uses the actual amount, not the uncapped overhead.
+    // This avoids rejecting loads that would fit after tracker capping (e.g., delta=0 when group is saturated).
+    auto delta = overhead;
+    if (overhead_handle != LoadingOverheadTracker::kInvalidHandle) {
+        delta = tracker->Reserve(overhead_handle, overhead);
+    }
+    auto actual_size = (loaded + delta) * eviction_config_.loading_resource_factor;
+    auto using_resources = total_loaded_size_.load() + total_loading_size_.load();
+
+    bool logical_limit_exceeded = !max_resource_limit_.load().CanHold(using_resources + actual_size);
+    auto physical_eviction_needed = checkPhysicalMemoryLimit(actual_size);
+
+    while (logical_limit_exceeded || physical_eviction_needed.AnyGTZero()) {
+        ResourceUsage eviction_target;
+        ResourceUsage min_eviction;
+
+        if (logical_limit_exceeded) {
+            eviction_target = using_resources + actual_size - low_watermark_;
+            min_eviction = using_resources + actual_size - max_resource_limit_.load();
+            if (eviction_target.memory_bytes < 0) eviction_target.memory_bytes = 0;
+            if (eviction_target.file_bytes < 0) eviction_target.file_bytes = 0;
+            if (min_eviction.memory_bytes < 0) min_eviction.memory_bytes = 0;
+            if (min_eviction.file_bytes < 0) min_eviction.file_bytes = 0;
+        }
+
+        if (physical_eviction_needed.AnyGTZero()) {
+            eviction_target.memory_bytes = std::max(eviction_target.memory_bytes, physical_eviction_needed.memory_bytes);
+            eviction_target.file_bytes = std::max(eviction_target.file_bytes, physical_eviction_needed.file_bytes);
+            min_eviction.memory_bytes = std::max(min_eviction.memory_bytes, physical_eviction_needed.memory_bytes);
+            min_eviction.file_bytes = std::max(min_eviction.file_bytes, physical_eviction_needed.file_bytes);
+        }
+
+        ResourceUsage evicted_size = tryEvict(eviction_target, min_eviction);
+        if (!evicted_size.AnyGTZero()) {
+            LOG_WARN("[MCL] reserve with tracker failed: loaded={}, overhead={}, delta={}, eviction_target={}, "
+                     "min_eviction={}",
+                     loaded.ToString(), overhead.ToString(), delta.ToString(),
+                     eviction_target.ToString(), min_eviction.ToString());
+            // Rollback tracker state on failure
+            if (overhead_handle != LoadingOverheadTracker::kInvalidHandle) {
+                tracker->Release(overhead_handle, overhead);
+            }
+            return {false, {}};
+        }
+        logical_limit_exceeded = false;
+
+        if (!physical_eviction_needed.AnyGTZero()) break;
+        if (physical_eviction_needed = checkPhysicalMemoryLimit(actual_size); !physical_eviction_needed.AnyGTZero())
+            break;
+    }
+
+    total_loading_size_ += actual_size;
+    auto unscaled = loaded + delta;
+    LOG_TRACE("[MCL] reserve with tracker: loaded={}, overhead={}, delta={}, unscaled={}, scaled={}, total_loading={}",
+              loaded.ToString(), overhead.ToString(), delta.ToString(), unscaled.ToString(),
+              actual_size.ToString(), total_loading_size_.load().ToString());
+    return {true, unscaled};
 }
 
 void
@@ -492,6 +632,28 @@ DList::UpdateHighWatermark(const ResourceUsage& new_high_watermark) {
 }
 
 void
+DList::ReleaseLoadingResource(const ResourceUsage& loaded, const ResourceUsage& overhead,
+                               uint64_t overhead_handle) {
+    std::vector<std::unique_ptr<WaitingRequest>> to_destroy;
+    {
+        std::unique_lock<std::mutex> lock(list_mtx_);
+        auto delta = overhead;
+        if (overhead_handle != LoadingOverheadTracker::kInvalidHandle) {
+            delta = loading_overhead_tracker_->Release(overhead_handle, overhead);
+        }
+        auto actual = (loaded + delta) * eviction_config_.loading_resource_factor;
+        total_loading_size_ -= actual;
+        ClampNonNegative(total_loading_size_, [&](const ResourceUsage& curr) {
+            LOG_ERROR("[MCL] total_loading_size_ negative after tracker release: loaded={}, overhead={}, delta={}, "
+                      "current={}",
+                      loaded.ToString(), overhead.ToString(), delta.ToString(), curr.ToString());
+        });
+        to_destroy = handleWaitingRequests();
+    }
+    // Destroy requests outside lock to avoid deadlock with cancel callbacks
+}
+
+void
 DList::ReleaseLoadingResource(const ResourceUsage& loading_size) {
     auto size = loading_size * eviction_config_.loading_resource_factor;
     total_loading_size_ -= size;
@@ -663,7 +825,7 @@ DList::handleWaitingRequests() {
                     "[MCL] Request {} expired, cleaned up by "
                     "handleWaitingRequests.",
                     request->request_id);
-                request->promise.setValue(false);
+                request->setValue(false);
             }
             // If erase returned 0, the timeout/cancel handler ran first and claimed the
             // request. We don't need to do anything with the promise.
@@ -673,20 +835,41 @@ DList::handleWaitingRequests() {
             continue;
         }
 
-        if (reserveResourceInternal(request_ptr_ref->required_size)) {
+        // Try to fulfill: tracker-aware path computes delta under lock,
+        // legacy path uses required_size directly.
+        bool fulfilled = false;
+        ResourceUsage actual{};
+        if (request_ptr_ref->use_resource_promise) {
+            auto [ok, unscaled] = reserveResourceInternalWithTracker(
+                request_ptr_ref->loaded, request_ptr_ref->overhead,
+                request_ptr_ref->overhead_handle, loading_overhead_tracker_.get());
+            fulfilled = ok;
+            actual = unscaled;
+        } else {
+            if (reserveResourceInternal(request_ptr_ref->required_size)) {
+                fulfilled = true;
+                actual = request_ptr_ref->required_size;
+            }
+        }
+        if (fulfilled) {
             auto request = std::move(request_ptr_ref);
 
             if (waiting_requests_map_.erase(request->request_id) > 0) {
-                // Success - notify the request
                 LOG_DEBUG("[MCL] Executing success notification for request {}", request->request_id);
-                request->promise.setValue(true);
+                request->setValue(true, actual);
             } else {
-                // Request was already handled by timeout/cancel, rollback reserved resource.
+                // Request was already handled by timeout/cancel, rollback.
+                // Legacy: actual is already scaled. Tracker-aware: actual is unscaled, needs scaling.
                 LOG_WARN(
-                    "[MCL] Request {} of size {} was already handled by timeout/cancel, rolling back reserved "
-                    "resource.",
-                    request->request_id, request->required_size.ToString());
-                total_loading_size_ -= request->required_size;
+                    "[MCL] Request {} was already handled by timeout/cancel, rolling back.",
+                    request->request_id);
+                auto rollback = request->use_resource_promise
+                                    ? actual * eviction_config_.loading_resource_factor
+                                    : actual;
+                total_loading_size_ -= rollback;
+                if (request->overhead_handle != LoadingOverheadTracker::kInvalidHandle) {
+                    loading_overhead_tracker_->Release(request->overhead_handle, request->overhead);
+                }
             }
             requests_to_destroy.push_back(std::move(request));
             waiting_queue_.pop();
@@ -719,7 +902,7 @@ DList::clearWaitingQueue() {
 
             // Only setValue if this request hasn't been handled by timeout/cancel
             if (waiting_requests_map_.erase(request->request_id) > 0) {
-                request->promise.setValue(false);
+                request->setValue(false);
             }
             requests_to_destroy.push_back(std::move(request));
         }

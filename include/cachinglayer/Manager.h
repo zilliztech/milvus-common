@@ -64,19 +64,22 @@ class Manager {
         auto evictable = translator->meta()->support_eviction && eviction_enabled_;
         auto self_reserve = eviction_enabled_;
 
-        // Register loading overhead upper bound for this CellDataType.
-        // If the translator specifies a finite UB, use it; otherwise register
-        // with unlimited UB to ensure every type goes through the tracker.
+        // Register loading overhead group. The group key defaults to
+        // the CellDataType name, but translators can override via Meta.
+        auto group_key = translator->meta()->loading_overhead_group.empty()
+                             ? std::to_string(static_cast<int>(translator->meta()->cell_data_type))
+                             : translator->meta()->loading_overhead_group;
+        uint64_t overhead_handle = 0;
         if (translator->meta()->loading_overhead_upper_bound.has_value()) {
-            loading_overhead_tracker_.RegisterUpperBound(translator->meta()->cell_data_type,
-                                                         translator->meta()->loading_overhead_upper_bound.value());
+            overhead_handle = loading_overhead_tracker_->Register(
+                group_key, translator->meta()->loading_overhead_upper_bound.value());
         } else {
-            loading_overhead_tracker_.EnsureRegistered(translator->meta()->cell_data_type);
+            overhead_handle = loading_overhead_tracker_->EnsureRegistered(group_key);
         }
 
         auto cache_slot = std::make_shared<CacheSlot<CellT>>(
             std::move(translator), dlist_.get(), evictable, self_reserve, config.storage_usage_tracking_enabled,
-            config.loading_timeout, config.warmup_loading_timeout, &loading_overhead_tracker_);
+            config.loading_timeout, config.warmup_loading_timeout, overhead_handle);
         cache_slot->Warmup(ctx, prefetch_pool_);
         return cache_slot;
     }
@@ -156,7 +159,8 @@ class Manager {
 
     std::shared_ptr<internal::DList> dlist_{nullptr};
     std::shared_ptr<folly::CPUThreadPoolExecutor> prefetch_pool_{nullptr};
-    LoadingOverheadTracker loading_overhead_tracker_;
+    std::shared_ptr<LoadingOverheadTracker> loading_overhead_tracker_ =
+        std::make_shared<LoadingOverheadTracker>();
     bool eviction_enabled_{false};
 };  // class Manager
 

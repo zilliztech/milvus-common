@@ -38,15 +38,20 @@ struct Meta {
     // loads happen. The real resource usage is bounded by loading_pool_size * cell_size.
     // If not set, no capping is applied (existing behavior).
     std::optional<ResourceUsage> loading_overhead_upper_bound;
+    // Group key for overhead capping. Translators sharing the same key share one UB.
+    // If empty, defaults to a string representation of cell_data_type.
+    std::string loading_overhead_group;
     explicit Meta(StorageType storage_type, CellIdMappingMode cell_id_mapping_mode, CellDataType cell_data_type,
                   CacheWarmupPolicy cache_warmup_policy, bool support_eviction,
-                  std::optional<ResourceUsage> loading_overhead_upper_bound = std::nullopt)
+                  std::optional<ResourceUsage> loading_overhead_upper_bound = std::nullopt,
+                  std::string loading_overhead_group = "")
         : storage_type(storage_type),
           cell_id_mapping_mode(cell_id_mapping_mode),
           cell_data_type(cell_data_type),
           cache_warmup_policy(cache_warmup_policy),
           support_eviction(support_eviction),
-          loading_overhead_upper_bound(loading_overhead_upper_bound) {
+          loading_overhead_upper_bound(loading_overhead_upper_bound),
+          loading_overhead_group(std::move(loading_overhead_group)) {
     }
 };
 

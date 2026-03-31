@@ -58,7 +58,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     CacheSlot(std::unique_ptr<Translator<CellT>> translator, internal::DList* dlist, bool evictable, bool self_reserve,
               bool storage_usage_tracking_enabled, std::chrono::milliseconds loading_timeout,
               std::chrono::milliseconds warmup_loading_timeout,
-              LoadingOverheadTracker* loading_overhead_tracker = nullptr)
+              uint64_t overhead_handle = 0)
         : translator_(std::move(translator)),
           cell_id_mapping_mode_(translator_->meta()->cell_id_mapping_mode),
           cell_data_type_(translator_->meta()->cell_data_type),
@@ -69,7 +69,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
           storage_usage_tracking_enabled_(storage_usage_tracking_enabled),
           loading_timeout_(loading_timeout),
           warmup_loading_timeout_(warmup_loading_timeout),
-          loading_overhead_tracker_(loading_overhead_tracker) {
+          overhead_handle_(overhead_handle) {
         cells_.reserve(translator_->num_cells());
         for (cid_t i = 0; i < static_cast<cid_t>(translator_->num_cells()); ++i) {
             cells_.push_back(std::make_unique<CacheCell>(this, i));
@@ -466,35 +466,12 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             auto loaded_resource = essential_loaded_resource + bonus_loaded_resource;
             auto loading_overhead = essential_loading_overhead + bonus_loading_overhead;
 
-            // Reserve tracker + DList atomically. On success, returns a guard that
-            // releases both on destruction. On failure, tracker state is rolled back
-            // before returning. No resource is left dangling in either case.
-            auto try_reserve = [this](const ResourceUsage& loaded, const ResourceUsage& loading,
-                                      std::chrono::milliseconds timeout,
-                                      OpContext* ctx) -> std::pair<bool, ResourceUsage /*actual_dlist_reserve*/> {
-                auto loading_delta = loading;
-                if (loading_overhead_tracker_) {
-                    loading_delta = loading_overhead_tracker_->Reserve(cell_data_type_, loading);
-                }
-                auto actual_dlist_reserve = loaded + loading_delta;
+            auto actual_dlist_reserve = SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(
+                loaded_resource, loading_overhead, overhead_handle_, timeout, ctx));
+            bool reservation_success = actual_dlist_reserve.AnyGTZero();
 
-                bool success =
-                    SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(actual_dlist_reserve, timeout, ctx));
-                if (!success) {
-                    if (loading_overhead_tracker_) {
-                        loading_overhead_tracker_->Release(cell_data_type_, loading);
-                    }
-                    return {false, {}};
-                }
-                return {true, actual_dlist_reserve};
-            };
-
-            auto reserve_result = try_reserve(loaded_resource, loading_overhead, timeout, ctx);
-            bool reservation_success = reserve_result.first;
-            ResourceUsage actual_dlist_reserve = reserve_result.second;
-
-            // Guard created immediately after reserve — all by-ref so bonus retry
-            // and metrics setup are automatically reflected. No gap, no handoff.
+            // Guard: releases DList + tracker atomically. All by-ref so bonus retry
+            // updates are reflected automatically.
             bool metrics_tracked = false;
             size_t loading_cids_count = 0;
             auto defer_release = folly::makeGuard([&]() {
@@ -502,18 +479,14 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                     return;
                 }
                 try {
-                    auto release_delta = loading_overhead;
-                    if (loading_overhead_tracker_) {
-                        release_delta = loading_overhead_tracker_->Release(cell_data_type_, loading_overhead);
-                    }
-                    auto dlist_release = loaded_resource + release_delta;
-                    dlist_->ReleaseLoadingResource(dlist_release);
+                    dlist_->ReleaseLoadingResource(loaded_resource, loading_overhead,
+                                                   overhead_handle_);
                     if (metrics_tracked) {
                         monitor::cache_cell_loading_count(cell_data_type_, storage_type_).Decrement(loading_cids_count);
                         monitor::cache_loading_bytes(cell_data_type_, StorageType::MEMORY)
-                            .Decrement(dlist_release.memory_bytes);
+                            .Decrement(actual_dlist_reserve.memory_bytes);
                         monitor::cache_loading_bytes(cell_data_type_, StorageType::DISK)
-                            .Decrement(dlist_release.file_bytes);
+                            .Decrement(actual_dlist_reserve.file_bytes);
                     }
                 } catch (...) {
                     auto ew = folly::exception_wrapper(std::current_exception());
@@ -532,9 +505,9 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                         "essential loading resource");
                     loaded_resource = essential_loaded_resource;
                     loading_overhead = essential_loading_overhead;
-                    auto retry = try_reserve(loaded_resource, loading_overhead, timeout, ctx);
-                    reservation_success = retry.first;
-                    actual_dlist_reserve = retry.second;
+                    actual_dlist_reserve = SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(
+                        loaded_resource, loading_overhead, overhead_handle_, timeout, ctx));
+                    reservation_success = actual_dlist_reserve.AnyGTZero();
                 } else {
                     loading_cids.insert(loading_cids.end(), bonus_cids.begin(), bonus_cids.end());
                 }
@@ -705,7 +678,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     const bool storage_usage_tracking_enabled_;
     std::chrono::milliseconds loading_timeout_{100000};
     std::chrono::milliseconds warmup_loading_timeout_{0};
-    LoadingOverheadTracker* loading_overhead_tracker_{nullptr};
+    uint64_t overhead_handle_{0};
     std::atomic<bool> warmup_called_{false};
     std::atomic<bool> skip_pin_{false};
 };
