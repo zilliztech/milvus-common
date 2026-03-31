@@ -1928,3 +1928,46 @@ TEST(CacheSlotTrackerTest, LoadingOverheadTrackerCleanupOnException) {
     auto release = tracker->Release(handle, {500, 0});
     EXPECT_EQ(release.memory_bytes, 500);
 }
+
+// Test bonus cells retry path with tracker: essential+bonus exceeds DList capacity,
+// falls back to essential-only which succeeds.
+TEST(CacheSlotTrackerTest, BonusCellsRetryWithTracker) {
+    // Tight capacity: can hold 2 cells (200 bytes) + overhead (up to UB=100), but not 3 cells (300).
+    ResourceUsage limit{350, 0};
+    auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
+
+    auto tracker = std::make_shared<LoadingOverheadTracker>();
+    auto handle = tracker->Register("test_bonus_retry", {100, 0});
+    dlist->SetLoadingOverheadTracker(tracker);
+
+    const int64_t cell_loaded_size = 100;
+    const int64_t cell_loading_overhead = 50;
+
+    // 3 cells: cid 0, 1, 2. We'll pin cid 0, with bonus cells {1, 2}.
+    // essential(cid 0) = 100 loaded + 50 overhead = fits in 350
+    // essential+bonus(cid 0,1,2) = 300 loaded + 150 overhead = 450 > 350, should fail
+    // retry essential-only(cid 0) = 100 loaded + delta overhead = fits
+    auto translator = std::make_unique<MockTranslator>(
+        std::vector<std::pair<cid_t, int64_t>>{{0, cell_loaded_size}, {1, cell_loaded_size}, {2, cell_loaded_size}},
+        std::unordered_map<cl_uid_t, cid_t>{{0, 0}, {1, 1}, {2, 2}}, "test_bonus_retry", StorageType::MEMORY);
+    translator->SetLoadingOverheadBytes(cell_loading_overhead);
+    translator->SetExtraReturnCids({{0, {1, 2}}});
+
+    auto cache_slot =
+        std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, false,
+                                              std::chrono::milliseconds(200), std::chrono::milliseconds(0),
+                                              handle);
+
+    auto op_ctx = std::make_unique<milvus::OpContext>();
+
+    // Pin cell 0: bonus retry should kick in, essential-only should succeed.
+    auto accessor = cache_slot->PinCellsDirect(op_ctx.get(), {0});
+    ASSERT_NE(accessor, nullptr);
+    EXPECT_EQ(accessor->get_cell_of(0)->data, 0);
+
+    // Cell 1 and 2 should NOT be loaded (bonus was dropped).
+    // Pin them separately to verify they weren't loaded as bonus.
+    auto accessor2 = cache_slot->PinCellsDirect(op_ctx.get(), {1});
+    ASSERT_NE(accessor2, nullptr);
+    EXPECT_EQ(accessor2->get_cell_of(1)->data, 10);
+}

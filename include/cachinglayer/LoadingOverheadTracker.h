@@ -52,12 +52,18 @@ class LoadingOverheadTracker {
             auto& existing = handle_state_[it->second].upper_bound;
             if (existing == kUnlimited) {
                 existing = upper_bound;
-            } else {
+                LOG_INFO("[MCL] LoadingOverheadTracker set UB for group '{}' (handle {}): {}", group, it->second,
+                         upper_bound.ToString());
+            } else if (existing.memory_bytes < upper_bound.memory_bytes ||
+                       existing.file_bytes < upper_bound.file_bytes) {
                 existing.memory_bytes = std::max(existing.memory_bytes, upper_bound.memory_bytes);
                 existing.file_bytes = std::max(existing.file_bytes, upper_bound.file_bytes);
+                LOG_INFO("[MCL] LoadingOverheadTracker widened UB for group '{}' (handle {}): {}", group, it->second,
+                         existing.ToString());
+            } else {
+                LOG_DEBUG("[MCL] LoadingOverheadTracker re-registered group '{}' (handle {}), UB unchanged", group,
+                          it->second);
             }
-            LOG_INFO("[MCL] LoadingOverheadTracker updated UB for group '{}' (handle {}): {}", group, it->second,
-                     upper_bound.ToString());
             return it->second;
         }
         auto handle = next_handle_++;
