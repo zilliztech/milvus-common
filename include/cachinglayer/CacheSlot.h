@@ -57,8 +57,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
 
     CacheSlot(std::unique_ptr<Translator<CellT>> translator, internal::DList* dlist, bool evictable, bool self_reserve,
               bool storage_usage_tracking_enabled, std::chrono::milliseconds loading_timeout,
-              std::chrono::milliseconds warmup_loading_timeout,
-              uint64_t overhead_handle = 0)
+              std::chrono::milliseconds warmup_loading_timeout, uint64_t overhead_handle = 0)
         : translator_(std::move(translator)),
           cell_id_mapping_mode_(translator_->meta()->cell_id_mapping_mode),
           cell_data_type_(translator_->meta()->cell_data_type),
@@ -479,8 +478,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                     return;
                 }
                 try {
-                    dlist_->ReleaseLoadingResource(loaded_resource, loading_overhead,
-                                                   overhead_handle_);
+                    dlist_->ReleaseLoadingResource(loaded_resource, loading_overhead, overhead_handle_);
                     if (metrics_tracked) {
                         monitor::cache_cell_loading_count(cell_data_type_, storage_type_).Decrement(loading_cids_count);
                         monitor::cache_loading_bytes(cell_data_type_, StorageType::MEMORY)

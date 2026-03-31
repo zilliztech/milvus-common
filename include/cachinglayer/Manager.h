@@ -151,8 +151,7 @@ class Manager {
 
     std::shared_ptr<internal::DList> dlist_{nullptr};
     std::shared_ptr<folly::CPUThreadPoolExecutor> prefetch_pool_{nullptr};
-    std::shared_ptr<LoadingOverheadTracker> loading_overhead_tracker_ =
-        std::make_shared<LoadingOverheadTracker>();
+    std::shared_ptr<LoadingOverheadTracker> loading_overhead_tracker_ = std::make_shared<LoadingOverheadTracker>();
     bool eviction_enabled_{false};
 };  // class Manager
 

@@ -139,13 +139,12 @@ class DList : public std::enable_shared_from_this<DList> {
     // Returns the actual reserved size (zero = failure).
     folly::SemiFuture<ResourceUsage>
     ReserveLoadingResourceWithTimeout(const ResourceUsage& loaded, const ResourceUsage& overhead,
-                                      uint64_t overhead_handle,
-                                      std::chrono::milliseconds timeout, OpContext* ctx = nullptr);
+                                      uint64_t overhead_handle, std::chrono::milliseconds timeout,
+                                      OpContext* ctx = nullptr);
 
     // Release with loading overhead tracker integration.
     void
-    ReleaseLoadingResource(const ResourceUsage& loaded, const ResourceUsage& overhead,
-                           uint64_t overhead_handle);
+    ReleaseLoadingResource(const ResourceUsage& loaded, const ResourceUsage& overhead, uint64_t overhead_handle);
 
     // Release resource used for loading, called after loading a cell.
     void

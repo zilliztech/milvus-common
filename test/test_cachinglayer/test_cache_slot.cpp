@@ -1874,8 +1874,7 @@ TEST(CacheSlotTrackerTest, LoadingOverheadTrackerIntegration) {
 
     auto cache_slot =
         std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, false,
-                                              std::chrono::milliseconds(5000), std::chrono::milliseconds(0),
-                                              handle);
+                                              std::chrono::milliseconds(5000), std::chrono::milliseconds(0), handle);
 
     auto op_ctx = std::make_unique<milvus::OpContext>();
 
@@ -1913,8 +1912,7 @@ TEST(CacheSlotTrackerTest, LoadingOverheadTrackerCleanupOnException) {
 
     auto cache_slot =
         std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, false,
-                                              std::chrono::milliseconds(5000), std::chrono::milliseconds(0),
-                                              handle);
+                                              std::chrono::milliseconds(5000), std::chrono::milliseconds(0), handle);
 
     auto op_ctx = std::make_unique<milvus::OpContext>();
 
@@ -1955,8 +1953,7 @@ TEST(CacheSlotTrackerTest, BonusCellsRetryWithTracker) {
 
     auto cache_slot =
         std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, false,
-                                              std::chrono::milliseconds(200), std::chrono::milliseconds(0),
-                                              handle);
+                                              std::chrono::milliseconds(200), std::chrono::milliseconds(0), handle);
 
     auto op_ctx = std::make_unique<milvus::OpContext>();
 
