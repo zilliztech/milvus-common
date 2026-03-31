@@ -74,20 +74,6 @@ class LoadingOverheadTracker {
         return handle;
     }
 
-    // Ensure a group is registered. If not yet registered, registers with kUnlimited.
-    uint64_t
-    EnsureRegistered(const std::string& group) {
-        std::lock_guard<std::mutex> lock(mtx_);
-        auto it = name_to_handle_.find(group);
-        if (it != name_to_handle_.end()) {
-            return it->second;
-        }
-        auto handle = next_handle_++;
-        name_to_handle_[group] = handle;
-        handle_state_[handle] = GroupState{kUnlimited, {}, {}};
-        return handle;
-    }
-
     // Called before loading. Returns the delta to reserve from DList for loading overhead.
     ResourceUsage
     Reserve(uint64_t handle, const ResourceUsage& loading_overhead) {

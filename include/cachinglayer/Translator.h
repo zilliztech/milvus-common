@@ -22,6 +22,11 @@
 
 namespace milvus::cachinglayer {
 
+struct LoadingOverheadConfig {
+    ResourceUsage upper_bound;
+    std::string group;
+};
+
 struct Meta {
     // This storage type is currently used only by metrics to distinguish the slot type.
     // In actual resource reservation, we use the actual size of the cell to determine the type.
@@ -32,26 +37,21 @@ struct Meta {
     // Whether the translator supports strategy based eviction.
     // Does not affect manual eviction.
     bool support_eviction;
-    // Upper bound for loading overhead reservation for this CellDataType.
-    // When set, the total loading overhead across all CacheSlots of this type
-    // is capped at this value, preventing over-reservation when many concurrent
+    // Loading overhead configuration for this translator.
+    // When set, the total loading overhead across all CacheSlots sharing the same group
+    // is capped at upper_bound, preventing over-reservation when many concurrent
     // loads happen. The real resource usage is bounded by loading_pool_size * cell_size.
     // If not set, no capping is applied (existing behavior).
-    std::optional<ResourceUsage> loading_overhead_upper_bound;
-    // Group key for overhead capping. Translators sharing the same key share one UB.
-    // If empty, defaults to a string representation of cell_data_type.
-    std::string loading_overhead_group;
+    std::optional<LoadingOverheadConfig> loading_overhead;
     explicit Meta(StorageType storage_type, CellIdMappingMode cell_id_mapping_mode, CellDataType cell_data_type,
                   CacheWarmupPolicy cache_warmup_policy, bool support_eviction,
-                  std::optional<ResourceUsage> loading_overhead_upper_bound = std::nullopt,
-                  std::string loading_overhead_group = "")
+                  std::optional<LoadingOverheadConfig> loading_overhead = std::nullopt)
         : storage_type(storage_type),
           cell_id_mapping_mode(cell_id_mapping_mode),
           cell_data_type(cell_data_type),
           cache_warmup_policy(cache_warmup_policy),
           support_eviction(support_eviction),
-          loading_overhead_upper_bound(loading_overhead_upper_bound),
-          loading_overhead_group(std::move(loading_overhead_group)) {
+          loading_overhead(std::move(loading_overhead)) {
     }
 };
 

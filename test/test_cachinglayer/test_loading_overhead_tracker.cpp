@@ -15,7 +15,7 @@ class LoadingOverheadTrackerTest : public ::testing::Test {
 
 TEST_F(LoadingOverheadTrackerTest, NoUpperBoundPassThrough) {
     // Without registering a UB, all amounts pass through unchanged.
-    auto handle = tracker_.EnsureRegistered("vector_index");
+    auto handle = tracker_.Register("vector_index", LoadingOverheadTracker::kUnlimited);
     auto delta = tracker_.Reserve(handle, {100, 0});
     EXPECT_EQ(delta.memory_bytes, 100);
     EXPECT_EQ(delta.file_bytes, 0);
@@ -155,12 +155,12 @@ TEST_F(LoadingOverheadTrackerTest, RegisterUpperBoundTakesMax) {
 }
 
 TEST_F(LoadingOverheadTrackerTest, HasFiniteUpperBound) {
-    auto handle = tracker_.EnsureRegistered("vector_index");
+    auto handle = tracker_.Register("vector_index", LoadingOverheadTracker::kUnlimited);
     EXPECT_FALSE(tracker_.HasFiniteUpperBound(handle));
     handle = tracker_.Register("vector_index", {200, 0});
     EXPECT_TRUE(tracker_.HasFiniteUpperBound(handle));
 
-    auto scalar_handle = tracker_.EnsureRegistered("scalar_field");
+    auto scalar_handle = tracker_.Register("scalar_field", LoadingOverheadTracker::kUnlimited);
     EXPECT_FALSE(tracker_.HasFiniteUpperBound(scalar_handle));
 }
 
@@ -196,8 +196,8 @@ TEST_F(LoadingOverheadTrackerTest, ConcurrentReserveRelease) {
 }
 
 TEST_F(LoadingOverheadTrackerTest, DefaultUnlimitedUBFallback) {
-    // EnsureRegistered without explicit UB -> unlimited, behaves like no capping.
-    auto handle = tracker_.EnsureRegistered("vector_index");
+    // Register with kUnlimited -> unlimited, behaves like no capping.
+    auto handle = tracker_.Register("vector_index", LoadingOverheadTracker::kUnlimited);
 
     EXPECT_FALSE(tracker_.HasFiniteUpperBound(handle));
 
@@ -214,8 +214,8 @@ TEST_F(LoadingOverheadTrackerTest, DefaultUnlimitedUBFallback) {
     EXPECT_EQ(r2.memory_bytes, 2000000000);
 }
 
-TEST_F(LoadingOverheadTrackerTest, EnsureRegisteredThenRegisterFiniteUB) {
-    auto handle = tracker_.EnsureRegistered("vector_index");
+TEST_F(LoadingOverheadTrackerTest, RegisterUnlimitedThenFiniteUB) {
+    auto handle = tracker_.Register("vector_index", LoadingOverheadTracker::kUnlimited);
     EXPECT_FALSE(tracker_.HasFiniteUpperBound(handle));
 
     handle = tracker_.Register("vector_index", {200, 0});
@@ -227,7 +227,7 @@ TEST_F(LoadingOverheadTrackerTest, EnsureRegisteredThenRegisterFiniteUB) {
 }
 
 TEST_F(LoadingOverheadTrackerTest, UnregisteredTypeAutoCreatesUnlimited) {
-    auto handle = tracker_.EnsureRegistered("scalar_field");
+    auto handle = tracker_.Register("scalar_field", LoadingOverheadTracker::kUnlimited);
     auto d1 = tracker_.Reserve(handle, {500, 0});
     EXPECT_EQ(d1.memory_bytes, 500);
 
@@ -268,7 +268,7 @@ TEST_F(LoadingOverheadTrackerTest, UBChangesMidFlight) {
 }
 
 TEST_F(LoadingOverheadTrackerTest, UBDecreasesFromUnlimitedMidFlight) {
-    auto handle = tracker_.EnsureRegistered("vector_index");
+    auto handle = tracker_.Register("vector_index", LoadingOverheadTracker::kUnlimited);
     auto d1 = tracker_.Reserve(handle, {1000, 0});
     EXPECT_EQ(d1.memory_bytes, 1000);
     auto d2 = tracker_.Reserve(handle, {1000, 0});
@@ -296,7 +296,7 @@ TEST_F(LoadingOverheadTrackerTest, UBDecreasesFromUnlimitedMidFlight) {
 }
 
 TEST_F(LoadingOverheadTrackerTest, GetUpperBound) {
-    auto handle = tracker_.EnsureRegistered("vector_index");
+    auto handle = tracker_.Register("vector_index", LoadingOverheadTracker::kUnlimited);
     EXPECT_EQ(tracker_.GetUpperBound(handle), LoadingOverheadTracker::kUnlimited);
 
     handle = tracker_.Register("vector_index", {200, 100});

@@ -64,17 +64,9 @@ class Manager {
         auto evictable = translator->meta()->support_eviction && eviction_enabled_;
         auto self_reserve = eviction_enabled_;
 
-        // Register loading overhead group. The group key defaults to
-        // the CellDataType name, but translators can override via Meta.
-        auto group_key = translator->meta()->loading_overhead_group.empty()
-                             ? std::to_string(static_cast<int>(translator->meta()->cell_data_type))
-                             : translator->meta()->loading_overhead_group;
         uint64_t overhead_handle = 0;
-        if (translator->meta()->loading_overhead_upper_bound.has_value()) {
-            overhead_handle = loading_overhead_tracker_->Register(
-                group_key, translator->meta()->loading_overhead_upper_bound.value());
-        } else {
-            overhead_handle = loading_overhead_tracker_->EnsureRegistered(group_key);
+        if (auto& lo = translator->meta()->loading_overhead) {
+            overhead_handle = loading_overhead_tracker_->Register(lo->group, lo->upper_bound);
         }
 
         auto cache_slot = std::make_shared<CacheSlot<CellT>>(
