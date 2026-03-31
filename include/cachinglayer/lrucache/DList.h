@@ -203,7 +203,11 @@ class DList : public std::enable_shared_from_this<DList> {
         // Legacy constructor (no tracker)
         WaitingRequest(ResourceUsage size, std::chrono::steady_clock::time_point dl, folly::Promise<bool> p,
                        uint64_t id)
-            : required_size(size), deadline(dl), bool_promise(std::move(p)), request_id(id) {
+            : required_size(size),
+              deadline(dl),
+              bool_promise(std::move(p)),
+              resource_promise(folly::Promise<ResourceUsage>::makeEmpty()),
+              request_id(id) {
         }
 
         // Tracker-aware constructor.
@@ -218,6 +222,7 @@ class DList : public std::enable_shared_from_this<DList> {
               overhead(overhead),
               overhead_handle(overhead_handle),
               deadline(dl),
+              bool_promise(folly::Promise<bool>::makeEmpty()),
               resource_promise(std::move(p)),
               use_resource_promise(true),
               request_id(id) {
