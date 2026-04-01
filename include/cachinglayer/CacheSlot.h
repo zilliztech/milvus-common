@@ -57,7 +57,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
 
     CacheSlot(std::unique_ptr<Translator<CellT>> translator, internal::DList* dlist, bool evictable, bool self_reserve,
               bool storage_usage_tracking_enabled, std::chrono::milliseconds loading_timeout,
-              std::chrono::milliseconds warmup_loading_timeout, uint64_t overhead_handle = 0)
+              std::chrono::milliseconds warmup_loading_timeout)
         : translator_(std::move(translator)),
           cell_id_mapping_mode_(translator_->meta()->cell_id_mapping_mode),
           cell_data_type_(translator_->meta()->cell_data_type),
@@ -67,8 +67,10 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
           self_reserve_(self_reserve),
           storage_usage_tracking_enabled_(storage_usage_tracking_enabled),
           loading_timeout_(loading_timeout),
-          warmup_loading_timeout_(warmup_loading_timeout),
-          overhead_handle_(overhead_handle) {
+          warmup_loading_timeout_(warmup_loading_timeout) {
+        if (auto& lo = translator_->meta()->loading_overhead) {
+            overhead_handle_ = dlist_->RegisterLoadingOverhead(lo->group, lo->upper_bound);
+        }
         cells_.reserve(translator_->num_cells());
         for (cid_t i = 0; i < static_cast<cid_t>(translator_->num_cells()); ++i) {
             cells_.push_back(std::make_unique<CacheCell>(this, i));
@@ -323,6 +325,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     }
 
     ~CacheSlot() {
+        dlist_->UnregisterLoadingOverhead(overhead_handle_);
         monitor::cache_slot_count(cell_data_type_, storage_type_).Decrement();
         monitor::cache_cell_count(cell_data_type_, storage_type_).Decrement(translator_->num_cells());
     }
@@ -465,8 +468,12 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             auto loaded_resource = essential_loaded_resource + bonus_loaded_resource;
             auto loading_overhead = essential_loading_overhead + bonus_loading_overhead;
 
+            // When bonus cells are present, first try best-effort (timeout=0) for essential+bonus.
+            // If that fails, fall back to essential-only with the real timeout.
+            // This avoids blocking in the waiting queue for a bonus attempt that could retry immediately.
+            auto reserve_timeout = bonus_cids.empty() ? timeout : std::chrono::milliseconds(0);
             auto actual_dlist_reserve = SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(
-                loaded_resource, loading_overhead, overhead_handle_, timeout, ctx));
+                loaded_resource, loading_overhead, overhead_handle_, reserve_timeout, ctx));
             bool reservation_success = actual_dlist_reserve.AnyGTZero();
 
             // Guard: releases DList + tracker atomically. All by-ref so bonus retry
@@ -497,7 +504,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
 
             if (!bonus_cids.empty()) {
                 if (!reservation_success) {
-                    // Bonus+essential failed — retry with essential only
+                    // Bonus+essential failed immediately — retry with essential only using real timeout.
                     LOG_WARN(
                         "[MCL] CacheSlot reserve loading resource with bonus cells failed, try to reserve only "
                         "essential loading resource");

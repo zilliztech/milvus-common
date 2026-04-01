@@ -183,6 +183,10 @@ class MockTranslator : public Translator<TestCell> {
     SetLoadingOverheadBytes(int64_t bytes) {
         loading_overhead_bytes_ = bytes;
     }
+    void
+    SetLoadingOverheadConfig(const std::string& group, const ResourceUsage& upper_bound) {
+        meta_.loading_overhead = LoadingOverheadConfig{upper_bound, group};
+    }
     int
     GetCellsCallCount() const {
         EXPECT_FALSE(for_concurrent_test_);
@@ -1859,7 +1863,7 @@ TEST(CacheSlotTrackerTest, LoadingOverheadTrackerIntegration) {
     auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
 
     auto tracker = std::make_shared<LoadingOverheadTracker>();
-    auto handle = tracker->Register("test_group", {500, 0});
+    dlist->SetLoadingOverheadTracker(tracker);
 
     const int64_t cell_loaded_size = 100;
     const int64_t cell_loading_overhead = 200;
@@ -1868,13 +1872,12 @@ TEST(CacheSlotTrackerTest, LoadingOverheadTrackerIntegration) {
         std::vector<std::pair<cid_t, int64_t>>{{0, cell_loaded_size}, {1, cell_loaded_size}},
         std::unordered_map<cl_uid_t, cid_t>{{0, 0}, {1, 1}}, "test_tracker_integration", StorageType::MEMORY);
     translator->SetLoadingOverheadBytes(cell_loading_overhead);
+    translator->SetLoadingOverheadConfig("test_group", {500, 0});
     auto* translator_ptr = translator.get();
-
-    dlist->SetLoadingOverheadTracker(tracker);
 
     auto cache_slot =
         std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, false,
-                                              std::chrono::milliseconds(5000), std::chrono::milliseconds(0), handle);
+                                              std::chrono::milliseconds(5000), std::chrono::milliseconds(0));
 
     auto op_ctx = std::make_unique<milvus::OpContext>();
 
@@ -1897,7 +1900,7 @@ TEST(CacheSlotTrackerTest, LoadingOverheadTrackerCleanupOnException) {
     auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
 
     auto tracker = std::make_shared<LoadingOverheadTracker>();
-    auto handle = tracker->Register("test_group", {500, 0});
+    dlist->SetLoadingOverheadTracker(tracker);
 
     const int64_t cell_loaded_size = 100;
     const int64_t cell_loading_overhead = 200;
@@ -1906,18 +1909,20 @@ TEST(CacheSlotTrackerTest, LoadingOverheadTrackerCleanupOnException) {
                                                        std::unordered_map<cl_uid_t, cid_t>{{0, 0}},
                                                        "test_tracker_exception", StorageType::MEMORY);
     translator->SetLoadingOverheadBytes(cell_loading_overhead);
+    translator->SetLoadingOverheadConfig("test_group", {500, 0});
     translator->SetShouldThrow(true);
-
-    dlist->SetLoadingOverheadTracker(tracker);
 
     auto cache_slot =
         std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, false,
-                                              std::chrono::milliseconds(5000), std::chrono::milliseconds(0), handle);
+                                              std::chrono::milliseconds(5000), std::chrono::milliseconds(0));
 
     auto op_ctx = std::make_unique<milvus::OpContext>();
 
     // Pin should fail because translator throws, but tracker state must be cleaned up.
     EXPECT_ANY_THROW(cache_slot->PinCellsDirect(op_ctx.get(), {0}));
+
+    // Register again to get handle for verification (CacheSlot registered internally).
+    auto handle = tracker->Register("test_group", {500, 0});
 
     // Verify tracker state is clean by reserving the full UB.
     auto delta = tracker->Reserve(handle, {500, 0});
@@ -1935,7 +1940,6 @@ TEST(CacheSlotTrackerTest, BonusCellsRetryWithTracker) {
     auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
 
     auto tracker = std::make_shared<LoadingOverheadTracker>();
-    auto handle = tracker->Register("test_bonus_retry", {100, 0});
     dlist->SetLoadingOverheadTracker(tracker);
 
     const int64_t cell_loaded_size = 100;
@@ -1949,11 +1953,12 @@ TEST(CacheSlotTrackerTest, BonusCellsRetryWithTracker) {
         std::vector<std::pair<cid_t, int64_t>>{{0, cell_loaded_size}, {1, cell_loaded_size}, {2, cell_loaded_size}},
         std::unordered_map<cl_uid_t, cid_t>{{0, 0}, {1, 1}, {2, 2}}, "test_bonus_retry", StorageType::MEMORY);
     translator->SetLoadingOverheadBytes(cell_loading_overhead);
+    translator->SetLoadingOverheadConfig("test_bonus_retry", {100, 0});
     translator->SetExtraReturnCids({{0, {1, 2}}});
 
     auto cache_slot =
         std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, false,
-                                              std::chrono::milliseconds(200), std::chrono::milliseconds(0), handle);
+                                              std::chrono::milliseconds(200), std::chrono::milliseconds(0));
 
     auto op_ctx = std::make_unique<milvus::OpContext>();
 

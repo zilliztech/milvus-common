@@ -44,32 +44,34 @@ class LoadingOverheadTracker {
     // Register a group with an upper bound. Returns a handle for hot-path use.
     // If the group already exists with a finite UB, takes the larger of the two per dimension.
     // If previously registered with kUnlimited, replaces with the given UB.
+    // Each Register increments a ref count; call Unregister to decrement.
     uint64_t
     Register(const std::string& group, const ResourceUsage& upper_bound) {
         std::lock_guard<std::mutex> lock(mtx_);
         auto it = name_to_handle_.find(group);
         if (it != name_to_handle_.end()) {
-            auto& existing = handle_state_[it->second].upper_bound;
-            if (existing == kUnlimited) {
-                existing = upper_bound;
-                LOG_INFO("[MCL] LoadingOverheadTracker set UB for group '{}' (handle {}): {}", group, it->second,
-                         upper_bound.ToString());
-            } else if (existing.memory_bytes < upper_bound.memory_bytes ||
-                       existing.file_bytes < upper_bound.file_bytes) {
-                existing.memory_bytes = std::max(existing.memory_bytes, upper_bound.memory_bytes);
-                existing.file_bytes = std::max(existing.file_bytes, upper_bound.file_bytes);
-                LOG_INFO("[MCL] LoadingOverheadTracker widened UB for group '{}' (handle {}): {}", group, it->second,
-                         existing.ToString());
+            auto& state = handle_state_[it->second];
+            state.ref_count++;
+            if (state.upper_bound == kUnlimited) {
+                state.upper_bound = upper_bound;
+                LOG_INFO("[MCL] LoadingOverheadTracker set UB for group '{}' (handle {}, refs={}): {}", group,
+                         it->second, state.ref_count, upper_bound.ToString());
+            } else if (state.upper_bound.memory_bytes < upper_bound.memory_bytes ||
+                       state.upper_bound.file_bytes < upper_bound.file_bytes) {
+                state.upper_bound.memory_bytes = std::max(state.upper_bound.memory_bytes, upper_bound.memory_bytes);
+                state.upper_bound.file_bytes = std::max(state.upper_bound.file_bytes, upper_bound.file_bytes);
+                LOG_INFO("[MCL] LoadingOverheadTracker widened UB for group '{}' (handle {}, refs={}): {}", group,
+                         it->second, state.ref_count, state.upper_bound.ToString());
             } else {
-                LOG_DEBUG("[MCL] LoadingOverheadTracker re-registered group '{}' (handle {}), UB unchanged", group,
-                          it->second);
+                LOG_DEBUG("[MCL] LoadingOverheadTracker re-registered group '{}' (handle {}, refs={}), UB unchanged",
+                          group, it->second, state.ref_count);
             }
             return it->second;
         }
         auto handle = next_handle_++;
         name_to_handle_[group] = handle;
-        handle_state_[handle] = GroupState{upper_bound, {}, {}};
-        LOG_INFO("[MCL] LoadingOverheadTracker registered group '{}' (handle {}): UB={}", group, handle,
+        handle_state_[handle] = GroupState{upper_bound, {}, {}, 1};
+        LOG_INFO("[MCL] LoadingOverheadTracker registered group '{}' (handle {}, refs=1): UB={}", group, handle,
                  upper_bound.ToString());
         return handle;
     }
@@ -136,11 +138,50 @@ class LoadingOverheadTracker {
         return it->second.upper_bound;
     }
 
+    // Decrement ref count for a group. When ref count reaches 0, the group is
+    // unconditionally removed. Safe to call from CacheSlot destructor.
+    void
+    Unregister(uint64_t handle) {
+        if (handle == kInvalidHandle) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mtx_);
+        auto it = handle_state_.find(handle);
+        if (it == handle_state_.end()) {
+            return;
+        }
+        auto& state = it->second;
+        if (state.ref_count > 0) {
+            state.ref_count--;
+        }
+        if (state.ref_count > 0) {
+            LOG_DEBUG("[MCL] LoadingOverheadTracker handle {} ref_count decremented to {}", handle, state.ref_count);
+            return;
+        }
+        // ref_count == 0, unconditionally clean up.
+        // Log error if there are residual reservations — indicates a Reserve/Release pairing bug.
+        if (state.sum_of_overhead.AnyGTZero() || state.overhead_reserved.AnyGTZero()) {
+            LOG_ERROR(
+                "[MCL] LoadingOverheadTracker handle {} ref_count=0 with residual reservations: "
+                "sum_of_overhead={}, overhead_reserved={}. Cleaning up anyway to avoid leak.",
+                handle, state.sum_of_overhead.ToString(), state.overhead_reserved.ToString());
+        }
+        for (auto nit = name_to_handle_.begin(); nit != name_to_handle_.end(); ++nit) {
+            if (nit->second == handle) {
+                LOG_INFO("[MCL] LoadingOverheadTracker unregistered group '{}' (handle {})", nit->first, handle);
+                name_to_handle_.erase(nit);
+                break;
+            }
+        }
+        handle_state_.erase(it);
+    }
+
  private:
     struct GroupState {
         ResourceUsage upper_bound;
         ResourceUsage sum_of_overhead;
         ResourceUsage overhead_reserved;
+        uint64_t ref_count{0};
     };
 
     static ResourceUsage

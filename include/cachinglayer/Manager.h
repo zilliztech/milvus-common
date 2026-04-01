@@ -64,14 +64,9 @@ class Manager {
         auto evictable = translator->meta()->support_eviction && eviction_enabled_;
         auto self_reserve = eviction_enabled_;
 
-        uint64_t overhead_handle = 0;
-        if (auto& lo = translator->meta()->loading_overhead) {
-            overhead_handle = loading_overhead_tracker_->Register(lo->group, lo->upper_bound);
-        }
-
-        auto cache_slot = std::make_shared<CacheSlot<CellT>>(
-            std::move(translator), dlist_.get(), evictable, self_reserve, config.storage_usage_tracking_enabled,
-            config.loading_timeout, config.warmup_loading_timeout, overhead_handle);
+        auto cache_slot = std::make_shared<CacheSlot<CellT>>(std::move(translator), dlist_.get(), evictable,
+                                                             self_reserve, config.storage_usage_tracking_enabled,
+                                                             config.loading_timeout, config.warmup_loading_timeout);
         cache_slot->Warmup(ctx, prefetch_pool_);
         return cache_slot;
     }

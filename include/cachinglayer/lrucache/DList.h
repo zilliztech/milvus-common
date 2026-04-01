@@ -68,9 +68,26 @@ class DList : public std::enable_shared_from_this<DList> {
         }
     }
 
+    // Must be called during initialization, before any Reserve/Release calls.
+    // Not thread-safe with concurrent Reserve/Release.
     void
     SetLoadingOverheadTracker(std::shared_ptr<LoadingOverheadTracker> tracker) {
         loading_overhead_tracker_ = std::move(tracker);
+    }
+
+    uint64_t
+    RegisterLoadingOverhead(const std::string& group, const ResourceUsage& upper_bound) {
+        if (loading_overhead_tracker_) {
+            return loading_overhead_tracker_->Register(group, upper_bound);
+        }
+        return LoadingOverheadTracker::kInvalidHandle;
+    }
+
+    void
+    UnregisterLoadingOverhead(uint64_t overhead_handle) {
+        if (loading_overhead_tracker_) {
+            loading_overhead_tracker_->Unregister(overhead_handle);
+        }
     }
 
     ~DList() {
@@ -211,13 +228,12 @@ class DList : public std::enable_shared_from_this<DList> {
         }
 
         // Tracker-aware constructor.
-        // Note: required_size uses loaded + overhead (uncapped upper bound) for queue ordering.
-        // The actual reservation may be smaller after tracker capping, which means the queue
-        // ordering is conservative — a later request that fits may wait behind one that doesn't.
-        // This matches the existing legacy behavior where the queue breaks on the first unsatisfied head.
+        // required_size is scaled by loading_resource_factor to match the legacy path,
+        // ensuring consistent queue ordering between legacy and tracker-aware requests.
         WaitingRequest(ResourceUsage loaded, ResourceUsage overhead, uint64_t overhead_handle,
-                       std::chrono::steady_clock::time_point dl, folly::Promise<ResourceUsage> p, uint64_t id)
-            : required_size(loaded + overhead),
+                       std::chrono::steady_clock::time_point dl, folly::Promise<ResourceUsage> p, uint64_t id,
+                       float loading_resource_factor)
+            : required_size((loaded + overhead) * loading_resource_factor),
               loaded(loaded),
               overhead(overhead),
               overhead_handle(overhead_handle),

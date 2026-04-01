@@ -62,7 +62,8 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& loaded, const Reso
     uint64_t request_id = next_request_id_.fetch_add(1);
 
     auto waiting_request =
-        std::make_unique<WaitingRequest>(loaded, overhead, overhead_handle, deadline, std::move(promise), request_id);
+        std::make_unique<WaitingRequest>(loaded, overhead, overhead_handle, deadline, std::move(promise), request_id,
+                                         eviction_config_.loading_resource_factor);
     WaitingRequest* request_ptr = waiting_request.get();
     waiting_requests_map_[request_id] = request_ptr;
     waiting_queue_.push(std::move(waiting_request));
@@ -301,7 +302,7 @@ DList::reserveResourceInternalWithTracker(const ResourceUsage& loaded, const Res
     // Compute tracker delta first so space check uses the actual amount, not the uncapped overhead.
     // This avoids rejecting loads that would fit after tracker capping (e.g., delta=0 when group is saturated).
     auto delta = overhead;
-    if (overhead_handle != LoadingOverheadTracker::kInvalidHandle) {
+    if (overhead_handle != LoadingOverheadTracker::kInvalidHandle && tracker != nullptr) {
         delta = tracker->Reserve(overhead_handle, overhead);
     }
     auto actual_size = (loaded + delta) * eviction_config_.loading_resource_factor;
@@ -343,7 +344,7 @@ DList::reserveResourceInternalWithTracker(const ResourceUsage& loaded, const Res
                 loaded.ToString(), overhead.ToString(), delta.ToString(), eviction_target.ToString(),
                 min_eviction.ToString());
             // Rollback tracker state on failure
-            if (overhead_handle != LoadingOverheadTracker::kInvalidHandle) {
+            if (overhead_handle != LoadingOverheadTracker::kInvalidHandle && tracker != nullptr) {
                 tracker->Release(overhead_handle, overhead);
             }
             return {false, {}};
@@ -648,7 +649,7 @@ DList::ReleaseLoadingResource(const ResourceUsage& loaded, const ResourceUsage& 
     {
         std::unique_lock<std::mutex> lock(list_mtx_);
         auto delta = overhead;
-        if (overhead_handle != LoadingOverheadTracker::kInvalidHandle) {
+        if (overhead_handle != LoadingOverheadTracker::kInvalidHandle && loading_overhead_tracker_) {
             delta = loading_overhead_tracker_->Release(overhead_handle, overhead);
         }
         auto actual = (loaded + delta) * eviction_config_.loading_resource_factor;
@@ -875,18 +876,32 @@ DList::handleWaitingRequests() {
                 auto rollback =
                     request->use_resource_promise ? actual * eviction_config_.loading_resource_factor : actual;
                 total_loading_size_ -= rollback;
-                if (request->overhead_handle != LoadingOverheadTracker::kInvalidHandle) {
+                if (request->overhead_handle != LoadingOverheadTracker::kInvalidHandle && loading_overhead_tracker_) {
                     loading_overhead_tracker_->Release(request->overhead_handle, request->overhead);
                 }
             }
             requests_to_destroy.push_back(std::move(request));
             waiting_queue_.pop();
         } else {
+            // Check if this request is permanently impossible (required size exceeds capacity).
+            // If so, fail it immediately instead of blocking the entire queue until timeout.
+            if (!max_resource_limit_.load().CanHold(request_ptr_ref->required_size)) {
+                auto request = std::move(request_ptr_ref);
+                if (waiting_requests_map_.erase(request->request_id) > 0) {
+                    LOG_WARN(
+                        "[MCL] Request {} is permanently impossible (required_size={} > capacity={}), "
+                        "failing immediately.",
+                        request->request_id, request->required_size.ToString(), max_resource_limit_.load().ToString());
+                    request->setValue(false);
+                }
+                requests_to_destroy.push_back(std::move(request));
+                waiting_queue_.pop();
+                continue;
+            }
             LOG_DEBUG("[MCL] Request {} of size {} cannot be satisfied, breaking.", request_ptr_ref->request_id,
                       request_ptr_ref->required_size.ToString());
-            // Cannot satisfy even with eviction.
-            // The largest/oldest obstacle is at the top of the queue.
-            // No point trying for smaller requests.
+            // Cannot satisfy right now but may succeed later.
+            // The queue is ordered by deadline, so stop here.
             break;
         }
     }
