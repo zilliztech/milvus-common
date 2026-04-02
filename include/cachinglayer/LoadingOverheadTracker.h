@@ -58,10 +58,12 @@ class LoadingOverheadTracker {
                          it->second, state.ref_count, upper_bound.ToString());
             } else if (state.upper_bound.memory_bytes < upper_bound.memory_bytes ||
                        state.upper_bound.file_bytes < upper_bound.file_bytes) {
+                LOG_WARN(
+                    "[MCL] LoadingOverheadTracker UB mismatch for group '{}' (handle {}): existing={}, new={}. "
+                    "Taking max per dimension.",
+                    group, it->second, state.upper_bound.ToString(), upper_bound.ToString());
                 state.upper_bound.memory_bytes = std::max(state.upper_bound.memory_bytes, upper_bound.memory_bytes);
                 state.upper_bound.file_bytes = std::max(state.upper_bound.file_bytes, upper_bound.file_bytes);
-                LOG_INFO("[MCL] LoadingOverheadTracker widened UB for group '{}' (handle {}, refs={}): {}", group,
-                         it->second, state.ref_count, state.upper_bound.ToString());
             } else {
                 LOG_DEBUG("[MCL] LoadingOverheadTracker re-registered group '{}' (handle {}, refs={}), UB unchanged",
                           group, it->second, state.ref_count);
@@ -70,7 +72,7 @@ class LoadingOverheadTracker {
         }
         auto handle = next_handle_++;
         name_to_handle_[group] = handle;
-        handle_state_[handle] = GroupState{upper_bound, {}, {}, 1};
+        handle_state_[handle] = GroupState{upper_bound, {}, {}, 1, group};
         LOG_INFO("[MCL] LoadingOverheadTracker registered group '{}' (handle {}, refs=1): UB={}", group, handle,
                  upper_bound.ToString());
         return handle;
@@ -166,13 +168,8 @@ class LoadingOverheadTracker {
                 "sum_of_overhead={}, overhead_reserved={}. Cleaning up anyway to avoid leak.",
                 handle, state.sum_of_overhead.ToString(), state.overhead_reserved.ToString());
         }
-        for (auto nit = name_to_handle_.begin(); nit != name_to_handle_.end(); ++nit) {
-            if (nit->second == handle) {
-                LOG_INFO("[MCL] LoadingOverheadTracker unregistered group '{}' (handle {})", nit->first, handle);
-                name_to_handle_.erase(nit);
-                break;
-            }
-        }
+        LOG_INFO("[MCL] LoadingOverheadTracker unregistered group '{}' (handle {})", state.group_name, handle);
+        name_to_handle_.erase(state.group_name);
         handle_state_.erase(it);
     }
 
@@ -182,6 +179,7 @@ class LoadingOverheadTracker {
         ResourceUsage sum_of_overhead;
         ResourceUsage overhead_reserved;
         uint64_t ref_count{0};
+        std::string group_name;
     };
 
     static ResourceUsage

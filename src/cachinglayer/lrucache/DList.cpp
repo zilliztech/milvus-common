@@ -219,6 +219,42 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std
 
 bool
 DList::reserveResourceInternal(const ResourceUsage& size) {
+    auto rollback = []() {};
+    auto [success, _] = reserveResourceInternalImpl(size, rollback);
+    return success;
+}
+
+std::pair<bool, ResourceUsage>
+DList::reserveResourceInternalWithTracker(const ResourceUsage& loaded, const ResourceUsage& overhead,
+                                          uint64_t overhead_handle, LoadingOverheadTracker* tracker) {
+    // Compute tracker delta first so space check uses the actual amount, not the uncapped overhead.
+    // This avoids rejecting loads that would fit after tracker capping (e.g., delta=0 when group is saturated).
+    auto delta = overhead;
+    if (overhead_handle != LoadingOverheadTracker::kInvalidHandle && tracker != nullptr) {
+        delta = tracker->Reserve(overhead_handle, overhead);
+    }
+    auto actual_size = (loaded + delta) * eviction_config_.loading_resource_factor;
+
+    auto rollback = [overhead_handle, overhead, tracker]() {
+        if (overhead_handle != LoadingOverheadTracker::kInvalidHandle && tracker != nullptr) {
+            tracker->Release(overhead_handle, overhead);
+        }
+    };
+
+    auto [success, _] = reserveResourceInternalImpl(actual_size, rollback);
+    if (!success) {
+        return {false, {}};
+    }
+
+    auto unscaled = loaded + delta;
+    LOG_TRACE("[MCL] reserve with tracker: loaded={}, overhead={}, delta={}, unscaled={}, scaled={}, total_loading={}",
+              loaded.ToString(), overhead.ToString(), delta.ToString(), unscaled.ToString(), actual_size.ToString(),
+              total_loading_size_.load().ToString());
+    return {true, unscaled};
+}
+
+std::pair<bool, ResourceUsage>
+DList::reserveResourceInternalImpl(const ResourceUsage& size, std::function<void()> rollback) {
     auto using_resources = total_loaded_size_.load() + total_loading_size_.load();
 
     // Combined logical and physical memory limit check
@@ -268,10 +304,13 @@ DList::reserveResourceInternal(const ResourceUsage& size) {
                 "[MCL] reserve resource with size={} failed due to all zero evicted_size, "
                 "eviction_target={}, min_eviction={}",
                 size.ToString(), eviction_target.ToString(), min_eviction.ToString());
-            return false;
+            rollback();
+            return {false, {}};
         }
+
+        using_resources -= evicted_size;
         // logical limit is accurate, thus we can guarantee after one successful eviction, logical limit is satisfied.
-        logical_limit_exceeded = false;
+        logical_limit_exceeded = !max_resource_limit_.load().CanHold(using_resources + size);
 
         if (!physical_eviction_needed.AnyGTZero()) {
             // we only need to evict for logical limit and we have succeeded.
@@ -290,79 +329,10 @@ DList::reserveResourceInternal(const ResourceUsage& size) {
     }
 
     total_loading_size_ += size;
-    LOG_TRACE("[MCL] reserve resource with size={} success, total_loading_size={}, total_loaded_size={}",
-              size.ToString(), total_loading_size_.load().ToString(), total_loaded_size_.load().ToString());
+    LOG_TRACE("[MCL] reserve resource success, size={}, total_loading_size={}, total_loaded_size={}", size.ToString(),
+              total_loading_size_.load().ToString(), total_loaded_size_.load().ToString());
 
-    return true;
-}
-
-std::pair<bool, ResourceUsage>
-DList::reserveResourceInternalWithTracker(const ResourceUsage& loaded, const ResourceUsage& overhead,
-                                          uint64_t overhead_handle, LoadingOverheadTracker* tracker) {
-    // Compute tracker delta first so space check uses the actual amount, not the uncapped overhead.
-    // This avoids rejecting loads that would fit after tracker capping (e.g., delta=0 when group is saturated).
-    auto delta = overhead;
-    if (overhead_handle != LoadingOverheadTracker::kInvalidHandle && tracker != nullptr) {
-        delta = tracker->Reserve(overhead_handle, overhead);
-    }
-    auto actual_size = (loaded + delta) * eviction_config_.loading_resource_factor;
-    auto using_resources = total_loaded_size_.load() + total_loading_size_.load();
-
-    bool logical_limit_exceeded = !max_resource_limit_.load().CanHold(using_resources + actual_size);
-    auto physical_eviction_needed = checkPhysicalMemoryLimit(actual_size);
-
-    while (logical_limit_exceeded || physical_eviction_needed.AnyGTZero()) {
-        ResourceUsage eviction_target;
-        ResourceUsage min_eviction;
-
-        if (logical_limit_exceeded) {
-            eviction_target = using_resources + actual_size - low_watermark_;
-            min_eviction = using_resources + actual_size - max_resource_limit_.load();
-            if (eviction_target.memory_bytes < 0)
-                eviction_target.memory_bytes = 0;
-            if (eviction_target.file_bytes < 0)
-                eviction_target.file_bytes = 0;
-            if (min_eviction.memory_bytes < 0)
-                min_eviction.memory_bytes = 0;
-            if (min_eviction.file_bytes < 0)
-                min_eviction.file_bytes = 0;
-        }
-
-        if (physical_eviction_needed.AnyGTZero()) {
-            eviction_target.memory_bytes =
-                std::max(eviction_target.memory_bytes, physical_eviction_needed.memory_bytes);
-            eviction_target.file_bytes = std::max(eviction_target.file_bytes, physical_eviction_needed.file_bytes);
-            min_eviction.memory_bytes = std::max(min_eviction.memory_bytes, physical_eviction_needed.memory_bytes);
-            min_eviction.file_bytes = std::max(min_eviction.file_bytes, physical_eviction_needed.file_bytes);
-        }
-
-        ResourceUsage evicted_size = tryEvict(eviction_target, min_eviction);
-        if (!evicted_size.AnyGTZero()) {
-            LOG_WARN(
-                "[MCL] reserve with tracker failed: loaded={}, overhead={}, delta={}, eviction_target={}, "
-                "min_eviction={}",
-                loaded.ToString(), overhead.ToString(), delta.ToString(), eviction_target.ToString(),
-                min_eviction.ToString());
-            // Rollback tracker state on failure
-            if (overhead_handle != LoadingOverheadTracker::kInvalidHandle && tracker != nullptr) {
-                tracker->Release(overhead_handle, overhead);
-            }
-            return {false, {}};
-        }
-        logical_limit_exceeded = false;
-
-        if (!physical_eviction_needed.AnyGTZero())
-            break;
-        if (physical_eviction_needed = checkPhysicalMemoryLimit(actual_size); !physical_eviction_needed.AnyGTZero())
-            break;
-    }
-
-    total_loading_size_ += actual_size;
-    auto unscaled = loaded + delta;
-    LOG_TRACE("[MCL] reserve with tracker: loaded={}, overhead={}, delta={}, unscaled={}, scaled={}, total_loading={}",
-              loaded.ToString(), overhead.ToString(), delta.ToString(), unscaled.ToString(), actual_size.ToString(),
-              total_loading_size_.load().ToString());
-    return {true, unscaled};
+    return {true, size};
 }
 
 void
@@ -643,16 +613,18 @@ DList::UpdateHighWatermark(const ResourceUsage& new_high_watermark) {
     cachinglayer::monitor::cache_high_watermark_bytes(StorageType::DISK).Set(high_watermark_.load().file_bytes);
 }
 
-void
+ResourceUsage
 DList::ReleaseLoadingResource(const ResourceUsage& loaded, const ResourceUsage& overhead, uint64_t overhead_handle) {
     std::vector<std::unique_ptr<WaitingRequest>> to_destroy;
+    ResourceUsage unscaled{};
     {
         std::unique_lock<std::mutex> lock(list_mtx_);
         auto delta = overhead;
         if (overhead_handle != LoadingOverheadTracker::kInvalidHandle && loading_overhead_tracker_) {
             delta = loading_overhead_tracker_->Release(overhead_handle, overhead);
         }
-        auto actual = (loaded + delta) * eviction_config_.loading_resource_factor;
+        unscaled = loaded + delta;
+        auto actual = unscaled * eviction_config_.loading_resource_factor;
         total_loading_size_ -= actual;
         ClampNonNegative(total_loading_size_, [&](const ResourceUsage& curr) {
             LOG_ERROR(
@@ -663,6 +635,7 @@ DList::ReleaseLoadingResource(const ResourceUsage& loaded, const ResourceUsage& 
         to_destroy = handleWaitingRequests();
     }
     // Destroy requests outside lock to avoid deadlock with cancel callbacks
+    return unscaled;
 }
 
 void
@@ -884,7 +857,8 @@ DList::handleWaitingRequests() {
             waiting_queue_.pop();
         } else {
             // Check if this request is permanently impossible (required size exceeds capacity).
-            // If so, fail it immediately instead of blocking the entire queue until timeout.
+            // Use required_size for both paths: (loaded + overhead) * factor for tracker-aware,
+            // which is the upper bound of what the request could need.
             if (!max_resource_limit_.load().CanHold(request_ptr_ref->required_size)) {
                 auto request = std::move(request_ptr_ref);
                 if (waiting_requests_map_.erase(request->request_id) > 0) {

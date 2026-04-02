@@ -160,7 +160,8 @@ class DList : public std::enable_shared_from_this<DList> {
                                       OpContext* ctx = nullptr);
 
     // Release with loading overhead tracker integration.
-    void
+    // Returns the actual unscaled size released (loaded + tracker_delta).
+    ResourceUsage
     ReleaseLoadingResource(const ResourceUsage& loaded, const ResourceUsage& overhead, uint64_t overhead_handle);
 
     // Release resource used for loading, called after loading a cell.
@@ -272,6 +273,11 @@ class DList : public std::enable_shared_from_this<DList> {
     // reserveResource without taking lock, must be called with lock held.
     bool
     reserveResourceInternal(const ResourceUsage& size);
+
+    // Common implementation for resource reservation with eviction.
+    // Returns {success, scaled_size_reserved}.
+    std::pair<bool, ResourceUsage>
+    reserveResourceInternalImpl(const ResourceUsage& size, std::function<void()> rollback);
 
     // Reserve with tracker under lock. Space check uses loaded + overhead,
     // actual reservation uses loaded + tracker delta. Returns actual reserved (zero = failed).

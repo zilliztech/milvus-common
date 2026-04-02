@@ -68,15 +68,17 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
           storage_usage_tracking_enabled_(storage_usage_tracking_enabled),
           loading_timeout_(loading_timeout),
           warmup_loading_timeout_(warmup_loading_timeout) {
-        if (auto& lo = translator_->meta()->loading_overhead) {
-            overhead_handle_ = dlist_->RegisterLoadingOverhead(lo->group, lo->upper_bound);
-        }
         cells_.reserve(translator_->num_cells());
         for (cid_t i = 0; i < static_cast<cid_t>(translator_->num_cells()); ++i) {
             cells_.push_back(std::make_unique<CacheCell>(this, i));
         }
         monitor::cache_slot_count(cell_data_type_, storage_type_).Increment();
         monitor::cache_cell_count(cell_data_type_, storage_type_).Increment(translator_->num_cells());
+        // Register after all potentially-throwing operations, so that if the constructor
+        // fails, we don't leak a ref_count (destructor won't run for incomplete objects).
+        if (auto& lo = translator_->meta()->loading_overhead) {
+            overhead_handle_ = dlist_->RegisterLoadingOverhead(lo->group, lo->upper_bound);
+        }
     }
 
     CacheSlot(const CacheSlot&) = delete;
@@ -485,13 +487,14 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                     return;
                 }
                 try {
-                    dlist_->ReleaseLoadingResource(loaded_resource, loading_overhead, overhead_handle_);
+                    auto released_resource =
+                        dlist_->ReleaseLoadingResource(loaded_resource, loading_overhead, overhead_handle_);
                     if (metrics_tracked) {
                         monitor::cache_cell_loading_count(cell_data_type_, storage_type_).Decrement(loading_cids_count);
                         monitor::cache_loading_bytes(cell_data_type_, StorageType::MEMORY)
-                            .Decrement(actual_dlist_reserve.memory_bytes);
+                            .Decrement(released_resource.memory_bytes);
                         monitor::cache_loading_bytes(cell_data_type_, StorageType::DISK)
-                            .Decrement(actual_dlist_reserve.file_bytes);
+                            .Decrement(released_resource.file_bytes);
                     }
                 } catch (...) {
                     auto ew = folly::exception_wrapper(std::current_exception());
