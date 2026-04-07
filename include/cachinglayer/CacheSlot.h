@@ -470,6 +470,13 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             auto loaded_resource = essential_loaded_resource + bonus_loaded_resource;
             auto loading_overhead = essential_loading_overhead + bonus_loading_overhead;
 
+            // Zero-resource cells: skip DList reservation entirely and load directly.
+            // set_cell() will ChargeLoadedResource with the actual size after loading.
+            if (!loaded_resource.AnyGTZero() && !loading_overhead.AnyGTZero()) {
+                run_load_internal();
+                return;
+            }
+
             // When bonus cells are present, first try best-effort (timeout=0) for essential+bonus.
             // If that fails, fall back to essential-only with the real timeout.
             // This avoids blocking in the waiting queue for a bonus attempt that could retry immediately.
