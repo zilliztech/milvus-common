@@ -58,6 +58,7 @@ Manager::ConfigureTieredStorage(CacheWarmupPolicies warmup_policies, CacheLimit 
 
         manager.dlist_ =
             std::make_shared<internal::DList>(eviction_enabled, max, low_watermark, high_watermark, eviction_config);
+        manager.dlist_->SetLoadingOverheadTracker(manager.loading_overhead_tracker_);
 
         LOG_INFO(
             "[MCL] Configured Tiered Storage manager with "

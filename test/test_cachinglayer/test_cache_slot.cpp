@@ -183,6 +183,10 @@ class MockTranslator : public Translator<TestCell> {
     SetLoadingOverheadBytes(int64_t bytes) {
         loading_overhead_bytes_ = bytes;
     }
+    void
+    SetLoadingOverheadConfig(const std::string& group, const ResourceUsage& upper_bound) {
+        meta_.loading_overhead = LoadingOverheadConfig{upper_bound, group};
+    }
     int
     GetCellsCallCount() const {
         EXPECT_FALSE(for_concurrent_test_);
@@ -1858,8 +1862,8 @@ TEST(CacheSlotTrackerTest, LoadingOverheadTrackerIntegration) {
     ResourceUsage limit{10000, 0};
     auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
 
-    LoadingOverheadTracker tracker;
-    tracker.RegisterUpperBound(CellDataType::OTHER, {500, 0});
+    auto tracker = std::make_shared<LoadingOverheadTracker>();
+    dlist->SetLoadingOverheadTracker(tracker);
 
     const int64_t cell_loaded_size = 100;
     const int64_t cell_loading_overhead = 200;
@@ -1868,11 +1872,12 @@ TEST(CacheSlotTrackerTest, LoadingOverheadTrackerIntegration) {
         std::vector<std::pair<cid_t, int64_t>>{{0, cell_loaded_size}, {1, cell_loaded_size}},
         std::unordered_map<cl_uid_t, cid_t>{{0, 0}, {1, 1}}, "test_tracker_integration", StorageType::MEMORY);
     translator->SetLoadingOverheadBytes(cell_loading_overhead);
+    translator->SetLoadingOverheadConfig("test_group", {500, 0});
     auto* translator_ptr = translator.get();
 
     auto cache_slot =
         std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, false,
-                                              std::chrono::milliseconds(5000), std::chrono::milliseconds(0), &tracker);
+                                              std::chrono::milliseconds(5000), std::chrono::milliseconds(0));
 
     auto op_ctx = std::make_unique<milvus::OpContext>();
 
@@ -1894,8 +1899,8 @@ TEST(CacheSlotTrackerTest, LoadingOverheadTrackerCleanupOnException) {
     ResourceUsage limit{10000, 0};
     auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
 
-    LoadingOverheadTracker tracker;
-    tracker.RegisterUpperBound(CellDataType::OTHER, {500, 0});
+    auto tracker = std::make_shared<LoadingOverheadTracker>();
+    dlist->SetLoadingOverheadTracker(tracker);
 
     const int64_t cell_loaded_size = 100;
     const int64_t cell_loading_overhead = 200;
@@ -1904,24 +1909,67 @@ TEST(CacheSlotTrackerTest, LoadingOverheadTrackerCleanupOnException) {
                                                        std::unordered_map<cl_uid_t, cid_t>{{0, 0}},
                                                        "test_tracker_exception", StorageType::MEMORY);
     translator->SetLoadingOverheadBytes(cell_loading_overhead);
+    translator->SetLoadingOverheadConfig("test_group", {500, 0});
     translator->SetShouldThrow(true);
 
     auto cache_slot =
         std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, false,
-                                              std::chrono::milliseconds(5000), std::chrono::milliseconds(0), &tracker);
+                                              std::chrono::milliseconds(5000), std::chrono::milliseconds(0));
 
     auto op_ctx = std::make_unique<milvus::OpContext>();
 
     // Pin should fail because translator throws, but tracker state must be cleaned up.
-    // The exception is caught internally by RunLoad and set as error on the cell.
     EXPECT_ANY_THROW(cache_slot->PinCellsDirect(op_ctx.get(), {0}));
 
-    // After the failed load, tracker state should be clean.
-    // Verify by reserving again — if state leaked, the tracker would have stale sum_of_overhead.
-    // Reserve the full UB amount — should succeed fully if no leak.
-    auto delta = tracker.Reserve(CellDataType::OTHER, {500, 0});
+    // Register again to get handle for verification (CacheSlot registered internally).
+    auto handle = tracker->Register("test_group", {500, 0});
+
+    // Verify tracker state is clean by reserving the full UB.
+    auto delta = tracker->Reserve(handle, {500, 0});
     EXPECT_EQ(delta.memory_bytes, 500);
 
-    auto release = tracker.Release(CellDataType::OTHER, {500, 0});
+    auto release = tracker->Release(handle, {500, 0});
     EXPECT_EQ(release.memory_bytes, 500);
+}
+
+// Test bonus cells retry path with tracker: essential+bonus exceeds DList capacity,
+// falls back to essential-only which succeeds.
+TEST(CacheSlotTrackerTest, BonusCellsRetryWithTracker) {
+    // Tight capacity: can hold 2 cells (200 bytes) + overhead (up to UB=100), but not 3 cells (300).
+    ResourceUsage limit{350, 0};
+    auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
+
+    auto tracker = std::make_shared<LoadingOverheadTracker>();
+    dlist->SetLoadingOverheadTracker(tracker);
+
+    const int64_t cell_loaded_size = 100;
+    const int64_t cell_loading_overhead = 50;
+
+    // 3 cells: cid 0, 1, 2. We'll pin cid 0, with bonus cells {1, 2}.
+    // essential(cid 0) = 100 loaded + 50 overhead = fits in 350
+    // essential+bonus(cid 0,1,2) = 300 loaded + 150 overhead = 450 > 350, should fail
+    // retry essential-only(cid 0) = 100 loaded + delta overhead = fits
+    auto translator = std::make_unique<MockTranslator>(
+        std::vector<std::pair<cid_t, int64_t>>{{0, cell_loaded_size}, {1, cell_loaded_size}, {2, cell_loaded_size}},
+        std::unordered_map<cl_uid_t, cid_t>{{0, 0}, {1, 1}, {2, 2}}, "test_bonus_retry", StorageType::MEMORY);
+    translator->SetLoadingOverheadBytes(cell_loading_overhead);
+    translator->SetLoadingOverheadConfig("test_bonus_retry", {100, 0});
+    translator->SetExtraReturnCids({{0, {1, 2}}});
+
+    auto cache_slot =
+        std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, false,
+                                              std::chrono::milliseconds(200), std::chrono::milliseconds(0));
+
+    auto op_ctx = std::make_unique<milvus::OpContext>();
+
+    // Pin cell 0: bonus retry should kick in, essential-only should succeed.
+    auto accessor = cache_slot->PinCellsDirect(op_ctx.get(), {0});
+    ASSERT_NE(accessor, nullptr);
+    EXPECT_EQ(accessor->get_cell_of(0)->data, 0);
+
+    // Cell 1 and 2 should NOT be loaded (bonus was dropped).
+    // Pin them separately to verify they weren't loaded as bonus.
+    auto accessor2 = cache_slot->PinCellsDirect(op_ctx.get(), {1});
+    ASSERT_NE(accessor2, nullptr);
+    EXPECT_EQ(accessor2->get_cell_of(1)->data, 10);
 }

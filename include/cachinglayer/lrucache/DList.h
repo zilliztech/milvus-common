@@ -24,6 +24,7 @@
 #include <queue>
 #include <unordered_map>
 
+#include "cachinglayer/LoadingOverheadTracker.h"
 #include "cachinglayer/Metrics.h"
 #include "cachinglayer/Utils.h"
 #include "cachinglayer/lrucache/ListNode.h"
@@ -64,6 +65,28 @@ class DList : public std::enable_shared_from_this<DList> {
         if (eviction_config_.background_eviction_enabled) {
             LOG_INFO("[MCL] Starting periodic background eviction loop thread");
             bg_eviction_thread_ = std::thread(&DList::evictionLoop, this);
+        }
+    }
+
+    // Must be called during initialization, before any Reserve/Release calls.
+    // Not thread-safe with concurrent Reserve/Release.
+    void
+    SetLoadingOverheadTracker(std::shared_ptr<LoadingOverheadTracker> tracker) {
+        loading_overhead_tracker_ = std::move(tracker);
+    }
+
+    uint64_t
+    RegisterLoadingOverhead(const std::string& group, const ResourceUsage& upper_bound) {
+        if (loading_overhead_tracker_) {
+            return loading_overhead_tracker_->Register(group, upper_bound);
+        }
+        return LoadingOverheadTracker::kInvalidHandle;
+    }
+
+    void
+    UnregisterLoadingOverhead(uint64_t overhead_handle) {
+        if (loading_overhead_tracker_) {
+            loading_overhead_tracker_->Unregister(overhead_handle);
         }
     }
 
@@ -127,6 +150,20 @@ class DList : public std::enable_shared_from_this<DList> {
     ReserveLoadingResourceWithTimeout(const ResourceUsage& size, std::chrono::milliseconds timeout,
                                       OpContext* ctx = nullptr);
 
+    // Reserve with loading overhead tracker integration.
+    // Space check uses (loaded + overhead) * factor as upper bound.
+    // Actual reservation uses (loaded + delta) * factor, where delta = tracker->Reserve() or overhead if no tracker.
+    // Returns the actual reserved size (zero = failure).
+    folly::SemiFuture<ResourceUsage>
+    ReserveLoadingResourceWithTimeout(const ResourceUsage& loaded, const ResourceUsage& overhead,
+                                      uint64_t overhead_handle, std::chrono::milliseconds timeout,
+                                      OpContext* ctx = nullptr);
+
+    // Release with loading overhead tracker integration.
+    // Returns the actual unscaled size released (loaded + tracker_delta).
+    ResourceUsage
+    ReleaseLoadingResource(const ResourceUsage& loaded, const ResourceUsage& overhead, uint64_t overhead_handle);
+
     // Release resource used for loading, called after loading a cell.
     void
     ReleaseLoadingResource(const ResourceUsage& loading_size);
@@ -170,15 +207,51 @@ class DList : public std::enable_shared_from_this<DList> {
 
     // Waiting request for timeout-based memory reservation
     struct WaitingRequest {
-        ResourceUsage required_size;
+        ResourceUsage required_size;  // loaded + overhead (for space check)
+        ResourceUsage loaded;         // loaded portion (for tracker-aware path)
+        ResourceUsage overhead;       // overhead portion (for tracker-aware path)
+        uint64_t overhead_handle{0};
         std::chrono::steady_clock::time_point deadline;
-        folly::Promise<bool> promise;
+        folly::Promise<bool> bool_promise;
+        folly::Promise<ResourceUsage> resource_promise;
+        bool use_resource_promise{false};
         uint64_t request_id;
         std::optional<folly::CancellationCallback> cancel_cb{std::nullopt};
 
+        // Legacy constructor (no tracker)
         WaitingRequest(ResourceUsage size, std::chrono::steady_clock::time_point dl, folly::Promise<bool> p,
                        uint64_t id)
-            : required_size(size), deadline(dl), promise(std::move(p)), request_id(id) {
+            : required_size(size),
+              deadline(dl),
+              bool_promise(std::move(p)),
+              resource_promise(folly::Promise<ResourceUsage>::makeEmpty()),
+              request_id(id) {
+        }
+
+        // Tracker-aware constructor.
+        // required_size is scaled by loading_resource_factor to match the legacy path,
+        // ensuring consistent queue ordering between legacy and tracker-aware requests.
+        WaitingRequest(ResourceUsage loaded, ResourceUsage overhead, uint64_t overhead_handle,
+                       std::chrono::steady_clock::time_point dl, folly::Promise<ResourceUsage> p, uint64_t id,
+                       float loading_resource_factor)
+            : required_size((loaded + overhead) * loading_resource_factor),
+              loaded(loaded),
+              overhead(overhead),
+              overhead_handle(overhead_handle),
+              deadline(dl),
+              bool_promise(folly::Promise<bool>::makeEmpty()),
+              resource_promise(std::move(p)),
+              use_resource_promise(true),
+              request_id(id) {
+        }
+
+        void
+        setValue(bool success, ResourceUsage actual = {}) {
+            if (use_resource_promise) {
+                resource_promise.setValue(success ? actual : ResourceUsage{});
+            } else {
+                bool_promise.setValue(success);
+            }
         }
     };
 
@@ -200,6 +273,18 @@ class DList : public std::enable_shared_from_this<DList> {
     // reserveResource without taking lock, must be called with lock held.
     bool
     reserveResourceInternal(const ResourceUsage& size);
+
+    // Common implementation for resource reservation with eviction.
+    // Returns {success, scaled_size_reserved}.
+    std::pair<bool, ResourceUsage>
+    reserveResourceInternalImpl(const ResourceUsage& size, std::function<void()> rollback);
+
+    // Reserve with tracker under lock. Space check uses loaded + overhead,
+    // actual reservation uses loaded + tracker delta. Returns actual reserved (zero = failed).
+    // Returns {success, unscaled_reserved}. Scaled amount is added to total_loading_size_ internally.
+    std::pair<bool, ResourceUsage>
+    reserveResourceInternalWithTracker(const ResourceUsage& loaded, const ResourceUsage& overhead,
+                                       uint64_t overhead_handle, LoadingOverheadTracker* tracker);
 
     void
     evictionLoop();
@@ -262,6 +347,8 @@ class DList : public std::enable_shared_from_this<DList> {
     // tail_ <- prev <- ... <- head_
     ListNode* head_ = nullptr;
     ListNode* tail_ = nullptr;
+
+    std::shared_ptr<LoadingOverheadTracker> loading_overhead_tracker_;
 
     // TODO(tiered storage 3): benchmark folly::DistributedMutex for this usecase.
     mutable std::mutex list_mtx_;
