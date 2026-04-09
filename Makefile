@@ -27,7 +27,7 @@ conan: deps
 	$(SDKROOT_ENV) \
 	conan install . --build=missing \
 		-s build_type=$(BUILD_TYPE) \
-		-if $(BUILD_DIR)
+		-of $(BUILD_DIR)
 
 configure: conan
 	cmake -S . -B $(BUILD_DIR) \
