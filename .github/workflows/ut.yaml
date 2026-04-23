@@ -47,7 +47,7 @@ jobs:
           && conan remote add default-conan-local2 https://milvus01.jfrog.io/artifactory/api/conan/default-conan-local2 --force
       - name: Build & Run
         env:
-          CONAN_ARGS: '-o &:with_ut=True -o &:with_asan=True -s compiler.version=12 -s compiler.cppstd=17 -s build_type=Release -of .'
+          CONAN_ARGS: '-o &:with_ut=True -o &:with_asan=True -s compiler.version=12 -s compiler.cppstd=20 -s build_type=Release -of .'
         run: |
           mkdir build && cd build \
           && conan install .. --build=missing $CONAN_ARGS \

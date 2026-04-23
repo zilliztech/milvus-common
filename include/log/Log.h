@@ -61,17 +61,24 @@
 #define SERVER_MODULE_FUNCTION \
     fmt::format("[{}][{}][{}][{}]", SERVER_MODULE_NAME, __FUNCTION__, GetThreadName(), milvus::tracer::GetTraceID())
 
+// fmt 11 requires the first argument of fmt::format to be a compile-time
+// format string. The macros below accept the format string (fmt_str) as a
+// named parameter and wrap it with fmt::runtime(...) so pre-formatted strings
+// and other non-literal first arguments (e.g. LOG_INFO(fmt::format(...)))
+// continue to work under fmt 11 + C++20.
+
 // avoid evaluating args if trace log is not enabled
-#define LOG_TRACE(args...)                                               \
-    if (VLOG_IS_ON(GLOG_TRACE)) {                                        \
-        VLOG(GLOG_TRACE) << SERVER_MODULE_FUNCTION << fmt::format(args); \
+#define LOG_TRACE(fmt_str, args...)                                                               \
+    if (VLOG_IS_ON(GLOG_TRACE)) {                                                                 \
+        VLOG(GLOG_TRACE) << SERVER_MODULE_FUNCTION << fmt::format(fmt::runtime(fmt_str), ##args); \
     }
 
-#define LOG_DEBUG(args...) VLOG(GLOG_DEBUG) << SERVER_MODULE_FUNCTION << fmt::format(args)
-#define LOG_INFO(args...) LOG(INFO) << SERVER_MODULE_FUNCTION << fmt::format(args)
-#define LOG_WARN(args...) LOG(WARNING) << SERVER_MODULE_FUNCTION << fmt::format(args)
-#define LOG_ERROR(args...) LOG(ERROR) << SERVER_MODULE_FUNCTION << fmt::format(args)
-#define LOG_FATAL(args...) LOG(FATAL) << SERVER_MODULE_FUNCTION << fmt::format(args)
+#define LOG_DEBUG(fmt_str, args...) \
+    VLOG(GLOG_DEBUG) << SERVER_MODULE_FUNCTION << fmt::format(fmt::runtime(fmt_str), ##args)
+#define LOG_INFO(fmt_str, args...) LOG(INFO) << SERVER_MODULE_FUNCTION << fmt::format(fmt::runtime(fmt_str), ##args)
+#define LOG_WARN(fmt_str, args...) LOG(WARNING) << SERVER_MODULE_FUNCTION << fmt::format(fmt::runtime(fmt_str), ##args)
+#define LOG_ERROR(fmt_str, args...) LOG(ERROR) << SERVER_MODULE_FUNCTION << fmt::format(fmt::runtime(fmt_str), ##args)
+#define LOG_FATAL(fmt_str, args...) LOG(FATAL) << SERVER_MODULE_FUNCTION << fmt::format(fmt::runtime(fmt_str), ##args)
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 

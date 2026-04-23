@@ -15,7 +15,7 @@ project(milvus_common CXX C)
 option(ENABLE_UNIT_TESTS "Enable unit tests" OFF)
 option(ENABLE_SYNCPOINT "Enable sync point for testing" OFF)
 
-set( CMAKE_CXX_STANDARD 17 )
+set( CMAKE_CXX_STANDARD 20 )
 set( CMAKE_CXX_STANDARD_REQUIRED on )
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
