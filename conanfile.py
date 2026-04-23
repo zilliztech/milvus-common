@@ -15,7 +15,6 @@ class MilvusCommonConan(ConanFile):
     requires = (
         "gtest/1.15.0",
         "glog/0.7.1#a306e61d7b8311db8cb148ad62c48030",
-        "fmt/11.0.2#eb98daa559c7c59d591f4720dde4cd5c",
         "prometheus-cpp/1.2.4#0918d66c13f97acb7809759f9de49b3f",
         "gflags/2.2.2#7671803f1dc19354cc90bd32874dcfda",
         "opentelemetry-cpp/1.23.0@milvus/dev#11bc565ec6e82910ae8f7471da756720",
@@ -24,7 +23,7 @@ class MilvusCommonConan(ConanFile):
         "xz_utils/5.4.5#fc4e36861e0a47ecd4a40a00e6d29ac8",
         "zlib/1.3.1#8045430172a5f8d56ba001b14561b4ea",
         "libevent/2.1.12#95065aaefcd58d3956d6dfbfc5631d97",
-        "folly/2024.08.12.00@milvus/dev#f9b2bdf162c0ec47cb4e5404097b340d",
+        "folly/2026.04.20.00@milvus/dev#f72c1b4271ff64215e9b1797a32bf8ad",
         "boost/1.83.0#4e8a94ac1b88312af95eded83cd81ca8",
     )
 
@@ -57,6 +56,8 @@ class MilvusCommonConan(ConanFile):
         # Force overrides openssl to resolve opentelemetry-cpp's transitive deps
         self.requires("openssl/3.3.2#9f9f130d58e7c13e76bb8a559f0a6a8b", force=True, override=True)
         self.requires("libcurl/8.10.1#a3113369c86086b0e84231844e7ed0a9", force=True, override=True)
+        # folly/2026.x recipe still pins fmt/10.2.1; align on fmt/11 (matches knowhere)
+        self.requires("fmt/11.2.0#eb98daa559c7c59d591f4720dde4cd5c", force=True, override=True)
         # nlohmann_json is a direct dependency (used in Tracer.cpp) and also forces
         # the transitive version from opentelemetry-cpp to align
         self.requires("nlohmann_json/3.11.3#ffb9e9236619f1c883e36662f944345d", force=True)
@@ -67,7 +68,7 @@ class MilvusCommonConan(ConanFile):
 
     @property
     def _minimum_cpp_standard(self):
-        return 17
+        return 20
 
     def generate(self):
         tc = CMakeToolchain(self)
