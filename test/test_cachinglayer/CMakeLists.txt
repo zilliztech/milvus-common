@@ -10,7 +10,7 @@
 # or implied. See the License for the specific language governing permissions and limitations under the License
 
 find_package(GTest CONFIG REQUIRED)
-find_package(BLAS REQUIRED)
+find_package(Threads REQUIRED)
 
 set(CACHINGLAYER_TEST_FILES
     ../init_gtest.cpp
@@ -31,7 +31,6 @@ target_link_libraries(cachinglayer_test
     milvus-common
     ${COMMON_LINKER_LIBS}
     Threads::Threads
-    ${BLAS_LIBRARIES}
 )
 if(NOT APPLE)
     target_link_libraries(cachinglayer_test atomic gomp)

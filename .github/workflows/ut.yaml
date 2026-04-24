@@ -28,12 +28,12 @@ jobs:
       fail-fast: false
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           submodules: recursive
       - name: Install Dependency
         run: |
-          sudo apt update && sudo apt install -y cmake libopenblas-dev libaio-dev g++-12 gcc-12 python3 python3-pip \
+          sudo apt update && sudo apt install -y cmake libaio-dev g++-12 gcc-12 python3 python3-pip \
           && pip3 install conan==2.25.1
       - name: Restore Conan Packages
         uses: actions/cache@v4
@@ -58,4 +58,3 @@ jobs:
         with:
           path: ~/.conan2
           key: milvus-common-ubuntu-22.04-${{ hashFiles('conanfile.py')}}
-          restore-keys: milvus-common-ubuntu-22.04-

@@ -43,6 +43,8 @@ class MilvusCommonConan(ConanFile):
         "prometheus-cpp/*:with_pull": False,
         "fmt/*:header_only": False,
         "opentelemetry-cpp/*:with_stl": True,
+        # Use OpenMP threading to match knowhere's libopenblas-openmp-dev
+        "openblas/*:use_openmp": True,
         "with_ut": False,
         "with_asan": False,
     }
@@ -60,6 +62,8 @@ class MilvusCommonConan(ConanFile):
         self.requires("nlohmann_json/3.11.3#ffb9e9236619f1c883e36662f944345d", force=True)
         if self.settings.os != "Macos":
             self.requires("libunwind/1.8.1#748a981ace010b80163a08867b732e71")
+            # openblas is only used on Linux (thread_pool.cc is guarded by __linux__)
+            self.requires("openblas/0.3.27")
 
     @property
     def _minimum_cpp_standard(self):
