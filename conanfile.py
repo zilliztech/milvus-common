@@ -64,7 +64,7 @@ class MilvusCommonConan(ConanFile):
         if self.settings.os != "Macos":
             self.requires("libunwind/1.8.1#748a981ace010b80163a08867b732e71")
             # openblas is only used on Linux (thread_pool.cc is guarded by __linux__)
-            self.requires("openblas/0.3.27")
+            self.requires("openblas/0.3.30")
 
     @property
     def _minimum_cpp_standard(self):
