@@ -2,7 +2,9 @@
 
 #include <libaio.h>
 
+#include <atomic>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <queue>
 
@@ -33,6 +35,9 @@ class AioContextPool {
     push(io_context_t ctx) {
         {
             std::scoped_lock lk(ctx_mtx_);
+            if (stop_) {
+                return;
+            }
             ctx_q_.push(ctx);
         }
         ctx_cv_.notify_one();
@@ -41,10 +46,7 @@ class AioContextPool {
     io_context_t
     pop() {
         std::unique_lock lk(ctx_mtx_);
-        if (stop_) {
-            return nullptr;
-        }
-        ctx_cv_.wait(lk, [this] { return ctx_q_.size(); });
+        ctx_cv_.wait(lk, [this] { return stop_ || !ctx_q_.empty(); });
         if (stop_) {
             return nullptr;
         }
@@ -53,18 +55,38 @@ class AioContextPool {
         return ret;
     }
 
+    void
+    Shutdown() {
+        {
+            std::scoped_lock lk(ctx_mtx_);
+            if (stop_) {
+                return;
+            }
+            stop_ = true;
+        }
+        ctx_cv_.notify_all();
+    }
+
     static bool
     InitGlobalAioPool(size_t num_ctx, size_t max_events);
 
     static std::shared_ptr<AioContextPool>
     GetGlobalAioPool();
 
+    static bool
+    InitGlobalAioPoolWithValidation(size_t num_ctx, size_t max_events);
+
+    static std::shared_ptr<AioContextPool>
+    GetGlobalAioPoolDirect();
+
+    static void
+    ResetGlobalForTest();
+
     ~AioContextPool() {
-        stop_ = true;
+        Shutdown();
         for (auto ctx : ctx_bak_) {
             io_destroy(ctx);
         }
-        ctx_cv_.notify_all();
     }
 
  private:
@@ -75,8 +97,8 @@ class AioContextPool {
     bool stop_ = false;
     size_t num_ctx_;
     size_t max_events_;
-    static size_t global_aio_pool_size;
-    static size_t global_aio_max_events;
+    static std::atomic<size_t> global_aio_pool_size;
+    static std::atomic<size_t> global_aio_max_events;
     static std::mutex global_aio_pool_mut;
 
     AioContextPool(size_t num_ctx, size_t max_events) : num_ctx_(num_ctx), max_events_(max_events) {
