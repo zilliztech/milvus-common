@@ -16,11 +16,15 @@ on:
       - 'CMakeLists.txt'
       - '.github/workflows/ut.yaml'
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  ut:
+  ut-linux:
     name: UT on ubuntu-22.04
     runs-on: ubuntu-22.04
-    timeout-minutes: 240
+    timeout-minutes: 60
     env:
       CC: gcc-12
       CXX: g++-12
@@ -47,9 +51,47 @@ jobs:
           && conan remote add default-conan-local2 https://milvus01.jfrog.io/artifactory/api/conan/default-conan-local2 --force
       - name: Build & Run
         run: |
-          make test BUILD_TYPE=Release CONAN_EXTRA='-o \&:with_ut=True -o \&:with_asan=True -s compiler.version=12 -s compiler.cppstd=20'
+          make test BUILD_TYPE=Release CONAN_EXTRA='-o \&:with_asan=True -s compiler.version=12'
       - name: Save Conan Packages
         uses: actions/cache/save@v4
         with:
           path: ~/.conan2
           key: milvus-common-ubuntu-22.04-${{ hashFiles('conanfile.py')}}
+
+  ut-macos:
+    name: UT on macos-15
+    runs-on: macos-15
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install Dependency
+        run: |
+          python3 -m venv "$RUNNER_TEMP/conan-venv"
+          "$RUNNER_TEMP/conan-venv/bin/python" -m pip install conan==2.25.1 "cmake<4"
+          echo "$RUNNER_TEMP/conan-venv/bin" >> $GITHUB_PATH
+      - name: Restore Conan Packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.conan2
+          key: milvus-common-macos-15-${{ hashFiles('conanfile.py')}}
+          restore-keys: milvus-common-macos-15-
+      - name: Setup Conan
+        run: |
+          conan profile detect --force \
+          && conan remote add default-conan-local2 https://milvus01.jfrog.io/artifactory/api/conan/default-conan-local2 --force
+      - name: Build & Run
+        env:
+          # OpenSSL source builds on macOS 15 need header padding for Conan's install_name_tool rpath rewrite.
+          CONAN_EXTRA: "-c tools.build:exelinkflags='[\"-Wl,-headerpad_max_install_names\"]' -c tools.build:sharedlinkflags='[\"-Wl,-headerpad_max_install_names\"]'"
+        run: |
+          make test BUILD_TYPE=Release
+      - name: Save Conan Packages
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.conan2
+          key: milvus-common-macos-15-${{ hashFiles('conanfile.py')}}

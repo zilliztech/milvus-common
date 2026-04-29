@@ -1,5 +1,6 @@
 BUILD_DIR     := build
 BUILD_TYPE    := Release
+CONAN_CPPSTD  ?= 20
 CONAN_EXTRA   ?=
 CMAKE_EXTRA   ?=
 NPROC         := $(shell sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
@@ -28,6 +29,7 @@ conan: deps
 	$(SDKROOT_ENV) \
 	conan install . --build=missing \
 		-s build_type=$(BUILD_TYPE) \
+		-s compiler.cppstd=$(CONAN_CPPSTD) \
 		-c tools.build:jobs=$(NPROC) \
 		-of $(BUILD_DIR) \
 		$(CONAN_EXTRA)
@@ -42,7 +44,8 @@ configure: conan
 build: configure
 	cmake --build $(BUILD_DIR) -j$(NPROC)
 
-test: CMAKE_EXTRA += -DWITH_COMMON_UT=ON
+test: override CONAN_EXTRA += -o \&:with_ut=True
+test: override CMAKE_EXTRA += -DWITH_COMMON_UT=ON
 test: configure
 	cmake --build $(BUILD_DIR) -j$(NPROC)
 	. $(BUILD_DIR)/conanrun.sh && ctest --test-dir $(BUILD_DIR) --output-on-failure

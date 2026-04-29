@@ -502,7 +502,10 @@ TEST_F(DListTest, ReserveToAboveHighWatermarkNoEvictionThenAutoEviction) {
     // wait for background eviction to run, current usage 95, 46, above high watermark.
     // reserved 55, 26 is considered pinned, thus evict node 1, resulting in 65, 31, below low watermark
     EXPECT_CALL(*node1, unload()).Times(1);
-    std::this_thread::sleep_for(dlist->eviction_config().eviction_interval + std::chrono::milliseconds(10));
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (get_used_memory() != usage2 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
 
     EXPECT_EQ(get_used_memory(), usage2);
     EXPECT_EQ(get_loading_memory(), reserve_size);
