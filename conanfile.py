@@ -13,7 +13,6 @@ import os
 class MilvusCommonConan(ConanFile):
     settings = "os", "compiler", "build_type", "arch"
     requires = (
-        "gtest/1.15.0",
         "glog/0.7.1#a306e61d7b8311db8cb148ad62c48030",
         "prometheus-cpp/1.2.4#0918d66c13f97acb7809759f9de49b3f",
         "gflags/2.2.2#7671803f1dc19354cc90bd32874dcfda",
@@ -48,6 +47,10 @@ class MilvusCommonConan(ConanFile):
         "with_asan": False,
     }
 
+    def build_requirements(self):
+        if self.options.with_ut:
+            self.test_requires("gtest/1.15.0")
+
     def requirements(self):
         # Force all dependencies to use protobuf from milvus/dev channel
         # This is needed to resolve conflicts between opentelemetry-cpp and grpc
@@ -57,18 +60,22 @@ class MilvusCommonConan(ConanFile):
         self.requires("openssl/3.3.2#9f9f130d58e7c13e76bb8a559f0a6a8b", force=True, override=True)
         self.requires("libcurl/8.10.1#a3113369c86086b0e84231844e7ed0a9", force=True, override=True)
         # folly/2026.x recipe still pins fmt/10.2.1; align on fmt/11 (matches knowhere)
-        self.requires("fmt/11.2.0#eb98daa559c7c59d591f4720dde4cd5c", force=True, override=True)
+        self.requires("fmt/11.2.0#eb98daa559c7c59d591f4720dde4cd5c", force=True)
         # nlohmann_json is a direct dependency (used in Tracer.cpp) and also forces
         # the transitive version from opentelemetry-cpp to align
         self.requires("nlohmann_json/3.11.3#ffb9e9236619f1c883e36662f944345d", force=True)
         if self.settings.os != "Macos":
             self.requires("libunwind/1.8.1#748a981ace010b80163a08867b732e71")
+        if self.settings.os == "Linux":
             # openblas is only used on Linux (thread_pool.cc is guarded by __linux__)
             self.requires("openblas/0.3.30")
 
     @property
     def _minimum_cpp_standard(self):
         return 20
+
+    def validate(self):
+        check_min_cppstd(self, self._minimum_cpp_standard)
 
     def generate(self):
         tc = CMakeToolchain(self)

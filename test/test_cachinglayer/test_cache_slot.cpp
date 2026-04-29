@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <functional>
 #include <future>
 #include <memory>
 #include <random>
@@ -1075,6 +1076,9 @@ class MockTranslatorWithWarmup : public Translator<TestCell> {
             load_started_promise_->set_value();
             load_started_promise_ = nullptr;
         }
+        if (load_started_callback_) {
+            load_started_callback_();
+        }
 
         std::vector<std::pair<cid_t, std::unique_ptr<TestCell>>> result;
         for (cid_t cid : cids) {
@@ -1123,6 +1127,11 @@ class MockTranslatorWithWarmup : public Translator<TestCell> {
         load_started_promise_ = promise;
     }
 
+    void
+    SetLoadStartedCallback(std::function<void()> callback) {
+        load_started_callback_ = std::move(callback);
+    }
+
     // Set a promise that will be signaled when loading completes
     void
     SetLoadCompletedPromise(std::promise<void>* promise) {
@@ -1146,6 +1155,7 @@ class MockTranslatorWithWarmup : public Translator<TestCell> {
     std::atomic<int> get_cells_call_count_ = 0;
     milvus::OpContext* last_ctx_ = nullptr;
     std::promise<void>* load_started_promise_ = nullptr;
+    std::function<void()> load_started_callback_;
     std::promise<void>* load_completed_promise_ = nullptr;
     std::shared_ptr<std::atomic<int>> shared_call_counter_;
 };
@@ -1262,29 +1272,21 @@ TEST(WarmupTest, WarmupWithCancelledCtxDuringLoadingThrows) {
     auto translator = std::make_unique<MockTranslatorWithWarmup>(
         cell_sizes, uid_to_cid_map, "test_slot", StorageType::MEMORY, CacheWarmupPolicy::CacheWarmupPolicy_Sync);
 
-    // Add delay so we can cancel during loading
+    // Add delay so cancellation is observed before loading completes.
     translator->SetCidLoadDelay({{0, 50}, {1, 50}});
 
     // Create a context with cancellation support
     folly::CancellationSource cancel_source;
     auto cancel_token = cancel_source.getToken();
     auto op_ctx = std::make_unique<milvus::OpContext>(cancel_token);
+    translator->SetLoadStartedCallback([&cancel_source]() { cancel_source.requestCancellation(); });
 
     auto cache_slot =
         std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
                                               std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
 
-    // Cancel the operation before warmup completes
-    // Launch warmup in a thread and cancel after a short delay
-    std::thread cancel_thread([&cancel_source]() {
-        std::this_thread::sleep_for(std::chrono::milliseconds(30));
-        cancel_source.requestCancellation();
-    });
-
     // Warmup should throw because cancellation will be requested during loading
     EXPECT_THROW(cache_slot->Warmup(op_ctx.get()), std::runtime_error);
-
-    cancel_thread.join();
 }
 
 // Test that Warmup with nullptr ctx and EveryLoad policy works (no crash)
