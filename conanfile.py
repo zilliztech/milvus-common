@@ -22,7 +22,7 @@ class MilvusCommonConan(ConanFile):
         "xz_utils/5.4.5#fc4e36861e0a47ecd4a40a00e6d29ac8",
         "zlib/1.3.1#8045430172a5f8d56ba001b14561b4ea",
         "libevent/2.1.12#95065aaefcd58d3956d6dfbfc5631d97",
-        "folly/2026.04.20.00@milvus/dev#f72c1b4271ff64215e9b1797a32bf8ad",
+        "folly/2026.04.20.00@milvus/dev#06852bea5b6449f0c4eb0df002b5779c",
         "boost/1.83.0#4e8a94ac1b88312af95eded83cd81ca8",
     )
 
