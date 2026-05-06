@@ -134,8 +134,8 @@ class LoadingOverheadTracker {
                           group, handle, ref_count);
                 break;
             case LogEvent::kNewGroup:
-                LOG_INFO("[MCL] LoadingOverheadTracker registered group '{}' (handle {}, refs=1): UB={}", group,
-                         handle, effective_upper_bound.ToString());
+                LOG_INFO("[MCL] LoadingOverheadTracker registered group '{}' (handle {}, refs=1): UB={}", group, handle,
+                         effective_upper_bound.ToString());
                 break;
             case LogEvent::kNone:
                 break;
@@ -275,10 +275,7 @@ class LoadingOverheadTracker {
 
  private:
     struct GroupState {
-        GroupState(ResourceUsage ub, std::string group)
-            : upper_bound(ub),
-              ref_count(1),
-              group_name(std::move(group)) {
+        GroupState(ResourceUsage ub, std::string group) : upper_bound(ub), ref_count(1), group_name(std::move(group)) {
         }
 
         mutable std::mutex mtx;
