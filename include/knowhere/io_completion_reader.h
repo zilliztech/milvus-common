@@ -1,0 +1,68 @@
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <deque>
+#include <memory>
+#include <span>
+#include <unordered_map>
+#include <vector>
+
+#include "knowhere/io_context_pool.h"
+
+class IOCompletionReader {
+ public:
+    using RequestId = uint64_t;
+
+    struct Completion {
+        RequestId request_id = 0;
+        bool ok = false;
+    };
+
+    IOCompletionReader(int fd, std::shared_ptr<IOContextPool> io_pool = IOContextPool::GetGlobal());
+
+    IOCompletionReader(const IOCompletionReader&) = delete;
+    IOCompletionReader&
+    operator=(const IOCompletionReader&) = delete;
+
+    IOCompletionReader(IOCompletionReader&& other) noexcept;
+    IOCompletionReader&
+    operator=(IOCompletionReader&& other) noexcept;
+
+    ~IOCompletionReader();
+
+    RequestId
+    Submit(std::span<std::byte* const> buffers, size_t size, std::span<const size_t> offsets);
+
+    Completion
+    WaitCompleted();
+
+    std::vector<Completion>
+    PollCompleted();
+
+    bool
+    IsReady() const;
+
+ private:
+    struct RequestState {
+        size_t remaining = 0;
+        size_t expected_size = 0;
+        bool ok = true;
+    };
+
+    void
+    ProcessCqe(struct io_uring_cqe* cqe);
+
+    void
+    DrainOutstanding();
+
+    void
+    ReleaseHandle();
+
+    int fd_ = -1;
+    std::shared_ptr<IOContextPool> io_pool_;
+    IOContextHandle handle_;
+    RequestId next_request_id_ = 1;
+    std::unordered_map<RequestId, RequestState> pending_requests_;
+    std::deque<Completion> ready_completions_;
+};

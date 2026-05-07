@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -15,6 +16,7 @@
 #include <type_traits>
 #include <vector>
 
+#include "knowhere/io_completion_reader.h"
 #include "knowhere/io_context_pool.h"
 #include "knowhere/io_reader.h"
 #ifdef MILVUS_COMMON_WITH_LIBAIO
@@ -428,3 +430,71 @@ TEST_F(IOContextPoolTestFixture, ReadAsyncShouldReadMultipleBatches) {
     ::close(fd);
     ::unlink(path);
 }
+
+#ifdef WITH_IO_URING
+TEST_F(IOContextPoolTestFixture, CompletionReaderReturnsSubmittedRequestIds) {
+    IOContextPoolConfig cfg;
+    cfg.num_ctx = 1;
+    cfg.max_events = 8;
+    ASSERT_TRUE(IOContextPool::InitGlobal(cfg));
+
+    auto pool = IOContextPool::GetGlobal();
+    ASSERT_NE(pool, nullptr);
+    ASSERT_EQ(pool->Backend(), IOBackend::IO_URING);
+
+    char path[] = "/tmp/io_completion_reader_XXXXXX";
+    int fd = OpenIOReaderTestFile(path, false);
+    ASSERT_GE(fd, 0);
+
+    constexpr size_t kTotalSize = kIOReaderTestBlockSize * 2;
+    auto content = AllocateAlignedBuffer(kTotalSize);
+    auto first = AllocateAlignedBuffer(kIOReaderTestBlockSize);
+    auto second = AllocateAlignedBuffer(kIOReaderTestBlockSize);
+    ASSERT_NE(content, nullptr);
+    ASSERT_NE(first, nullptr);
+    ASSERT_NE(second, nullptr);
+
+    std::fill(content.get(), content.get() + kIOReaderTestBlockSize, std::byte{0x1});
+    std::fill(content.get() + kIOReaderTestBlockSize, content.get() + kTotalSize, std::byte{0x2});
+
+    ASSERT_EQ(::pwrite(fd, content.get(), kTotalSize, 0), static_cast<ssize_t>(kTotalSize));
+    ASSERT_EQ(::fsync(fd), 0);
+
+    IOCompletionReader reader(fd, pool);
+    std::array<std::byte*, 1> first_buffers{first.get()};
+    std::array<size_t, 1> first_offsets{0};
+    std::array<std::byte*, 1> second_buffers{second.get()};
+    std::array<size_t, 1> second_offsets{kIOReaderTestBlockSize};
+
+    const auto request_1 = reader.Submit(std::span<std::byte* const>(first_buffers.data(), first_buffers.size()),
+                                         kIOReaderTestBlockSize,
+                                         std::span<const size_t>(first_offsets.data(), first_offsets.size()));
+    const auto request_2 = reader.Submit(std::span<std::byte* const>(second_buffers.data(), second_buffers.size()),
+                                         kIOReaderTestBlockSize,
+                                         std::span<const size_t>(second_offsets.data(), second_offsets.size()));
+    ASSERT_NE(request_1, request_2);
+
+    std::vector<IOCompletionReader::Completion> completions;
+    completions.push_back(reader.WaitCompleted());
+
+    auto polled = reader.PollCompleted();
+    completions.insert(completions.end(), polled.begin(), polled.end());
+    while (completions.size() < 2) {
+        completions.push_back(reader.WaitCompleted());
+    }
+
+    ASSERT_EQ(completions.size(), 2u);
+    ASSERT_TRUE(std::all_of(completions.begin(), completions.end(), [](const auto& c) { return c.ok; }));
+
+    std::vector<IOCompletionReader::RequestId> ids{completions[0].request_id, completions[1].request_id};
+    std::sort(ids.begin(), ids.end());
+    ASSERT_EQ(ids[0], std::min(request_1, request_2));
+    ASSERT_EQ(ids[1], std::max(request_1, request_2));
+
+    ASSERT_EQ(std::memcmp(first.get(), content.get(), kIOReaderTestBlockSize), 0);
+    ASSERT_EQ(std::memcmp(second.get(), content.get() + kIOReaderTestBlockSize, kIOReaderTestBlockSize), 0);
+
+    ASSERT_EQ(::close(fd), 0);
+    ::unlink(path);
+}
+#endif

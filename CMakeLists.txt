@@ -125,6 +125,7 @@ if(URING_INCLUDE_DIR AND URING_LIBRARY)
     set(MILVUS_COMMON_WITH_IO_URING ON)
 else()
     list(REMOVE_ITEM SRC_FILES ${CMAKE_CURRENT_SOURCE_DIR}/src/knowhere/uring_context_pool.cc)
+    list(REMOVE_ITEM SRC_FILES ${CMAKE_CURRENT_SOURCE_DIR}/src/knowhere/io_completion_reader.cc)
     message(STATUS "liburing not found, disabling io_uring support")
 endif()
 
