@@ -158,7 +158,7 @@ IOCompletionReader::WaitCompleted() {
 std::vector<IOCompletionReader::Completion>
 IOCompletionReader::PollCompleted() {
 #ifndef WITH_IO_URING
-    return {};
+    throw std::runtime_error("IOCompletionReader requires io_uring support");
 #else
     while (true) {
         io_uring_cqe* cqe = nullptr;
