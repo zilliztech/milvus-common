@@ -14,6 +14,9 @@ IOCompletionReader::IOCompletionReader(int fd, std::shared_ptr<IOContextPool> io
         throw std::runtime_error("IOContextPool is not initialized");
     }
 
+#ifndef WITH_IO_URING
+    throw std::runtime_error("IOCompletionReader requires io_uring support");
+#else
     if (io_pool_->Backend() != IOBackend::IO_URING) {
         throw std::runtime_error("IOCompletionReader requires io_uring backend");
     }
@@ -22,6 +25,7 @@ IOCompletionReader::IOCompletionReader(int fd, std::shared_ptr<IOContextPool> io
     if (handle_.backend != IOBackend::IO_URING || handle_.uring == nullptr) {
         throw std::runtime_error("failed to acquire io_uring context handle");
     }
+#endif
 }
 
 IOCompletionReader::IOCompletionReader(IOCompletionReader&& other) noexcept
@@ -90,31 +94,65 @@ IOCompletionReader::Submit(std::span<std::byte* const> buffers, size_t size, std
     }
 
     auto request_id = next_request_id_++;
-    size_t submitted = 0;
-    while (submitted < buffers.size()) {
+    auto [iter, inserted] = pending_requests_.emplace(request_id, RequestState{});
+    if (!inserted) {
+        throw std::runtime_error("duplicate io_uring request id");
+    }
+    auto& state = iter->second;
+    state.expected_size = size;
+    state.ok = true;
+
+    size_t prepared = 0;
+    while (prepared < buffers.size()) {
         auto* sqe = io_uring_get_sqe(handle_.uring);
         if (sqe == nullptr) {
             const auto flushed = io_uring_submit(handle_.uring);
-            if (flushed <= 0) {
+            if (flushed < 0) {
+                if (state.remaining > 0) {
+                    DrainOutstanding(request_id);
+                } else {
+                    pending_requests_.erase(iter);
+                }
                 throw std::runtime_error("io_uring_submit failed while preparing request");
             }
+            if (flushed == 0) {
+                if (state.remaining > 0) {
+                    DrainOutstanding(request_id);
+                } else {
+                    pending_requests_.erase(iter);
+                }
+                throw std::runtime_error("io_uring_submit made no progress while preparing request");
+            }
+            state.remaining += static_cast<size_t>(flushed);
             continue;
         }
 
-        io_uring_prep_read(sqe, fd_, reinterpret_cast<void*>(buffers[submitted]), size, offsets[submitted]);
+        io_uring_prep_read(sqe, fd_, reinterpret_cast<void*>(buffers[prepared]), size, offsets[prepared]);
         sqe->user_data = request_id;
-        ++submitted;
+        ++prepared;
     }
 
-    const auto final_submitted = io_uring_submit(handle_.uring);
-    if (final_submitted <= 0) {
-        throw std::runtime_error("io_uring_submit failed");
+    while (state.remaining < prepared) {
+        const auto flushed = io_uring_submit(handle_.uring);
+        if (flushed < 0) {
+            if (state.remaining > 0) {
+                DrainOutstanding(request_id);
+            } else {
+                pending_requests_.erase(iter);
+            }
+            throw std::runtime_error("io_uring_submit failed");
+        }
+        if (flushed == 0) {
+            if (state.remaining > 0) {
+                DrainOutstanding(request_id);
+            } else {
+                pending_requests_.erase(iter);
+            }
+            throw std::runtime_error("io_uring_submit made no progress");
+        }
+        state.remaining += static_cast<size_t>(flushed);
     }
 
-    auto& state = pending_requests_[request_id];
-    state.remaining = buffers.size();
-    state.expected_size = size;
-    state.ok = true;
     return request_id;
 #endif
 }
@@ -202,7 +240,7 @@ IOCompletionReader::ProcessCqe(struct io_uring_cqe* cqe) {
     const auto request_id = static_cast<RequestId>(cqe->user_data);
     auto iter = pending_requests_.find(request_id);
     if (iter == pending_requests_.end()) {
-        return;
+        throw std::runtime_error("unknown io_uring completion request id");
     }
 
     auto& state = iter->second;
@@ -230,6 +268,15 @@ IOCompletionReader::DrainOutstanding() {
         WaitCompleted();
     }
     ready_completions_.clear();
+#endif
+}
+
+void
+IOCompletionReader::DrainOutstanding(RequestId request_id) {
+#ifdef WITH_IO_URING
+    while (pending_requests_.find(request_id) != pending_requests_.end()) {
+        WaitCompleted();
+    }
 #endif
 }
 

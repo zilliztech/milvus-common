@@ -10,6 +10,7 @@
 
 #include "knowhere/io_context_pool.h"
 
+// Worker-local single-threaded reader; not thread-safe.
 class IOCompletionReader {
  public:
     using RequestId = uint64_t;
@@ -55,6 +56,9 @@ class IOCompletionReader {
 
     void
     DrainOutstanding();
+
+    void
+    DrainOutstanding(RequestId request_id);
 
     void
     ReleaseHandle();
