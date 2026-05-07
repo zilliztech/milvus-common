@@ -1,7 +1,9 @@
 #include "knowhere/io_completion_reader.h"
 
 #include <cerrno>
+#include <optional>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 IOCompletionReader::IOCompletionReader(int fd, std::shared_ptr<IOContextPool> io_pool)
@@ -22,7 +24,10 @@ IOCompletionReader::IOCompletionReader(int fd, std::shared_ptr<IOContextPool> io
     }
 
     handle_ = io_pool_->Pop();
-    if (handle_.backend != IOBackend::IO_URING || handle_.uring == nullptr) {
+    if (handle_.backend != IOBackend::IO_URING) {
+        throw std::runtime_error("failed to acquire io_uring context handle");
+    }
+    if (handle_.uring == nullptr) {
         throw std::runtime_error("failed to acquire io_uring context handle");
     }
 #endif
@@ -41,7 +46,7 @@ IOCompletionReader::IOCompletionReader(IOCompletionReader&& other) noexcept
 }
 
 IOCompletionReader&
-IOCompletionReader::operator=(IOCompletionReader&& other) noexcept {
+IOCompletionReader::operator=(IOCompletionReader&& other) {
     if (this == &other) {
         return *this;
     }
@@ -63,7 +68,7 @@ IOCompletionReader::operator=(IOCompletionReader&& other) noexcept {
 }
 
 IOCompletionReader::~IOCompletionReader() {
-    DrainOutstanding();
+    DrainOutstandingNoThrow();
     ReleaseHandle();
 }
 
@@ -162,6 +167,9 @@ IOCompletionReader::WaitCompleted() {
 #ifndef WITH_IO_URING
     throw std::runtime_error("IOCompletionReader requires io_uring support");
 #else
+    if (!IsReady()) {
+        throw std::runtime_error("IOCompletionReader is not ready");
+    }
     if (!ready_completions_.empty()) {
         auto completion = ready_completions_.front();
         ready_completions_.pop_front();
@@ -181,8 +189,11 @@ IOCompletionReader::WaitCompleted() {
             continue;
         }
 
-        ProcessCqe(cqe);
+        auto error = ProcessCqe(cqe);
         io_uring_cqe_seen(handle_.uring, cqe);
+        if (error) {
+            throw std::runtime_error(*error);
+        }
 
         if (!ready_completions_.empty()) {
             auto completion = ready_completions_.front();
@@ -198,6 +209,9 @@ IOCompletionReader::PollCompleted() {
 #ifndef WITH_IO_URING
     throw std::runtime_error("IOCompletionReader requires io_uring support");
 #else
+    if (!IsReady()) {
+        throw std::runtime_error("IOCompletionReader is not ready");
+    }
     while (true) {
         io_uring_cqe* cqe = nullptr;
         const auto ret = io_uring_peek_cqe(handle_.uring, &cqe);
@@ -211,8 +225,11 @@ IOCompletionReader::PollCompleted() {
             throw std::runtime_error("io_uring_peek_cqe failed");
         }
 
-        ProcessCqe(cqe);
+        auto error = ProcessCqe(cqe);
         io_uring_cqe_seen(handle_.uring, cqe);
+        if (error) {
+            throw std::runtime_error(*error);
+        }
     }
 
     std::vector<Completion> completed;
@@ -234,13 +251,13 @@ IOCompletionReader::IsReady() const {
 #endif
 }
 
-void
+std::optional<std::string>
 IOCompletionReader::ProcessCqe(struct io_uring_cqe* cqe) {
 #ifdef WITH_IO_URING
     const auto request_id = static_cast<RequestId>(cqe->user_data);
     auto iter = pending_requests_.find(request_id);
     if (iter == pending_requests_.end()) {
-        throw std::runtime_error("unknown io_uring completion request id");
+        return std::string("unknown io_uring completion request id");
     }
 
     auto& state = iter->second;
@@ -256,8 +273,47 @@ IOCompletionReader::ProcessCqe(struct io_uring_cqe* cqe) {
         ready_completions_.push_back({request_id, state.ok});
         pending_requests_.erase(iter);
     }
+    return std::nullopt;
 #else
     (void)cqe;
+    return std::nullopt;
+#endif
+}
+
+void
+IOCompletionReader::DrainOutstandingNoThrow() noexcept {
+#ifdef WITH_IO_URING
+    if (!IsReady()) {
+        ready_completions_.clear();
+        pending_requests_.clear();
+        return;
+    }
+
+    while (!pending_requests_.empty()) {
+        try {
+            io_uring_cqe* cqe = nullptr;
+            const auto ret = io_uring_wait_cqe(handle_.uring, &cqe);
+            if (ret < 0) {
+                if (-ret == EINTR) {
+                    continue;
+                }
+                break;
+            }
+            if (cqe == nullptr) {
+                continue;
+            }
+
+            auto error = ProcessCqe(cqe);
+            io_uring_cqe_seen(handle_.uring, cqe);
+            if (error) {
+                break;
+            }
+        } catch (...) {
+            break;
+        }
+    }
+    ready_completions_.clear();
+    pending_requests_.clear();
 #endif
 }
 

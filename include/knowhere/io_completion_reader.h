@@ -4,13 +4,15 @@
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <optional>
 #include <span>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "knowhere/io_context_pool.h"
 
-// Worker-local single-threaded reader; not thread-safe.
+// Worker-local, single-threaded completion reader. Not thread-safe.
 class IOCompletionReader {
  public:
     using RequestId = uint64_t;
@@ -28,7 +30,7 @@ class IOCompletionReader {
 
     IOCompletionReader(IOCompletionReader&& other) noexcept;
     IOCompletionReader&
-    operator=(IOCompletionReader&& other) noexcept;
+    operator=(IOCompletionReader&& other);
 
     ~IOCompletionReader();
 
@@ -51,8 +53,11 @@ class IOCompletionReader {
         bool ok = true;
     };
 
-    void
+    std::optional<std::string>
     ProcessCqe(struct io_uring_cqe* cqe);
+
+    void
+    DrainOutstandingNoThrow() noexcept;
 
     void
     DrainOutstanding();
