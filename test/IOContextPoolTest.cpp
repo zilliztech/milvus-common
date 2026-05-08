@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <future>
@@ -19,6 +20,7 @@
 #include "knowhere/io_completion_reader.h"
 #include "knowhere/io_context_pool.h"
 #include "knowhere/io_reader.h"
+#include "../src/knowhere/io_reader_internal.h"
 #ifdef MILVUS_COMMON_WITH_LIBAIO
 #include "knowhere/aio_context_pool.h"
 #endif
@@ -210,6 +212,17 @@ TEST_F(IOContextPoolTestFixture, IoReaderSpanShouldUseCompatSpanType) {
 #endif
 }
 
+TEST_F(IOContextPoolTestFixture, InterruptedSyscallRetryShouldHaveBound) {
+    size_t retry = 0;
+
+    EXPECT_TRUE(knowhere_internal::ShouldRetryInterruptedSyscall(retry, 2));
+    EXPECT_EQ(retry, 1u);
+    EXPECT_TRUE(knowhere_internal::ShouldRetryInterruptedSyscall(retry, 2));
+    EXPECT_EQ(retry, 2u);
+    EXPECT_FALSE(knowhere_internal::ShouldRetryInterruptedSyscall(retry, 2));
+    EXPECT_EQ(retry, 3u);
+}
+
 #ifdef MILVUS_COMMON_WITH_LIBAIO
 TEST_F(IOContextPoolTestFixture, LegacyAioInitStillWorksViaUnifiedPath) {
 #ifdef WITH_IO_URING
@@ -288,6 +301,33 @@ TEST_F(IOContextPoolTestFixture, LegacyUringInitShouldHonorRequestedConfig) {
     ASSERT_NE(io_pool, nullptr);
     ASSERT_EQ(io_pool->Backend(), IOBackend::IO_URING);
     ASSERT_EQ(io_pool->MaxEventsPerCtx(), 64u);
+}
+
+TEST_F(IOContextPoolTestFixture, LegacyUringDirectDefaultShouldProvideMultipleContexts) {
+    auto pool = UringContextPool::GetGlobalUringPoolDirect();
+    ASSERT_NE(pool, nullptr);
+    if (!pool->IsUsable()) {
+        GTEST_SKIP() << "io_uring backend unavailable";
+    }
+
+    auto* first = pool->pop();
+    ASSERT_NE(first, nullptr);
+
+    auto second_future = std::async(std::launch::async, [&] { return pool->pop(); });
+    if (second_future.wait_for(std::chrono::milliseconds(100)) != std::future_status::ready) {
+        pool->push(first);
+        first = nullptr;
+        auto* second = second_future.get();
+        if (second != nullptr) {
+            pool->push(second);
+        }
+        FAIL() << "direct uring default should expose more than one context";
+    }
+
+    auto* second = second_future.get();
+    ASSERT_NE(second, nullptr);
+    pool->push(second);
+    pool->push(first);
 }
 #endif
 

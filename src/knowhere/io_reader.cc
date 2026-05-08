@@ -1,5 +1,7 @@
 #include "knowhere/io_reader.h"
 
+#include "io_reader_internal.h"
+
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
@@ -79,6 +81,9 @@ SubmitAioBatch(io_context_t ctx, int fd, const std::vector<std::byte*>& buffers,
             io_submit(ctx, static_cast<long>(batch - submitted_total), cb_ptrs.data() + submitted_total);
         if (submitted < 0) {
             if (-submitted == EINTR) {
+                if (!knowhere_internal::ShouldRetryInterruptedSyscall(retry, kNumRetries)) {
+                    break;
+                }
                 continue;
             }
             break;
@@ -112,6 +117,9 @@ WaitAioBatch(io_context_t ctx, size_t size, size_t submitted_total) {
                                             events.data() + result.completed, nullptr);
         if (completed < 0) {
             if (-completed == EINTR) {
+                if (!knowhere_internal::ShouldRetryInterruptedSyscall(retry, kNumRetries)) {
+                    break;
+                }
                 continue;
             }
             break;
@@ -255,11 +263,15 @@ BatchWaitResult
 WaitUringBatch(io_uring* ring, size_t size, size_t submitted_total) {
     BatchWaitResult result;
     result.ok = true;
+    size_t retry = 0;
     while (result.completed < submitted_total) {
         io_uring_cqe* cqe = nullptr;
         const auto wait_result = io_uring_wait_cqe(ring, &cqe);
         if (wait_result < 0) {
             if (-wait_result == EINTR) {
+                if (!knowhere_internal::ShouldRetryInterruptedSyscall(retry, kNumRetries)) {
+                    break;
+                }
                 continue;
             }
             break;

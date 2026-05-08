@@ -74,8 +74,9 @@ std::shared_ptr<UringContextPool>
 UringContextPool::GetGlobalUringPoolDirect() {
     std::scoped_lock lk(global_uring_pool_mut);
     if (global_uring_pool_size == 0) {
-        global_uring_pool_size = 1;
-        global_uring_max_entries = default_uring_max_entries;
+        IOContextPoolConfig cfg;
+        global_uring_pool_size = cfg.num_ctx;
+        global_uring_max_entries = cfg.max_events;
         LOG_WARN("Global UringContextPool has not been initialized yet, init it now with context num: %zu",
                  global_uring_pool_size);
     }
