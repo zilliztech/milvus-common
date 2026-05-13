@@ -81,6 +81,9 @@ class UringContextPool {
         return ret;
     }
 
+    bool
+    ResetCheckedOut(struct io_uring* ring);
+
     static bool
     InitGlobalUringPool(size_t num_ctx, size_t max_entries);
 

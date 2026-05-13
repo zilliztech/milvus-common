@@ -163,7 +163,12 @@ target_link_libraries(milvus-common PUBLIC OpenMP::OpenMP_CXX)
 # thread_pool.cc uses openblas-specific API (openblas_set_num_threads) under OPENBLAS_OS_LINUX
 if(NOT APPLE)
     find_package(OpenBLAS CONFIG REQUIRED)
-    target_link_libraries(milvus-common PUBLIC OpenBLAS::OpenBLAS)
+    if(TARGET OpenBLAS::OpenBLAS)
+        target_link_libraries(milvus-common PUBLIC OpenBLAS::OpenBLAS)
+    else()
+        target_include_directories(milvus-common PUBLIC ${OpenBLAS_INCLUDE_DIRS})
+        target_link_libraries(milvus-common PUBLIC ${OpenBLAS_LIBRARIES})
+    endif()
 endif()
 
 if(WITH_COMMON_UT)

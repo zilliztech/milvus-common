@@ -1,10 +1,17 @@
 #include "knowhere/io_completion_reader.h"
 
+#include "io_reader_internal.h"
+
+#include <algorithm>
 #include <cerrno>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
+
+namespace {
+constexpr size_t kNumRetries = 10;
+}
 
 IOCompletionReader::IOCompletionReader(int fd, std::shared_ptr<IOContextPool> io_pool)
     : fd_(fd), io_pool_(std::move(io_pool)) {
@@ -113,19 +120,11 @@ IOCompletionReader::Submit(std::span<std::byte* const> buffers, size_t size, std
         if (sqe == nullptr) {
             const auto flushed = io_uring_submit(handle_.uring);
             if (flushed < 0) {
-                if (state.remaining > 0) {
-                    DrainOutstanding(request_id);
-                } else {
-                    pending_requests_.erase(iter);
-                }
+                CleanupFailedSubmit(request_id, prepared, state.remaining);
                 throw std::runtime_error("io_uring_submit failed while preparing request");
             }
             if (flushed == 0) {
-                if (state.remaining > 0) {
-                    DrainOutstanding(request_id);
-                } else {
-                    pending_requests_.erase(iter);
-                }
+                CleanupFailedSubmit(request_id, prepared, state.remaining);
                 throw std::runtime_error("io_uring_submit made no progress while preparing request");
             }
             state.remaining += static_cast<size_t>(flushed);
@@ -140,19 +139,11 @@ IOCompletionReader::Submit(std::span<std::byte* const> buffers, size_t size, std
     while (state.remaining < prepared) {
         const auto flushed = io_uring_submit(handle_.uring);
         if (flushed < 0) {
-            if (state.remaining > 0) {
-                DrainOutstanding(request_id);
-            } else {
-                pending_requests_.erase(iter);
-            }
+            CleanupFailedSubmit(request_id, prepared, state.remaining);
             throw std::runtime_error("io_uring_submit failed");
         }
         if (flushed == 0) {
-            if (state.remaining > 0) {
-                DrainOutstanding(request_id);
-            } else {
-                pending_requests_.erase(iter);
-            }
+            CleanupFailedSubmit(request_id, prepared, state.remaining);
             throw std::runtime_error("io_uring_submit made no progress");
         }
         state.remaining += static_cast<size_t>(flushed);
@@ -176,11 +167,15 @@ IOCompletionReader::WaitCompleted() {
         return completion;
     }
 
+    size_t retry = 0;
     while (true) {
         io_uring_cqe* cqe = nullptr;
         const auto ret = io_uring_wait_cqe(handle_.uring, &cqe);
         if (ret < 0) {
             if (-ret == EINTR) {
+                if (!knowhere_internal::ShouldRetryInterruptedSyscall(retry, kNumRetries)) {
+                    throw std::runtime_error("io_uring_wait_cqe interrupted too many times");
+                }
                 continue;
             }
             throw std::runtime_error("io_uring_wait_cqe failed");
@@ -212,17 +207,24 @@ IOCompletionReader::PollCompleted() {
     if (!IsReady()) {
         throw std::runtime_error("IOCompletionReader is not ready");
     }
+    size_t retry = 0;
     while (true) {
         io_uring_cqe* cqe = nullptr;
         const auto ret = io_uring_peek_cqe(handle_.uring, &cqe);
-        if (ret == -EAGAIN || cqe == nullptr) {
+        if (ret == -EAGAIN) {
             break;
         }
         if (ret < 0) {
             if (-ret == EINTR) {
+                if (!knowhere_internal::ShouldRetryInterruptedSyscall(retry, kNumRetries)) {
+                    throw std::runtime_error("io_uring_peek_cqe interrupted too many times");
+                }
                 continue;
             }
             throw std::runtime_error("io_uring_peek_cqe failed");
+        }
+        if (cqe == nullptr) {
+            break;
         }
 
         auto error = ProcessCqe(cqe);
@@ -289,12 +291,16 @@ IOCompletionReader::DrainOutstandingNoThrow() noexcept {
         return;
     }
 
+    size_t retry = 0;
     while (!pending_requests_.empty()) {
         try {
             io_uring_cqe* cqe = nullptr;
             const auto ret = io_uring_wait_cqe(handle_.uring, &cqe);
             if (ret < 0) {
                 if (-ret == EINTR) {
+                    if (!knowhere_internal::ShouldRetryInterruptedSyscall(retry, kNumRetries)) {
+                        break;
+                    }
                     continue;
                 }
                 break;
@@ -334,6 +340,51 @@ IOCompletionReader::DrainOutstanding(RequestId request_id) {
         WaitCompleted();
     }
 #endif
+}
+
+void
+IOCompletionReader::CleanupFailedSubmit(RequestId request_id, size_t prepared, size_t submitted) {
+#ifdef WITH_IO_URING
+    if (submitted > 0) {
+        try {
+            DrainOutstanding(request_id);
+        } catch (...) {
+            pending_requests_.erase(request_id);
+        }
+        RemoveReadyCompletion(request_id);
+    } else {
+        pending_requests_.erase(request_id);
+    }
+
+    if (prepared > submitted) {
+        ResetHandleUring();
+    }
+#else
+    (void)request_id;
+    (void)prepared;
+    (void)submitted;
+#endif
+}
+
+void
+IOCompletionReader::RemoveReadyCompletion(RequestId request_id) {
+    auto new_end = std::remove_if(ready_completions_.begin(), ready_completions_.end(),
+                                  [request_id](const auto& completion) { return completion.request_id == request_id; });
+    ready_completions_.erase(new_end, ready_completions_.end());
+}
+
+bool
+IOCompletionReader::ResetHandleUring() {
+#ifdef WITH_IO_URING
+    if (io_pool_ == nullptr || handle_.backend != IOBackend::IO_URING || handle_.uring == nullptr) {
+        return false;
+    }
+    if (io_pool_->ResetUring(handle_.uring)) {
+        return true;
+    }
+    handle_ = IOContextHandle{};
+#endif
+    return false;
 }
 
 void

@@ -2,6 +2,7 @@
 
 #include "knowhere/uring_context_pool.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <thread>
@@ -68,6 +69,41 @@ UringContextPool::InitGlobalUringPoolWithValidation(size_t num_ctx, size_t max_e
 
     LOG_WARN("Global UringContextPool has already been initialized with context num: %zu", global_uring_pool_size);
     return true;
+}
+
+bool
+UringContextPool::ResetCheckedOut(struct io_uring* ring) {
+    if (ring == nullptr) {
+        LOG_WARN("UringContextPool reset gets null ring");
+        return false;
+    }
+
+    std::scoped_lock lk(ring_mtx_);
+    if (owned_rings_.find(ring) == owned_rings_.end()) {
+        LOG_WARN("UringContextPool rejects reset for unknown ring: %p", static_cast<void*>(ring));
+        return false;
+    }
+    if (checked_out_rings_.find(ring) == checked_out_rings_.end()) {
+        LOG_WARN("UringContextPool rejects reset for ring not checked out: %p", static_cast<void*>(ring));
+        return false;
+    }
+
+    io_uring_queue_exit(ring);
+    std::memset(ring, 0, sizeof(io_uring));
+    const auto ret = io_uring_queue_init(static_cast<unsigned>(max_entries_), ring, 0);
+    if (ret == 0) {
+        return true;
+    }
+
+    LOG_ERROR("io_uring_queue_init failed while resetting ring with ret=%d, errno=%d: %s", ret, -ret, ::strerror(-ret));
+    checked_out_rings_.erase(ring);
+    owned_rings_.erase(ring);
+    auto iter = std::find(ring_bak_.begin(), ring_bak_.end(), ring);
+    if (iter != ring_bak_.end()) {
+        ring_bak_.erase(iter);
+    }
+    delete ring;
+    return false;
 }
 
 std::shared_ptr<UringContextPool>
