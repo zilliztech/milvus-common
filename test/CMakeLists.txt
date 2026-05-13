@@ -12,8 +12,7 @@
 add_subdirectory(test_cachinglayer)
 
 find_package(GTest CONFIG REQUIRED)
-find_package(OpenMP REQUIRED)
-find_package(BLAS REQUIRED)
+find_package(Threads REQUIRED)
 
 set(ALL_TEST_FILES
     init_gtest.cpp
@@ -35,10 +34,7 @@ target_link_libraries(all_tests
     GTest::gmock
     milvus-common
     ${COMMON_LINKER_LIBS}
-    pthread
-    atomic
-    gomp
-    openblas
+    Threads::Threads
 )
 
 install(TARGETS all_tests DESTINATION unittest)

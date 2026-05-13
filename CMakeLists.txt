@@ -40,6 +40,7 @@ find_package(gflags REQUIRED)
 find_package(glog REQUIRED)
 find_package(fmt REQUIRED)
 find_package(prometheus-cpp REQUIRED)
+find_package(OpenMP REQUIRED)
 
 list(APPEND COMMON_LINKER_LIBS glog::glog)
 list(APPEND COMMON_LINKER_LIBS prometheus-cpp::core prometheus-cpp::push)
@@ -79,6 +80,14 @@ endif()
 target_link_libraries(milvus-common PUBLIC
     ${COMMON_LINKER_LIBS}
 )
+
+target_link_libraries(milvus-common PUBLIC OpenMP::OpenMP_CXX)
+
+# thread_pool.cc uses openblas-specific API (openblas_set_num_threads) under OPENBLAS_OS_LINUX
+if(NOT APPLE)
+    find_package(OpenBLAS CONFIG REQUIRED)
+    target_link_libraries(milvus-common PUBLIC OpenBLAS::OpenBLAS)
+endif()
 
 if(WITH_COMMON_UT)
     # Enable unit-test-only helpers for caching layer
