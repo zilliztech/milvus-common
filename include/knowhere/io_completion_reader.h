@@ -66,6 +66,15 @@ class IOCompletionReader {
     DrainOutstanding(RequestId request_id);
 
     void
+    CleanupFailedSubmit(RequestId request_id, size_t prepared, size_t submitted);
+
+    void
+    RemoveReadyCompletion(RequestId request_id);
+
+    bool
+    ResetHandleUring();
+
+    void
     ReleaseHandle();
 
     int fd_ = -1;

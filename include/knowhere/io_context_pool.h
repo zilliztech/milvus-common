@@ -87,6 +87,9 @@ class IOContextPool {
     void
     PushUring(struct io_uring* ring);
 
+    bool
+    ResetUring(struct io_uring* ring);
+
     std::shared_ptr<UringContextPool>
     GetUringPoolForLegacy() const;
 #endif

@@ -225,6 +225,11 @@ IOContextPool::PushUring(struct io_uring* ring) {
     }
 }
 
+bool
+IOContextPool::ResetUring(struct io_uring* ring) {
+    return uring_pool_ != nullptr && uring_pool_->ResetCheckedOut(ring);
+}
+
 std::shared_ptr<UringContextPool>
 IOContextPool::GetUringPoolForLegacy() const {
     return uring_pool_;
