@@ -65,17 +65,16 @@ IOContextPool::InitGlobal(const IOContextPoolConfig& cfg) {
     std::scoped_lock lk(g_io_pool_mutex);
     if (g_io_pool != nullptr && g_io_pool->IsInitialized()) {
         if (cfg.max_events != g_io_pool->MaxEventsPerCtx()) {
-            LOG_ERROR("Global IOContextPool already initialized with max_events=%zu, requested=%zu",
+            LOG_ERROR("Global IOContextPool already initialized with max_events={}, requested={}",
                       g_io_pool->MaxEventsPerCtx(), cfg.max_events);
             return false;
         }
         if (cfg.num_ctx != g_io_pool->num_ctx_) {
-            LOG_ERROR("Global IOContextPool already initialized with num_ctx=%zu, requested=%zu", g_io_pool->num_ctx_,
+            LOG_ERROR("Global IOContextPool already initialized with num_ctx={}, requested={}", g_io_pool->num_ctx_,
                       cfg.num_ctx);
             return false;
         }
-        LOG_WARN("Global IOContextPool has already been initialized with backend: %s",
-                 g_io_pool->BackendName().c_str());
+        LOG_WARN("Global IOContextPool has already been initialized with backend: {}", g_io_pool->BackendName());
         return true;
     }
 
@@ -188,7 +187,7 @@ IOContextPool::Pop() {
 void
 IOContextPool::Push(IOContextHandle handle) {
     if (handle.backend != backend_) {
-        LOG_WARN("IOContextPool rejects handle for backend %d while active backend is %d",
+        LOG_WARN("IOContextPool rejects handle for backend {} while active backend is {}",
                  static_cast<int>(handle.backend), static_cast<int>(backend_));
         return;
     }

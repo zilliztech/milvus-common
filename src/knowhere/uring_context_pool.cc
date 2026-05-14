@@ -25,7 +25,7 @@ UringContextPool::UringContextPool(size_t num_ctx, size_t max_entries) : num_ctx
         std::memset(ring, 0, sizeof(io_uring));
         int ret = io_uring_queue_init(static_cast<unsigned>(max_entries_), ring, 0);
         if (ret < 0) {
-            LOG_ERROR("io_uring_queue_init failed with ret=%d, errno=%d: %s", ret, -ret, ::strerror(-ret));
+            LOG_ERROR("io_uring_queue_init failed with ret={}, errno={}: {}", ret, -ret, ::strerror(-ret));
             delete ring;
             continue;
         }
@@ -49,7 +49,7 @@ UringContextPool::InitGlobalUringPoolWithValidation(size_t num_ctx, size_t max_e
     }
 
     if (max_entries == 0 || max_entries > default_uring_max_entries) {
-        LOG_ERROR("max_entries %zu should be in range (0, %zu]", max_entries, default_uring_max_entries);
+        LOG_ERROR("max_entries {} should be in range (0, {}]", max_entries, default_uring_max_entries);
         return false;
     }
 
@@ -62,12 +62,12 @@ UringContextPool::InitGlobalUringPoolWithValidation(size_t num_ctx, size_t max_e
 
     if (global_uring_pool_size != num_ctx || global_uring_max_entries != max_entries) {
         LOG_ERROR(
-            "Global UringContextPool already initialized with context num: %zu, max_entries: %zu (requested %zu, %zu)",
+            "Global UringContextPool already initialized with context num: {}, max_entries: {} (requested {}, {})",
             global_uring_pool_size, global_uring_max_entries, num_ctx, max_entries);
         return false;
     }
 
-    LOG_WARN("Global UringContextPool has already been initialized with context num: %zu", global_uring_pool_size);
+    LOG_WARN("Global UringContextPool has already been initialized with context num: {}", global_uring_pool_size);
     return true;
 }
 
@@ -80,11 +80,11 @@ UringContextPool::ResetCheckedOut(struct io_uring* ring) {
 
     std::scoped_lock lk(ring_mtx_);
     if (owned_rings_.find(ring) == owned_rings_.end()) {
-        LOG_WARN("UringContextPool rejects reset for unknown ring: %p", static_cast<void*>(ring));
+        LOG_WARN("UringContextPool rejects reset for unknown ring: {}", static_cast<void*>(ring));
         return false;
     }
     if (checked_out_rings_.find(ring) == checked_out_rings_.end()) {
-        LOG_WARN("UringContextPool rejects reset for ring not checked out: %p", static_cast<void*>(ring));
+        LOG_WARN("UringContextPool rejects reset for ring not checked out: {}", static_cast<void*>(ring));
         return false;
     }
 
@@ -95,7 +95,7 @@ UringContextPool::ResetCheckedOut(struct io_uring* ring) {
         return true;
     }
 
-    LOG_ERROR("io_uring_queue_init failed while resetting ring with ret=%d, errno=%d: %s", ret, -ret, ::strerror(-ret));
+    LOG_ERROR("io_uring_queue_init failed while resetting ring with ret={}, errno={}: {}", ret, -ret, ::strerror(-ret));
     checked_out_rings_.erase(ring);
     owned_rings_.erase(ring);
     auto iter = std::find(ring_bak_.begin(), ring_bak_.end(), ring);
@@ -113,7 +113,7 @@ UringContextPool::GetGlobalUringPoolDirect() {
         IOContextPoolConfig cfg;
         global_uring_pool_size = cfg.num_ctx;
         global_uring_max_entries = cfg.max_events;
-        LOG_WARN("Global UringContextPool has not been initialized yet, init it now with context num: %zu",
+        LOG_WARN("Global UringContextPool has not been initialized yet, init it now with context num: {}",
                  global_uring_pool_size);
     }
 
@@ -139,8 +139,7 @@ UringContextPool::InitGlobalUringPool(size_t num_ctx, size_t max_entries) {
         return false;
     }
     if (io_pool->Backend() != IOBackend::IO_URING) {
-        LOG_ERROR("Global IOContextPool backend is %s, legacy io_uring API is unavailable",
-                  io_pool->BackendName().c_str());
+        LOG_ERROR("Global IOContextPool backend is {}, legacy io_uring API is unavailable", io_pool->BackendName());
         return false;
     }
     return true;
@@ -181,8 +180,7 @@ UringContextPool::~UringContextPool() {
             }
 
             if (retry == 99) {
-                LOG_WARN("UringContextPool shutdown with %zu checked-out rings still not returned",
-                         checked_out_rings_.size());
+                LOG_WARN("UringContextPool shutdown with {} checked-out rings still not returned", checked_out_rings_.size());
             }
         }
 
