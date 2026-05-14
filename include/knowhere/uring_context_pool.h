@@ -53,12 +53,12 @@ class UringContextPool {
             }
 
             if (owned_rings_.find(ring) == owned_rings_.end()) {
-                LOG_WARN("UringContextPool rejects unknown ring: %p", static_cast<void*>(ring));
+                LOG_WARN("UringContextPool rejects unknown ring: {}", static_cast<void*>(ring));
                 return;
             }
 
             if (checked_out_rings_.erase(ring) == 0) {
-                LOG_WARN("UringContextPool rejects ring not checked out: %p", static_cast<void*>(ring));
+                LOG_WARN("UringContextPool rejects ring not checked out: {}", static_cast<void*>(ring));
                 return;
             }
 

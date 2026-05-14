@@ -22,7 +22,7 @@ class IOCompletionReader {
         bool ok = false;
     };
 
-    IOCompletionReader(int fd, std::shared_ptr<IOContextPool> io_pool = IOContextPool::GetGlobal());
+    IOCompletionReader(int fd, std::shared_ptr<IOContextPool> io_pool);
 
     IOCompletionReader(const IOCompletionReader&) = delete;
     IOCompletionReader&

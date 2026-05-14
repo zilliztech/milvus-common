@@ -58,7 +58,7 @@ IOCompletionReader::operator=(IOCompletionReader&& other) {
         return *this;
     }
 
-    DrainOutstanding();
+    DrainOutstandingNoThrow();
     ReleaseHandle();
 
     fd_ = other.fd_;
@@ -165,6 +165,9 @@ IOCompletionReader::WaitCompleted() {
         auto completion = ready_completions_.front();
         ready_completions_.pop_front();
         return completion;
+    }
+    if (pending_requests_.empty()) {
+        throw std::runtime_error("IOCompletionReader has no pending requests");
     }
 
     size_t retry = 0;
@@ -291,6 +294,7 @@ IOCompletionReader::DrainOutstandingNoThrow() noexcept {
         return;
     }
 
+    bool drained = true;
     size_t retry = 0;
     while (!pending_requests_.empty()) {
         try {
@@ -299,10 +303,12 @@ IOCompletionReader::DrainOutstandingNoThrow() noexcept {
             if (ret < 0) {
                 if (-ret == EINTR) {
                     if (!knowhere_internal::ShouldRetryInterruptedSyscall(retry, kNumRetries)) {
+                        drained = false;
                         break;
                     }
                     continue;
                 }
+                drained = false;
                 break;
             }
             if (cqe == nullptr) {
@@ -312,14 +318,19 @@ IOCompletionReader::DrainOutstandingNoThrow() noexcept {
             auto error = ProcessCqe(cqe);
             io_uring_cqe_seen(handle_.uring, cqe);
             if (error) {
+                drained = false;
                 break;
             }
         } catch (...) {
+            drained = false;
             break;
         }
     }
     ready_completions_.clear();
     pending_requests_.clear();
+    if (!drained) {
+        ResetHandleUring();
+    }
 #endif
 }
 
@@ -345,19 +356,24 @@ IOCompletionReader::DrainOutstanding(RequestId request_id) {
 void
 IOCompletionReader::CleanupFailedSubmit(RequestId request_id, size_t prepared, size_t submitted) {
 #ifdef WITH_IO_URING
+    if (prepared > submitted) {
+        ready_completions_.clear();
+        pending_requests_.clear();
+        ResetHandleUring();
+        return;
+    }
+
     if (submitted > 0) {
         try {
             DrainOutstanding(request_id);
+            RemoveReadyCompletion(request_id);
         } catch (...) {
-            pending_requests_.erase(request_id);
+            ready_completions_.clear();
+            pending_requests_.clear();
+            ResetHandleUring();
         }
-        RemoveReadyCompletion(request_id);
     } else {
         pending_requests_.erase(request_id);
-    }
-
-    if (prepared > submitted) {
-        ResetHandleUring();
     }
 #else
     (void)request_id;
@@ -377,12 +393,16 @@ bool
 IOCompletionReader::ResetHandleUring() {
 #ifdef WITH_IO_URING
     if (io_pool_ == nullptr || handle_.backend != IOBackend::IO_URING || handle_.uring == nullptr) {
+        handle_ = IOContextHandle{};
         return false;
     }
-    if (io_pool_->ResetUring(handle_.uring)) {
+
+    auto handle = handle_;
+    handle_ = IOContextHandle{};
+    if (io_pool_->ResetUring(handle.uring)) {
+        io_pool_->Push(handle);
         return true;
     }
-    handle_ = IOContextHandle{};
 #endif
     return false;
 }

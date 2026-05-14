@@ -107,13 +107,13 @@ class AioContextPool {
             int ret = -1;
             for (int retry = 0; (ret = io_setup(max_events, &ctx)) != 0 && retry < 5; ++retry) {
                 if (-ret != EAGAIN) {
-                    LOG_ERROR("Unknown error occur in io_setup, errno: %d, %s", -ret, ::strerror(-ret));
+                    LOG_ERROR("Unknown error occur in io_setup, errno: {}, {}", -ret, ::strerror(-ret));
                 }
             }
             if (ret != 0) {
-                LOG_ERROR("io_setup() failed; returned %d, errno=%d: %s", ret, -ret, ::strerror(-ret));
+                LOG_ERROR("io_setup() failed; returned {}, errno={}: {}", ret, -ret, ::strerror(-ret));
             } else {
-                LOG_DEBUG("allocating ctx: %p", (void*)ctx);
+                LOG_DEBUG("allocating ctx: {}", static_cast<void*>(ctx));
                 ctx_q_.push(ctx);
                 ctx_bak_.push_back(ctx);
             }
