@@ -20,6 +20,7 @@
 #include "knowhere/io_completion_reader.h"
 #include "knowhere/io_context_pool.h"
 #include "knowhere/io_reader.h"
+#include "syncpoint/sync_point.h"
 #include "../src/knowhere/io_reader_internal.h"
 #ifdef MILVUS_COMMON_WITH_LIBAIO
 #include "knowhere/aio_context_pool.h"
@@ -537,4 +538,109 @@ TEST_F(IOContextPoolTestFixture, CompletionReaderReturnsSubmittedRequestIds) {
     ASSERT_EQ(::close(fd), 0);
     ::unlink(path);
 }
+
+TEST_F(IOContextPoolTestFixture, CompletionReaderRejectsBatchLargerThanCapacity) {
+    IOContextPoolConfig cfg;
+    cfg.num_ctx = 1;
+    cfg.max_events = 1;
+    ASSERT_TRUE(IOContextPool::InitGlobal(cfg));
+
+    auto pool = IOContextPool::GetGlobal();
+    ASSERT_NE(pool, nullptr);
+    ASSERT_EQ(pool->Backend(), IOBackend::IO_URING);
+
+    char path[] = "/tmp/io_completion_reader_capacity_XXXXXX";
+    int fd = OpenIOReaderTestFile(path, false);
+    ASSERT_GE(fd, 0);
+
+    auto first = AllocateAlignedBuffer(kIOReaderTestBlockSize);
+    auto second = AllocateAlignedBuffer(kIOReaderTestBlockSize);
+    ASSERT_NE(first, nullptr);
+    ASSERT_NE(second, nullptr);
+
+    IOCompletionReader reader(fd, pool);
+    std::array<std::byte*, 2> buffers{first.get(), second.get()};
+    std::array<size_t, 2> offsets{0, kIOReaderTestBlockSize};
+
+    EXPECT_THROW(reader.Submit(std::span<std::byte* const>(buffers.data(), buffers.size()), kIOReaderTestBlockSize,
+                               std::span<const size_t>(offsets.data(), offsets.size())),
+                 std::invalid_argument);
+
+    ASSERT_EQ(::close(fd), 0);
+    ::unlink(path);
+}
+
+#ifdef ENABLE_SYNCPOINT
+TEST_F(IOContextPoolTestFixture, CompletionReaderSubmitFailureKeepsExistingRequestObservable) {
+    IOContextPoolConfig cfg;
+    cfg.num_ctx = 1;
+    cfg.max_events = 8;
+    ASSERT_TRUE(IOContextPool::InitGlobal(cfg));
+
+    auto pool = IOContextPool::GetGlobal();
+    ASSERT_NE(pool, nullptr);
+    ASSERT_EQ(pool->Backend(), IOBackend::IO_URING);
+
+    char path[] = "/tmp/io_completion_reader_submit_failure_XXXXXX";
+    int fd = OpenIOReaderTestFile(path, false);
+    ASSERT_GE(fd, 0);
+
+    constexpr size_t kTotalSize = kIOReaderTestBlockSize * 2;
+    auto content = AllocateAlignedBuffer(kTotalSize);
+    auto first = AllocateAlignedBuffer(kIOReaderTestBlockSize);
+    auto second = AllocateAlignedBuffer(kIOReaderTestBlockSize);
+    ASSERT_NE(content, nullptr);
+    ASSERT_NE(first, nullptr);
+    ASSERT_NE(second, nullptr);
+
+    std::fill(content.get(), content.get() + kIOReaderTestBlockSize, std::byte{0x6});
+    std::fill(content.get() + kIOReaderTestBlockSize, content.get() + kTotalSize, std::byte{0x7});
+
+    ASSERT_EQ(::pwrite(fd, content.get(), kTotalSize, 0), static_cast<ssize_t>(kTotalSize));
+    ASSERT_EQ(::fsync(fd), 0);
+
+    IOCompletionReader reader(fd, pool);
+    std::array<std::byte*, 1> first_buffers{first.get()};
+    std::array<size_t, 1> first_offsets{0};
+    const auto request_1 = reader.Submit(std::span<std::byte* const>(first_buffers.data(), first_buffers.size()),
+                                         kIOReaderTestBlockSize,
+                                         std::span<const size_t>(first_offsets.data(), first_offsets.size()));
+
+    auto* sync_point = milvus::SyncPoint::GetInstance();
+    sync_point->ClearAllCallBacks();
+    sync_point->ClearTrace();
+    int forced_submits = 0;
+    int skipped_polls = 0;
+    sync_point->SetCallBack("IOCompletionReader::ProcessAvailableCompletions:Skip", [&](void* arg) {
+        if (skipped_polls++ == 0) {
+            *static_cast<bool*>(arg) = true;
+        }
+    });
+    sync_point->SetCallBack("IOCompletionReader::SubmitRing:Before", [&](void* arg) {
+        if (forced_submits++ == 0) {
+            *static_cast<int*>(arg) = -EIO;
+        }
+    });
+    sync_point->EnableProcessing();
+
+    std::array<std::byte*, 1> second_buffers{second.get()};
+    std::array<size_t, 1> second_offsets{kIOReaderTestBlockSize};
+    EXPECT_THROW(reader.Submit(std::span<std::byte* const>(second_buffers.data(), second_buffers.size()),
+                               kIOReaderTestBlockSize,
+                               std::span<const size_t>(second_offsets.data(), second_offsets.size())),
+                 std::runtime_error);
+
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+    sync_point->ClearTrace();
+
+    auto completion = reader.WaitCompleted();
+    EXPECT_EQ(completion.request_id, request_1);
+    EXPECT_FALSE(completion.ok);
+    EXPECT_THROW(reader.WaitCompleted(), std::runtime_error);
+
+    ASSERT_EQ(::close(fd), 0);
+    ::unlink(path);
+}
+#endif
 #endif
