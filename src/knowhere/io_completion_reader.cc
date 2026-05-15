@@ -2,6 +2,8 @@
 
 #include "io_reader_internal.h"
 
+#include "syncpoint/sync_point.h"
+
 #include <algorithm>
 #include <cerrno>
 #include <optional>
@@ -11,7 +13,21 @@
 
 namespace {
 constexpr size_t kNumRetries = 10;
+
+#ifdef WITH_IO_URING
+int
+SubmitRing(struct io_uring* ring) {
+#ifdef ENABLE_SYNCPOINT
+    int forced_ret = 0;
+    TEST_SYNC_POINT_CALLBACK("IOCompletionReader::SubmitRing:Before", &forced_ret);
+    if (forced_ret != 0) {
+        return forced_ret;
+    }
+#endif
+    return io_uring_submit(ring);
 }
+#endif
+}  // namespace
 
 IOCompletionReader::IOCompletionReader(int fd, std::shared_ptr<IOContextPool> io_pool)
     : fd_(fd), io_pool_(std::move(io_pool)) {
@@ -105,6 +121,19 @@ IOCompletionReader::Submit(std::span<std::byte* const> buffers, size_t size, std
         }
     }
 
+    const auto max_events = io_pool_->MaxEventsPerCtx();
+    if (max_events == 0) {
+        throw std::runtime_error("IOCompletionReader has no io_uring event capacity");
+    }
+    if (buffers.size() > max_events) {
+        throw std::invalid_argument("buffers should not exceed io_uring event capacity");
+    }
+
+    ProcessAvailableCompletions();
+    if (PendingOperationCount() + buffers.size() > max_events) {
+        throw std::runtime_error("too many outstanding io_uring requests");
+    }
+
     auto request_id = next_request_id_++;
     auto [iter, inserted] = pending_requests_.emplace(request_id, RequestState{});
     if (!inserted) {
@@ -118,7 +147,7 @@ IOCompletionReader::Submit(std::span<std::byte* const> buffers, size_t size, std
     while (prepared < buffers.size()) {
         auto* sqe = io_uring_get_sqe(handle_.uring);
         if (sqe == nullptr) {
-            const auto flushed = io_uring_submit(handle_.uring);
+            const auto flushed = SubmitRing(handle_.uring);
             if (flushed < 0) {
                 CleanupFailedSubmit(request_id, prepared, state.remaining);
                 throw std::runtime_error("io_uring_submit failed while preparing request");
@@ -137,7 +166,7 @@ IOCompletionReader::Submit(std::span<std::byte* const> buffers, size_t size, std
     }
 
     while (state.remaining < prepared) {
-        const auto flushed = io_uring_submit(handle_.uring);
+        const auto flushed = SubmitRing(handle_.uring);
         if (flushed < 0) {
             CleanupFailedSubmit(request_id, prepared, state.remaining);
             throw std::runtime_error("io_uring_submit failed");
@@ -158,47 +187,25 @@ IOCompletionReader::WaitCompleted() {
 #ifndef WITH_IO_URING
     throw std::runtime_error("IOCompletionReader requires io_uring support");
 #else
-    if (!IsReady()) {
-        throw std::runtime_error("IOCompletionReader is not ready");
-    }
     if (!ready_completions_.empty()) {
         auto completion = ready_completions_.front();
         ready_completions_.pop_front();
         return completion;
     }
+    if (!IsReady()) {
+        throw std::runtime_error("IOCompletionReader is not ready");
+    }
     if (pending_requests_.empty()) {
         throw std::runtime_error("IOCompletionReader has no pending requests");
     }
 
-    size_t retry = 0;
-    while (true) {
-        io_uring_cqe* cqe = nullptr;
-        const auto ret = io_uring_wait_cqe(handle_.uring, &cqe);
-        if (ret < 0) {
-            if (-ret == EINTR) {
-                if (!knowhere_internal::ShouldRetryInterruptedSyscall(retry, kNumRetries)) {
-                    throw std::runtime_error("io_uring_wait_cqe interrupted too many times");
-                }
-                continue;
-            }
-            throw std::runtime_error("io_uring_wait_cqe failed");
-        }
-        if (cqe == nullptr) {
-            continue;
-        }
-
-        auto error = ProcessCqe(cqe);
-        io_uring_cqe_seen(handle_.uring, cqe);
-        if (error) {
-            throw std::runtime_error(*error);
-        }
-
-        if (!ready_completions_.empty()) {
-            auto completion = ready_completions_.front();
-            ready_completions_.pop_front();
-            return completion;
-        }
+    while (ready_completions_.empty()) {
+        WaitOneCompletion();
     }
+
+    auto completion = ready_completions_.front();
+    ready_completions_.pop_front();
+    return completion;
 #endif
 }
 
@@ -207,34 +214,10 @@ IOCompletionReader::PollCompleted() {
 #ifndef WITH_IO_URING
     throw std::runtime_error("IOCompletionReader requires io_uring support");
 #else
-    if (!IsReady()) {
+    if (IsReady()) {
+        ProcessAvailableCompletions();
+    } else if (ready_completions_.empty()) {
         throw std::runtime_error("IOCompletionReader is not ready");
-    }
-    size_t retry = 0;
-    while (true) {
-        io_uring_cqe* cqe = nullptr;
-        const auto ret = io_uring_peek_cqe(handle_.uring, &cqe);
-        if (ret == -EAGAIN) {
-            break;
-        }
-        if (ret < 0) {
-            if (-ret == EINTR) {
-                if (!knowhere_internal::ShouldRetryInterruptedSyscall(retry, kNumRetries)) {
-                    throw std::runtime_error("io_uring_peek_cqe interrupted too many times");
-                }
-                continue;
-            }
-            throw std::runtime_error("io_uring_peek_cqe failed");
-        }
-        if (cqe == nullptr) {
-            break;
-        }
-
-        auto error = ProcessCqe(cqe);
-        io_uring_cqe_seen(handle_.uring, cqe);
-        if (error) {
-            throw std::runtime_error(*error);
-        }
     }
 
     std::vector<Completion> completed;
@@ -283,6 +266,87 @@ IOCompletionReader::ProcessCqe(struct io_uring_cqe* cqe) {
     (void)cqe;
     return std::nullopt;
 #endif
+}
+
+void
+IOCompletionReader::WaitOneCompletion() {
+#ifdef WITH_IO_URING
+    size_t retry = 0;
+    while (true) {
+        io_uring_cqe* cqe = nullptr;
+        const auto ret = io_uring_wait_cqe(handle_.uring, &cqe);
+        if (ret < 0) {
+            if (-ret == EINTR) {
+                if (!knowhere_internal::ShouldRetryInterruptedSyscall(retry, kNumRetries)) {
+                    throw std::runtime_error("io_uring_wait_cqe interrupted too many times");
+                }
+                continue;
+            }
+            throw std::runtime_error("io_uring_wait_cqe failed");
+        }
+        if (cqe == nullptr) {
+            continue;
+        }
+
+        auto error = ProcessCqe(cqe);
+        io_uring_cqe_seen(handle_.uring, cqe);
+        if (error) {
+            throw std::runtime_error(*error);
+        }
+        return;
+    }
+#else
+    throw std::runtime_error("IOCompletionReader requires io_uring support");
+#endif
+}
+
+void
+IOCompletionReader::ProcessAvailableCompletions() {
+#ifdef WITH_IO_URING
+#ifdef ENABLE_SYNCPOINT
+    bool skip = false;
+    TEST_SYNC_POINT_CALLBACK("IOCompletionReader::ProcessAvailableCompletions:Skip", &skip);
+    if (skip) {
+        return;
+    }
+#endif
+    size_t retry = 0;
+    while (true) {
+        io_uring_cqe* cqe = nullptr;
+        const auto ret = io_uring_peek_cqe(handle_.uring, &cqe);
+        if (ret == -EAGAIN) {
+            break;
+        }
+        if (ret < 0) {
+            if (-ret == EINTR) {
+                if (!knowhere_internal::ShouldRetryInterruptedSyscall(retry, kNumRetries)) {
+                    throw std::runtime_error("io_uring_peek_cqe interrupted too many times");
+                }
+                continue;
+            }
+            throw std::runtime_error("io_uring_peek_cqe failed");
+        }
+        if (cqe == nullptr) {
+            break;
+        }
+
+        auto error = ProcessCqe(cqe);
+        io_uring_cqe_seen(handle_.uring, cqe);
+        if (error) {
+            throw std::runtime_error(*error);
+        }
+        retry = 0;
+    }
+#endif
+}
+
+size_t
+IOCompletionReader::PendingOperationCount() const {
+    size_t count = 0;
+    for (const auto& pending : pending_requests_) {
+        count += pending.second.remaining;
+    }
+    return count;
 }
 
 void
@@ -348,7 +412,7 @@ void
 IOCompletionReader::DrainOutstanding(RequestId request_id) {
 #ifdef WITH_IO_URING
     while (pending_requests_.find(request_id) != pending_requests_.end()) {
-        WaitCompleted();
+        WaitOneCompletion();
     }
 #endif
 }
@@ -357,8 +421,7 @@ void
 IOCompletionReader::CleanupFailedSubmit(RequestId request_id, size_t prepared, size_t submitted) {
 #ifdef WITH_IO_URING
     if (prepared > submitted) {
-        ready_completions_.clear();
-        pending_requests_.clear();
+        FailPendingRequests(request_id);
         ResetHandleUring();
         return;
     }
@@ -368,8 +431,7 @@ IOCompletionReader::CleanupFailedSubmit(RequestId request_id, size_t prepared, s
             DrainOutstanding(request_id);
             RemoveReadyCompletion(request_id);
         } catch (...) {
-            ready_completions_.clear();
-            pending_requests_.clear();
+            FailPendingRequests(request_id);
             ResetHandleUring();
         }
     } else {
@@ -380,6 +442,17 @@ IOCompletionReader::CleanupFailedSubmit(RequestId request_id, size_t prepared, s
     (void)prepared;
     (void)submitted;
 #endif
+}
+
+void
+IOCompletionReader::FailPendingRequests(RequestId excluded_request_id) {
+    RemoveReadyCompletion(excluded_request_id);
+    for (const auto& pending : pending_requests_) {
+        if (pending.first != excluded_request_id) {
+            ready_completions_.push_back({pending.first, false});
+        }
+    }
+    pending_requests_.clear();
 }
 
 void

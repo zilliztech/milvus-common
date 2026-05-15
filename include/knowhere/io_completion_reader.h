@@ -57,6 +57,15 @@ class IOCompletionReader {
     ProcessCqe(struct io_uring_cqe* cqe);
 
     void
+    WaitOneCompletion();
+
+    void
+    ProcessAvailableCompletions();
+
+    size_t
+    PendingOperationCount() const;
+
+    void
     DrainOutstandingNoThrow() noexcept;
 
     void
@@ -67,6 +76,9 @@ class IOCompletionReader {
 
     void
     CleanupFailedSubmit(RequestId request_id, size_t prepared, size_t submitted);
+
+    void
+    FailPendingRequests(RequestId excluded_request_id);
 
     void
     RemoveReadyCompletion(RequestId request_id);

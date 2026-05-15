@@ -47,7 +47,16 @@ jobs:
           && conan remote add default-conan-local2 https://milvus01.jfrog.io/artifactory/api/conan/default-conan-local2 --force
       - name: Build & Run
         run: |
-          make test BUILD_TYPE=Release CONAN_EXTRA='-o \&:with_ut=True -o \&:with_asan=True -s compiler.version=12 -s compiler.cppstd=20'
+          make conan BUILD_TYPE=Release CONAN_EXTRA='-o \&:with_ut=True -o \&:with_asan=True -s compiler.version=12 -s compiler.cppstd=20'
+          sudo apt update && sudo apt install -y liburing-dev
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE=${{ github.workspace }}/build/conan_toolchain.cmake \
+            -DWITH_COMMON_UT=ON \
+            -DENABLE_SYNCPOINT=ON \
+            -Wno-dev
+          cmake --build build -j$(nproc)
+          . build/conanrun.sh && ctest --test-dir build --output-on-failure
       - name: Save Conan Packages
         uses: actions/cache/save@v4
         with:
