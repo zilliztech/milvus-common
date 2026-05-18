@@ -5,7 +5,6 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
-#include <thread>
 
 #include "knowhere/io_context_pool.h"
 
@@ -177,24 +176,20 @@ UringContextPool::~UringContextPool() {
     }
     ring_cv_.notify_all();
 
-    for (size_t retry = 0; retry < 100; ++retry) {
-        {
-            std::scoped_lock lk(ring_mtx_);
-            if (checked_out_rings_.empty()) {
-                break;
-            }
-
-            if (retry == 99) {
-                LOG_WARN("UringContextPool shutdown with {} checked-out rings still not returned", checked_out_rings_.size());
-            }
-        }
-
-        std::this_thread::yield();
+    std::unordered_set<struct io_uring*> checked_out;
+    {
+        std::scoped_lock lk(ring_mtx_);
+        checked_out = checked_out_rings_;
+    }
+    if (!checked_out.empty()) {
+        LOG_WARN("UringContextPool shutdown with {} checked-out rings still not returned", checked_out.size());
     }
 
     for (auto* ring : ring_bak_) {
-        io_uring_queue_exit(ring);
-        delete ring;
+        if (checked_out.find(ring) == checked_out.end()) {
+            io_uring_queue_exit(ring);
+            delete ring;
+        }
     }
     ring_bak_.clear();
     owned_rings_.clear();

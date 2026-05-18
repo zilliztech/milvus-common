@@ -74,6 +74,9 @@ class IOCompletionReader {
     void
     DrainOutstanding(RequestId request_id);
 
+    bool
+    TryDrainOutstanding(RequestId request_id) noexcept;
+
     void
     CleanupFailedSubmit(RequestId request_id, size_t prepared, size_t submitted);
 

@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <memory>
 #include <string>
+#include <utility>
 
 #ifdef MILVUS_COMMON_WITH_LIBAIO
 #include <libaio.h>
@@ -38,6 +39,33 @@ struct IOContextPoolConfig {
 };
 
 struct IOContextHandle {
+    IOContextHandle() = default;
+    IOContextHandle(const IOContextHandle&) = delete;
+    IOContextHandle&
+    operator=(const IOContextHandle&) = delete;
+
+    IOContextHandle(IOContextHandle&& other) noexcept {
+        *this = std::move(other);
+    }
+
+    IOContextHandle&
+    operator=(IOContextHandle&& other) noexcept {
+        if (this == &other) {
+            return *this;
+        }
+        backend = other.backend;
+#ifdef WITH_IO_URING
+        uring = other.uring;
+        other.uring = nullptr;
+#endif
+#ifdef MILVUS_COMMON_WITH_LIBAIO
+        aio = other.aio;
+        other.aio = nullptr;
+#endif
+        other.backend = IOBackend::UNKNOWN;
+        return *this;
+    }
+
     IOBackend backend = IOBackend::UNKNOWN;
 #ifdef WITH_IO_URING
     struct io_uring* uring = nullptr;
@@ -81,7 +109,10 @@ class IOContextPool {
     Pop();
 
     void
-    Push(IOContextHandle handle);
+    Push(IOContextHandle&& handle);
+
+    void
+    Push(IOContextHandle& handle);
 
 #ifdef WITH_IO_URING
     struct io_uring*
@@ -103,6 +134,9 @@ class IOContextPool {
 
     void
     PushAio(io_context_t ctx);
+
+    bool
+    ResetAio(io_context_t ctx);
 
     std::shared_ptr<AioContextPool>
     GetAioPoolForLegacy() const;

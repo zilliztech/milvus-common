@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <cstring>
 #include <stdexcept>
+#include <unordered_set>
 #include <utility>
 
 #include "log/Log.h"
@@ -21,7 +22,7 @@ MakeReadyFuture(bool value) {
 class IOContextHandleGuard {
  public:
     IOContextHandleGuard(std::shared_ptr<IOContextPool> pool, IOContextHandle handle)
-        : pool_(std::move(pool)), handle_(handle) {
+        : pool_(std::move(pool)), handle_(std::move(handle)) {
     }
 
     IOContextHandleGuard(const IOContextHandleGuard&) = delete;
@@ -29,7 +30,7 @@ class IOContextHandleGuard {
     operator=(const IOContextHandleGuard&) = delete;
 
     IOContextHandleGuard(IOContextHandleGuard&& other) noexcept
-        : pool_(std::move(other.pool_)), handle_(other.handle_), active_(other.active_) {
+        : pool_(std::move(other.pool_)), handle_(std::move(other.handle_)), active_(other.active_) {
         other.active_ = false;
     }
 
@@ -50,14 +51,25 @@ class IOContextHandleGuard {
         }
     }
 
+#ifdef MILVUS_COMMON_WITH_LIBAIO
+    void
+    ResetAio() {
+        if (!active_ || pool_ == nullptr || handle_.backend != IOBackend::AIO || handle_.aio == nullptr) {
+            return;
+        }
+        auto handle = std::move(handle_);
+        active_ = false;
+        pool_->ResetAio(handle.aio);
+    }
+#endif
+
 #ifdef WITH_IO_URING
     void
     ResetUring() {
         if (!active_ || pool_ == nullptr || handle_.backend != IOBackend::IO_URING || handle_.uring == nullptr) {
             return;
         }
-        auto handle = handle_;
-        handle_ = IOContextHandle{};
+        auto handle = std::move(handle_);
         active_ = false;
         if (pool_->ResetUring(handle.uring)) {
             pool_->Push(handle);
@@ -120,9 +132,14 @@ SubmitAioBatch(io_context_t ctx, int fd, const std::vector<std::byte*>& buffers,
 }
 
 BatchWaitResult
-WaitAioBatch(io_context_t ctx, size_t size, size_t submitted_total) {
+WaitAioBatch(io_context_t ctx, size_t size, const std::vector<struct iocb>& cbs, size_t submitted_total) {
     if (submitted_total == 0) {
         return {0, true, true};
+    }
+
+    std::unordered_set<struct iocb*> expected_cbs;
+    for (size_t i = 0; i < submitted_total; ++i) {
+        expected_cbs.insert(const_cast<struct iocb*>(&cbs[i]));
     }
 
     std::vector<struct io_event> events(submitted_total);
@@ -148,7 +165,8 @@ WaitAioBatch(io_context_t ctx, size_t size, size_t submitted_total) {
             continue;
         }
         for (size_t i = result.completed; i < result.completed + static_cast<size_t>(completed); ++i) {
-            if (events[i].res < 0 || static_cast<size_t>(events[i].res) != size) {
+            if (expected_cbs.erase(events[i].obj) == 0 || events[i].res < 0 ||
+                static_cast<size_t>(events[i].res) != size) {
                 result.ok = false;
             }
         }
@@ -164,8 +182,12 @@ WaitAioBatch(io_context_t ctx, size_t size, size_t submitted_total) {
 
 class AioReadState {
  public:
-    AioReadState(IOContextHandleGuard guard, size_t size, size_t first_submitted, std::vector<struct iocb>&& first_cbs)
-        : guard_(std::move(guard)), size_(size), first_remaining_(first_submitted), first_cbs_(std::move(first_cbs)) {
+    AioReadState(IOContextHandleGuard guard, size_t size, size_t first_submitted,
+                 std::vector<struct iocb>&& first_cbs)
+        : guard_(std::move(guard)),
+          size_(size),
+          first_remaining_(first_submitted),
+          first_cbs_(std::move(first_cbs)) {
     }
 
     AioReadState(const AioReadState&) = delete;
@@ -181,7 +203,9 @@ class AioReadState {
     }
 
     ~AioReadState() {
-        CollectFirst();
+        if (first_remaining_ != 0) {
+            ResetContext();
+        }
     }
 
     io_context_t
@@ -194,11 +218,17 @@ class AioReadState {
         if (first_remaining_ == 0) {
             return {0, true, true};
         }
-        auto result = WaitAioBatch(Context(), size_, first_remaining_);
+        auto result = WaitAioBatch(Context(), size_, first_cbs_, first_remaining_);
         first_remaining_ -= result.completed;
         result.complete = first_remaining_ == 0;
         result.ok = result.ok && result.complete;
         return result;
+    }
+
+    void
+    ResetContext() {
+        first_remaining_ = 0;
+        guard_.ResetAio();
     }
 
  private:
@@ -216,7 +246,8 @@ ReadAioAsync(int fd, size_t size, std::vector<std::byte*>&& buffers, std::vector
         return MakeReadyFuture(false);
     }
 
-    IOContextHandleGuard guard(pool, handle);
+    auto ctx = handle.aio;
+    IOContextHandleGuard guard(pool, std::move(handle));
     const size_t max_batch = pool->MaxEventsPerCtx();
     if (max_batch == 0) {
         return MakeReadyFuture(false);
@@ -224,7 +255,7 @@ ReadAioAsync(int fd, size_t size, std::vector<std::byte*>&& buffers, std::vector
 
     const size_t first_batch = std::min(max_batch, buffers.size());
     std::vector<struct iocb> first_cbs;
-    const size_t first_submitted = SubmitAioBatch(handle.aio, fd, buffers, size, offsets, 0, first_batch, first_cbs);
+    const size_t first_submitted = SubmitAioBatch(ctx, fd, buffers, size, offsets, 0, first_batch, first_cbs);
     if (first_submitted == 0) {
         return MakeReadyFuture(false);
     }
@@ -236,6 +267,9 @@ ReadAioAsync(int fd, size_t size, std::vector<std::byte*>&& buffers, std::vector
             auto ctx = state.Context();
             const auto first_result = state.CollectFirst();
             if (!first_result.complete || !first_result.ok || first_submitted != first_batch) {
+                if (!first_result.complete || !first_result.ok) {
+                    state.ResetContext();
+                }
                 return false;
             }
 
@@ -245,11 +279,12 @@ ReadAioAsync(int fd, size_t size, std::vector<std::byte*>&& buffers, std::vector
                 std::vector<struct iocb> cbs;
                 const size_t submitted = SubmitAioBatch(ctx, fd, buffers, size, offsets, processed, batch, cbs);
                 if (submitted != batch) {
-                    WaitAioBatch(ctx, size, submitted);
+                    WaitAioBatch(ctx, size, cbs, submitted);
                     return false;
                 }
-                const auto result = WaitAioBatch(ctx, size, submitted);
+                const auto result = WaitAioBatch(ctx, size, cbs, submitted);
                 if (!result.complete || !result.ok) {
+                    state.ResetContext();
                     return false;
                 }
                 processed += batch;
@@ -289,9 +324,13 @@ PrepareUringBatch(io_uring* ring, int fd, const std::vector<std::byte*>& buffers
 }
 
 BatchWaitResult
-WaitUringBatch(io_uring* ring, size_t size, size_t submitted_total) {
+WaitUringBatch(io_uring* ring, size_t size, size_t submitted_total, size_t start) {
     BatchWaitResult result;
     result.ok = true;
+    std::unordered_set<unsigned long long> expected_ids;
+    for (size_t i = 0; i < submitted_total; ++i) {
+        expected_ids.insert(static_cast<unsigned long long>(start + i));
+    }
     size_t retry = 0;
     while (result.completed < submitted_total) {
         io_uring_cqe* cqe = nullptr;
@@ -308,7 +347,7 @@ WaitUringBatch(io_uring* ring, size_t size, size_t submitted_total) {
         if (cqe == nullptr) {
             break;
         }
-        if (cqe->res < 0 || static_cast<size_t>(cqe->res) != size) {
+        if (expected_ids.erase(cqe->user_data) == 0 || cqe->res < 0 || static_cast<size_t>(cqe->res) != size) {
             result.ok = false;
         }
         io_uring_cqe_seen(ring, cqe);
@@ -330,12 +369,16 @@ class UringReadState {
     operator=(const UringReadState&) = delete;
 
     UringReadState(UringReadState&& other) noexcept
-        : guard_(std::move(other.guard_)), size_(other.size_), first_remaining_(other.first_remaining_) {
+        : guard_(std::move(other.guard_)),
+          size_(other.size_),
+          first_remaining_(other.first_remaining_) {
         other.first_remaining_ = 0;
     }
 
     ~UringReadState() {
-        CollectFirst();
+        if (first_remaining_ != 0) {
+            ResetRing();
+        }
     }
 
     io_uring*
@@ -354,7 +397,7 @@ class UringReadState {
         if (first_remaining_ == 0) {
             return {0, true, true};
         }
-        auto result = WaitUringBatch(Ring(), size_, first_remaining_);
+        auto result = WaitUringBatch(Ring(), size_, first_remaining_, 0);
         first_remaining_ -= result.completed;
         result.complete = first_remaining_ == 0;
         result.ok = result.ok && result.complete;
@@ -375,8 +418,8 @@ ReadUringAsync(int fd, size_t size, std::vector<std::byte*>&& buffers, std::vect
         return MakeReadyFuture(false);
     }
 
-    IOContextHandleGuard guard(pool, handle);
     auto* ring = handle.uring;
+    IOContextHandleGuard guard(pool, std::move(handle));
     const size_t first_batch = PrepareUringBatch(ring, fd, buffers, size, offsets, 0);
     if (first_batch == 0) {
         guard.ResetUring();
@@ -401,6 +444,7 @@ ReadUringAsync(int fd, size_t size, std::vector<std::byte*>&& buffers, std::vect
                 return false;
             }
             if (!first_result.ok) {
+                state.ResetRing();
                 return false;
             }
 
@@ -417,12 +461,13 @@ ReadUringAsync(int fd, size_t size, std::vector<std::byte*>&& buffers, std::vect
                     return false;
                 }
                 const auto submitted_count = static_cast<size_t>(submitted);
-                const auto result = WaitUringBatch(ring, size, submitted_count);
+                const auto result = WaitUringBatch(ring, size, submitted_count, processed);
                 if (!result.complete || submitted_count != batch) {
                     state.ResetRing();
                     return false;
                 }
                 if (!result.ok) {
+                    state.ResetRing();
                     return false;
                 }
                 processed += batch;
@@ -433,10 +478,10 @@ ReadUringAsync(int fd, size_t size, std::vector<std::byte*>&& buffers, std::vect
 #endif
 }  // namespace
 
-IOReader::IOReader() : io_pool_(IOContextPool::GetGlobalOrInit()) {
+IOReader::IOReader() : io_pool_(IOContextPool::GetGlobal()) {
 }
 
-IOReader::IOReader(int fd) : fd_(fd), io_pool_(IOContextPool::GetGlobalOrInit()) {
+IOReader::IOReader(int fd) : fd_(fd), io_pool_(IOContextPool::GetGlobal()) {
 }
 
 IOReader::IOReader(int fd, std::shared_ptr<IOContextPool> io_pool) : fd_(fd), io_pool_(std::move(io_pool)) {
@@ -489,7 +534,7 @@ IOReader::ReadAsync(std::vector<std::byte*>&& buffers, size_t size, std::vector<
         }
     }
 
-    auto pool = io_pool_ ? io_pool_ : IOContextPool::GetGlobalOrInit();
+    auto pool = io_pool_ ? io_pool_ : IOContextPool::GetGlobal();
     if (pool == nullptr || !pool->IsInitialized()) {
         throw std::runtime_error("IOContextPool is not initialized");
     }

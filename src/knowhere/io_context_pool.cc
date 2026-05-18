@@ -1,6 +1,7 @@
 #include "knowhere/io_context_pool.h"
 
 #include <mutex>
+#include <utility>
 
 #include "log/Log.h"
 
@@ -38,7 +39,9 @@ IOContextPool::TryInitAio(const IOContextPoolConfig& cfg, const std::shared_ptr<
     }
 
     auto pool = AioContextPool::GetGlobalAioPoolDirect();
-    if (pool == nullptr) {
+    if (pool == nullptr || !pool->IsUsable()) {
+        LOG_ERROR("Global AioContextPool is unavailable after initialization");
+        AioContextPool::ResetGlobalForTest();
         return false;
     }
 
@@ -190,10 +193,11 @@ IOContextPool::Pop() {
 }
 
 void
-IOContextPool::Push(IOContextHandle handle) {
+IOContextPool::Push(IOContextHandle&& handle) {
     if (handle.backend != backend_) {
         LOG_WARN("IOContextPool rejects handle for backend {} while active backend is {}",
                  static_cast<int>(handle.backend), static_cast<int>(backend_));
+        handle = IOContextHandle{};
         return;
     }
 
@@ -211,6 +215,12 @@ IOContextPool::Push(IOContextHandle handle) {
         default:
             break;
     }
+    handle = IOContextHandle{};
+}
+
+void
+IOContextPool::Push(IOContextHandle& handle) {
+    Push(std::move(handle));
 }
 
 #ifdef WITH_IO_URING
@@ -254,6 +264,11 @@ IOContextPool::PushAio(io_context_t ctx) {
     if (aio_pool_ != nullptr) {
         aio_pool_->push(ctx);
     }
+}
+
+bool
+IOContextPool::ResetAio(io_context_t ctx) {
+    return aio_pool_ != nullptr && aio_pool_->ResetCheckedOut(ctx);
 }
 
 std::shared_ptr<AioContextPool>

@@ -90,7 +90,7 @@ TEST_F(IOContextPoolTestFixture, BackendIsSelectedAtInit) {
 
     auto backend = pool->Backend();
 #ifdef WITH_IO_URING
-    ASSERT_EQ(backend, IOBackend::IO_URING);
+    ASSERT_TRUE(backend == IOBackend::IO_URING || backend == IOBackend::AIO);
 #else
     ASSERT_EQ(backend, IOBackend::AIO);
 #endif
@@ -155,11 +155,15 @@ TEST_F(IOContextPoolTestFixture, ReaderCanBeConstructed) {
     ASSERT_TRUE(IOContextPool::InitGlobal(cfg));
 
     IOReader reader;
-#ifdef WITH_IO_URING
-    ASSERT_EQ(reader.Backend(), IOBackend::IO_URING);
-#else
-    ASSERT_EQ(reader.Backend(), IOBackend::AIO);
-#endif
+    ASSERT_EQ(reader.Backend(), IOContextPool::GetGlobal()->Backend());
+}
+
+TEST_F(IOContextPoolTestFixture, ReaderShouldNotImplicitlyInitializeGlobalPool) {
+    ASSERT_EQ(IOContextPool::GetGlobal(), nullptr);
+
+    IOReader reader;
+    ASSERT_EQ(IOContextPool::GetGlobal(), nullptr);
+    ASSERT_FALSE(reader.IsReady());
 }
 
 TEST_F(IOContextPoolTestFixture, UnifiedPopPushShouldUseSelectedBackend) {
@@ -174,8 +178,10 @@ TEST_F(IOContextPoolTestFixture, UnifiedPopPushShouldUseSelectedBackend) {
     auto handle = pool->Pop();
     ASSERT_EQ(handle.backend, pool->Backend());
 #ifdef WITH_IO_URING
-    ASSERT_EQ(handle.backend, IOBackend::IO_URING);
-    ASSERT_NE(handle.uring, nullptr);
+    if (pool->Backend() == IOBackend::IO_URING) {
+        ASSERT_EQ(handle.backend, IOBackend::IO_URING);
+        ASSERT_NE(handle.uring, nullptr);
+    }
 #endif
 #if !defined(WITH_IO_URING) && defined(MILVUS_COMMON_WITH_LIBAIO)
     ASSERT_EQ(handle.backend, IOBackend::AIO);
@@ -200,7 +206,7 @@ TEST_F(IOContextPoolTestFixture, PushShouldRejectHandleFromDifferentBackend) {
     auto handle = pool->Pop();
     ASSERT_EQ(handle.backend, pool->Backend());
 
-    IOContextHandle mismatched = handle;
+    IOContextHandle mismatched;
     mismatched.backend = handle.backend == IOBackend::AIO ? IOBackend::IO_URING : IOBackend::AIO;
     pool->Push(mismatched);
     pool->Push(handle);
@@ -274,6 +280,29 @@ TEST_F(IOContextPoolTestFixture, LegacyAioPopShouldReturnNullAfterShutdown) {
     ASSERT_EQ(blocked.wait_for(std::chrono::seconds(1)), std::future_status::ready);
     ASSERT_EQ(blocked.get(), nullptr);
 }
+
+TEST_F(IOContextPoolTestFixture, LegacyAioPoolShouldRejectDoublePush) {
+    ASSERT_TRUE(AioContextPool::InitGlobalAioPoolWithValidation(1, 128));
+    auto pool = AioContextPool::GetGlobalAioPoolDirect();
+    ASSERT_NE(pool, nullptr);
+
+    auto first = pool->pop();
+    ASSERT_NE(first, nullptr);
+    pool->push(first);
+    pool->push(first);
+
+    auto checked_out = pool->pop();
+    ASSERT_EQ(checked_out, first);
+
+    auto blocked = std::async(std::launch::async, [&]() { return pool->pop(); });
+    ASSERT_EQ(blocked.wait_for(std::chrono::milliseconds(50)), std::future_status::timeout);
+
+    pool->push(checked_out);
+    ASSERT_EQ(blocked.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    auto second = blocked.get();
+    ASSERT_EQ(second, first);
+    pool->push(second);
+}
 #endif
 
 #ifdef WITH_IO_URING
@@ -300,7 +329,9 @@ TEST_F(IOContextPoolTestFixture, LegacyUringValidationReinitMismatchShouldFail) 
 }
 
 TEST_F(IOContextPoolTestFixture, LegacyUringInitShouldHonorRequestedConfig) {
-    ASSERT_TRUE(UringContextPool::InitGlobalUringPool(1, 64));
+    if (!UringContextPool::InitGlobalUringPool(1, 64)) {
+        GTEST_SKIP() << "io_uring backend unavailable";
+    }
 
     auto io_pool = IOContextPool::GetGlobal();
     ASSERT_NE(io_pool, nullptr);
@@ -476,6 +507,50 @@ TEST_F(IOContextPoolTestFixture, ReadAsyncShouldReadMultipleBatches) {
     ::unlink(path);
 }
 
+TEST_F(IOContextPoolTestFixture, ReadAsyncShouldReturnFalseOnShortRead) {
+    IOContextPoolConfig cfg;
+    cfg.num_ctx = 1;
+    cfg.max_events = 128;
+    ASSERT_TRUE(IOContextPool::InitGlobal(cfg));
+
+    auto pool = IOContextPool::GetGlobal();
+    ASSERT_NE(pool, nullptr);
+    const bool needs_direct_io = pool->Backend() == IOBackend::AIO;
+
+    char path[] = "/tmp/io_reader_short_read_XXXXXX";
+    int fd = OpenIOReaderTestFile(path, needs_direct_io);
+    if (fd < 0 && needs_direct_io) {
+        ::unlink(path);
+        GTEST_SKIP() << "direct I/O is not available for AIO ReadAsync test";
+    }
+    ASSERT_GE(fd, 0);
+
+    auto content = AllocateAlignedBuffer(kIOReaderTestBlockSize);
+    auto buffer = AllocateAlignedBuffer(kIOReaderTestBlockSize);
+    ASSERT_NE(content, nullptr);
+    ASSERT_NE(buffer, nullptr);
+    std::fill(content.get(), content.get() + kIOReaderTestBlockSize, std::byte{0xa});
+
+    const auto written = ::pwrite(fd, content.get(), kIOReaderTestBlockSize, 0);
+    if (written < 0 && needs_direct_io && errno == EINVAL) {
+        ::close(fd);
+        ::unlink(path);
+        GTEST_SKIP() << "filesystem does not support direct I/O";
+    }
+    ASSERT_EQ(written, static_cast<ssize_t>(kIOReaderTestBlockSize));
+    ASSERT_EQ(::fsync(fd), 0);
+
+    IOReader reader(fd, pool);
+    std::vector<std::byte*> buffers{buffer.get()};
+    std::vector<size_t> offsets{kIOReaderTestBlockSize};
+
+    auto fut = reader.ReadAsync(std::move(buffers), kIOReaderTestBlockSize, std::move(offsets));
+    ASSERT_FALSE(fut.get());
+
+    ::close(fd);
+    ::unlink(path);
+}
+
 #if defined(WITH_IO_URING) && defined(ENABLE_SYNCPOINT)
 TEST_F(IOContextPoolTestFixture, ReadAsyncSubmitFailureShouldResetUringHandle) {
     IOContextPoolConfig cfg;
@@ -485,7 +560,9 @@ TEST_F(IOContextPoolTestFixture, ReadAsyncSubmitFailureShouldResetUringHandle) {
 
     auto pool = IOContextPool::GetGlobal();
     ASSERT_NE(pool, nullptr);
-    ASSERT_EQ(pool->Backend(), IOBackend::IO_URING);
+    if (pool->Backend() != IOBackend::IO_URING) {
+        GTEST_SKIP() << "io_uring backend unavailable";
+    }
 
     char path[] = "/tmp/io_reader_submit_failure_XXXXXX";
     int fd = OpenIOReaderTestFile(path, false);
@@ -536,6 +613,69 @@ TEST_F(IOContextPoolTestFixture, ReadAsyncSubmitFailureShouldResetUringHandle) {
     ::close(fd);
     ::unlink(path);
 }
+
+TEST_F(IOContextPoolTestFixture, DroppedReadAsyncFutureShouldResetPartialUringSubmit) {
+    IOContextPoolConfig cfg;
+    cfg.num_ctx = 1;
+    cfg.max_events = 128;
+    ASSERT_TRUE(IOContextPool::InitGlobal(cfg));
+
+    auto pool = IOContextPool::GetGlobal();
+    ASSERT_NE(pool, nullptr);
+    if (pool->Backend() != IOBackend::IO_URING) {
+        GTEST_SKIP() << "io_uring backend unavailable";
+    }
+
+    char path[] = "/tmp/io_reader_dropped_future_XXXXXX";
+    int fd = OpenIOReaderTestFile(path, false);
+    ASSERT_GE(fd, 0);
+
+    constexpr size_t kTotalSize = kIOReaderTestBlockSize * 2;
+    auto content = AllocateAlignedBuffer(kTotalSize);
+    auto first = AllocateAlignedBuffer(kIOReaderTestBlockSize);
+    auto second = AllocateAlignedBuffer(kIOReaderTestBlockSize);
+    auto retry = AllocateAlignedBuffer(kIOReaderTestBlockSize);
+    ASSERT_NE(content, nullptr);
+    ASSERT_NE(first, nullptr);
+    ASSERT_NE(second, nullptr);
+    ASSERT_NE(retry, nullptr);
+
+    std::fill(content.get(), content.get() + kIOReaderTestBlockSize, std::byte{0xb});
+    std::fill(content.get() + kIOReaderTestBlockSize, content.get() + kTotalSize, std::byte{0xc});
+    ASSERT_EQ(::pwrite(fd, content.get(), kTotalSize, 0), static_cast<ssize_t>(kTotalSize));
+    ASSERT_EQ(::fsync(fd), 0);
+
+    auto* sync_point = milvus::SyncPoint::GetInstance();
+    sync_point->ClearAllCallBacks();
+    sync_point->ClearTrace();
+    int submit_calls = 0;
+    sync_point->SetCallBack("IOReader::SubmitUring:Before", [&](void* arg) {
+        if (submit_calls++ == 0) {
+            *static_cast<int*>(arg) = 1;
+        }
+    });
+    sync_point->EnableProcessing();
+
+    auto reader = IOReader(fd, pool);
+    {
+        std::vector<std::byte*> buffers{first.get(), second.get()};
+        std::vector<size_t> offsets{0, kIOReaderTestBlockSize};
+        auto dropped = reader.ReadAsync(std::move(buffers), kIOReaderTestBlockSize, std::move(offsets));
+    }
+
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+    sync_point->ClearTrace();
+
+    std::vector<std::byte*> retry_buffers{retry.get()};
+    std::vector<size_t> retry_offsets{0};
+    auto retried = reader.ReadAsync(std::move(retry_buffers), kIOReaderTestBlockSize, std::move(retry_offsets));
+    ASSERT_TRUE(retried.get());
+    ASSERT_EQ(std::memcmp(retry.get(), content.get(), kIOReaderTestBlockSize), 0);
+
+    ::close(fd);
+    ::unlink(path);
+}
 #endif
 
 #ifdef WITH_IO_URING
@@ -547,7 +687,9 @@ TEST_F(IOContextPoolTestFixture, CompletionReaderReturnsSubmittedRequestIds) {
 
     auto pool = IOContextPool::GetGlobal();
     ASSERT_NE(pool, nullptr);
-    ASSERT_EQ(pool->Backend(), IOBackend::IO_URING);
+    if (pool->Backend() != IOBackend::IO_URING) {
+        GTEST_SKIP() << "io_uring backend unavailable";
+    }
 
     char path[] = "/tmp/io_completion_reader_XXXXXX";
     int fd = OpenIOReaderTestFile(path, false);
@@ -605,6 +747,54 @@ TEST_F(IOContextPoolTestFixture, CompletionReaderReturnsSubmittedRequestIds) {
     ::unlink(path);
 }
 
+TEST_F(IOContextPoolTestFixture, CompletionReaderWaitsForAllBuffersInRequest) {
+    IOContextPoolConfig cfg;
+    cfg.num_ctx = 1;
+    cfg.max_events = 8;
+    ASSERT_TRUE(IOContextPool::InitGlobal(cfg));
+
+    auto pool = IOContextPool::GetGlobal();
+    ASSERT_NE(pool, nullptr);
+    if (pool->Backend() != IOBackend::IO_URING) {
+        GTEST_SKIP() << "io_uring backend unavailable";
+    }
+
+    char path[] = "/tmp/io_completion_reader_multi_buffer_XXXXXX";
+    int fd = OpenIOReaderTestFile(path, false);
+    ASSERT_GE(fd, 0);
+
+    constexpr size_t kTotalSize = kIOReaderTestBlockSize * 2;
+    auto content = AllocateAlignedBuffer(kTotalSize);
+    auto first = AllocateAlignedBuffer(kIOReaderTestBlockSize);
+    auto second = AllocateAlignedBuffer(kIOReaderTestBlockSize);
+    ASSERT_NE(content, nullptr);
+    ASSERT_NE(first, nullptr);
+    ASSERT_NE(second, nullptr);
+
+    std::fill(content.get(), content.get() + kIOReaderTestBlockSize, std::byte{0xd});
+    std::fill(content.get() + kIOReaderTestBlockSize, content.get() + kTotalSize, std::byte{0xe});
+    ASSERT_EQ(::pwrite(fd, content.get(), kTotalSize, 0), static_cast<ssize_t>(kTotalSize));
+    ASSERT_EQ(::fsync(fd), 0);
+
+    IOCompletionReader reader(fd, pool);
+    std::array<std::byte*, 2> buffers{first.get(), second.get()};
+    std::array<size_t, 2> offsets{0, kIOReaderTestBlockSize};
+
+    const auto request = reader.Submit(std::span<std::byte* const>(buffers.data(), buffers.size()),
+                                       kIOReaderTestBlockSize,
+                                       std::span<const size_t>(offsets.data(), offsets.size()));
+    auto completion = reader.WaitCompleted();
+    ASSERT_EQ(completion.request_id, request);
+    ASSERT_TRUE(completion.ok);
+    ASSERT_TRUE(reader.PollCompleted().empty());
+
+    ASSERT_EQ(std::memcmp(first.get(), content.get(), kIOReaderTestBlockSize), 0);
+    ASSERT_EQ(std::memcmp(second.get(), content.get() + kIOReaderTestBlockSize, kIOReaderTestBlockSize), 0);
+
+    ASSERT_EQ(::close(fd), 0);
+    ::unlink(path);
+}
+
 TEST_F(IOContextPoolTestFixture, CompletionReaderRejectsBatchLargerThanCapacity) {
     IOContextPoolConfig cfg;
     cfg.num_ctx = 1;
@@ -613,7 +803,9 @@ TEST_F(IOContextPoolTestFixture, CompletionReaderRejectsBatchLargerThanCapacity)
 
     auto pool = IOContextPool::GetGlobal();
     ASSERT_NE(pool, nullptr);
-    ASSERT_EQ(pool->Backend(), IOBackend::IO_URING);
+    if (pool->Backend() != IOBackend::IO_URING) {
+        GTEST_SKIP() << "io_uring backend unavailable";
+    }
 
     char path[] = "/tmp/io_completion_reader_capacity_XXXXXX";
     int fd = OpenIOReaderTestFile(path, false);
@@ -637,6 +829,66 @@ TEST_F(IOContextPoolTestFixture, CompletionReaderRejectsBatchLargerThanCapacity)
 }
 
 #ifdef ENABLE_SYNCPOINT
+TEST_F(IOContextPoolTestFixture, CompletionReaderRejectsOutstandingRequestsBeyondCapacity) {
+    IOContextPoolConfig cfg;
+    cfg.num_ctx = 1;
+    cfg.max_events = 2;
+    ASSERT_TRUE(IOContextPool::InitGlobal(cfg));
+
+    auto pool = IOContextPool::GetGlobal();
+    ASSERT_NE(pool, nullptr);
+    if (pool->Backend() != IOBackend::IO_URING) {
+        GTEST_SKIP() << "io_uring backend unavailable";
+    }
+
+    char path[] = "/tmp/io_completion_reader_outstanding_capacity_XXXXXX";
+    int fd = OpenIOReaderTestFile(path, false);
+    ASSERT_GE(fd, 0);
+
+    auto content = AllocateAlignedBuffer(kIOReaderTestBlockSize);
+    auto first = AllocateAlignedBuffer(kIOReaderTestBlockSize);
+    auto second = AllocateAlignedBuffer(kIOReaderTestBlockSize);
+    auto third = AllocateAlignedBuffer(kIOReaderTestBlockSize);
+    ASSERT_NE(content, nullptr);
+    ASSERT_NE(first, nullptr);
+    ASSERT_NE(second, nullptr);
+    ASSERT_NE(third, nullptr);
+    std::fill(content.get(), content.get() + kIOReaderTestBlockSize, std::byte{0xf});
+    ASSERT_EQ(::pwrite(fd, content.get(), kIOReaderTestBlockSize, 0), static_cast<ssize_t>(kIOReaderTestBlockSize));
+    ASSERT_EQ(::fsync(fd), 0);
+
+    IOCompletionReader reader(fd, pool);
+
+    auto* sync_point = milvus::SyncPoint::GetInstance();
+    sync_point->ClearAllCallBacks();
+    sync_point->ClearTrace();
+    sync_point->SetCallBack("IOCompletionReader::ProcessAvailableCompletions:Skip", [](void* arg) {
+        *static_cast<bool*>(arg) = true;
+    });
+    sync_point->EnableProcessing();
+
+    std::array<size_t, 1> offsets{0};
+    std::array<std::byte*, 1> first_buffers{first.get()};
+    std::array<std::byte*, 1> second_buffers{second.get()};
+    std::array<std::byte*, 1> third_buffers{third.get()};
+    ASSERT_NE(reader.Submit(std::span<std::byte* const>(first_buffers.data(), first_buffers.size()),
+                            kIOReaderTestBlockSize, std::span<const size_t>(offsets.data(), offsets.size())),
+              0u);
+    ASSERT_NE(reader.Submit(std::span<std::byte* const>(second_buffers.data(), second_buffers.size()),
+                            kIOReaderTestBlockSize, std::span<const size_t>(offsets.data(), offsets.size())),
+              0u);
+    EXPECT_THROW(reader.Submit(std::span<std::byte* const>(third_buffers.data(), third_buffers.size()),
+                               kIOReaderTestBlockSize, std::span<const size_t>(offsets.data(), offsets.size())),
+                 std::runtime_error);
+
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+    sync_point->ClearTrace();
+
+    ASSERT_EQ(::close(fd), 0);
+    ::unlink(path);
+}
+
 TEST_F(IOContextPoolTestFixture, CompletionReaderSubmitFailureKeepsExistingRequestObservable) {
     IOContextPoolConfig cfg;
     cfg.num_ctx = 1;
@@ -645,7 +897,9 @@ TEST_F(IOContextPoolTestFixture, CompletionReaderSubmitFailureKeepsExistingReque
 
     auto pool = IOContextPool::GetGlobal();
     ASSERT_NE(pool, nullptr);
-    ASSERT_EQ(pool->Backend(), IOBackend::IO_URING);
+    if (pool->Backend() != IOBackend::IO_URING) {
+        GTEST_SKIP() << "io_uring backend unavailable";
+    }
 
     char path[] = "/tmp/io_completion_reader_submit_failure_XXXXXX";
     int fd = OpenIOReaderTestFile(path, false);

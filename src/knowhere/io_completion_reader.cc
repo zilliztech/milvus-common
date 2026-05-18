@@ -13,6 +13,7 @@
 
 namespace {
 constexpr size_t kNumRetries = 10;
+constexpr size_t kCleanupPeekLimit = 1024;
 
 #ifdef WITH_IO_URING
 int
@@ -59,7 +60,7 @@ IOCompletionReader::IOCompletionReader(int fd, std::shared_ptr<IOContextPool> io
 IOCompletionReader::IOCompletionReader(IOCompletionReader&& other) noexcept
     : fd_(other.fd_),
       io_pool_(std::move(other.io_pool_)),
-      handle_(other.handle_),
+      handle_(std::move(other.handle_)),
       next_request_id_(other.next_request_id_),
       pending_requests_(std::move(other.pending_requests_)),
       ready_completions_(std::move(other.ready_completions_)) {
@@ -79,7 +80,7 @@ IOCompletionReader::operator=(IOCompletionReader&& other) {
 
     fd_ = other.fd_;
     io_pool_ = std::move(other.io_pool_);
-    handle_ = other.handle_;
+    handle_ = std::move(other.handle_);
     next_request_id_ = other.next_request_id_;
     pending_requests_ = std::move(other.pending_requests_);
     ready_completions_ = std::move(other.ready_completions_);
@@ -360,10 +361,15 @@ IOCompletionReader::DrainOutstandingNoThrow() noexcept {
 
     bool drained = true;
     size_t retry = 0;
-    while (!pending_requests_.empty()) {
+    size_t attempts = 0;
+    while (!pending_requests_.empty() && attempts++ < kCleanupPeekLimit) {
         try {
             io_uring_cqe* cqe = nullptr;
-            const auto ret = io_uring_wait_cqe(handle_.uring, &cqe);
+            const auto ret = io_uring_peek_cqe(handle_.uring, &cqe);
+            if (ret == -EAGAIN) {
+                drained = false;
+                break;
+            }
             if (ret < 0) {
                 if (-ret == EINTR) {
                     if (!knowhere_internal::ShouldRetryInterruptedSyscall(retry, kNumRetries)) {
@@ -376,7 +382,8 @@ IOCompletionReader::DrainOutstandingNoThrow() noexcept {
                 break;
             }
             if (cqe == nullptr) {
-                continue;
+                drained = false;
+                break;
             }
 
             auto error = ProcessCqe(cqe);
@@ -390,6 +397,7 @@ IOCompletionReader::DrainOutstandingNoThrow() noexcept {
             break;
         }
     }
+    drained = drained && pending_requests_.empty();
     ready_completions_.clear();
     pending_requests_.clear();
     if (!drained) {
@@ -417,6 +425,48 @@ IOCompletionReader::DrainOutstanding(RequestId request_id) {
 #endif
 }
 
+bool
+IOCompletionReader::TryDrainOutstanding(RequestId request_id) noexcept {
+#ifdef WITH_IO_URING
+    size_t retry = 0;
+    size_t attempts = 0;
+    while (pending_requests_.find(request_id) != pending_requests_.end() && attempts++ < kCleanupPeekLimit) {
+        try {
+            io_uring_cqe* cqe = nullptr;
+            const auto ret = io_uring_peek_cqe(handle_.uring, &cqe);
+            if (ret == -EAGAIN) {
+                return false;
+            }
+            if (ret < 0) {
+                if (-ret == EINTR) {
+                    if (!knowhere_internal::ShouldRetryInterruptedSyscall(retry, kNumRetries)) {
+                        return false;
+                    }
+                    continue;
+                }
+                return false;
+            }
+            if (cqe == nullptr) {
+                return false;
+            }
+
+            auto error = ProcessCqe(cqe);
+            io_uring_cqe_seen(handle_.uring, cqe);
+            if (error) {
+                return false;
+            }
+            retry = 0;
+        } catch (...) {
+            return false;
+        }
+    }
+    return pending_requests_.find(request_id) == pending_requests_.end();
+#else
+    (void)request_id;
+    return false;
+#endif
+}
+
 void
 IOCompletionReader::CleanupFailedSubmit(RequestId request_id, size_t prepared, size_t submitted) {
 #ifdef WITH_IO_URING
@@ -427,10 +477,9 @@ IOCompletionReader::CleanupFailedSubmit(RequestId request_id, size_t prepared, s
     }
 
     if (submitted > 0) {
-        try {
-            DrainOutstanding(request_id);
+        if (TryDrainOutstanding(request_id)) {
             RemoveReadyCompletion(request_id);
-        } catch (...) {
+        } else {
             FailPendingRequests(request_id);
             ResetHandleUring();
         }
@@ -470,8 +519,7 @@ IOCompletionReader::ResetHandleUring() {
         return false;
     }
 
-    auto handle = handle_;
-    handle_ = IOContextHandle{};
+    auto handle = std::move(handle_);
     if (io_pool_->ResetUring(handle.uring)) {
         io_pool_->Push(handle);
         return true;

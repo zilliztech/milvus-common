@@ -2,11 +2,15 @@
 
 #include <libaio.h>
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <unordered_set>
+#include <vector>
 
 #include "log/Log.h"
 
@@ -31,11 +35,39 @@ class AioContextPool {
         return max_events_;
     }
 
+    size_t
+    created_context_count() const {
+        std::scoped_lock lk(ctx_mtx_);
+        return ctx_bak_.size();
+    }
+
+    bool
+    IsUsable() const {
+        std::scoped_lock lk(ctx_mtx_);
+        return !stop_ && ctx_bak_.size() == num_ctx_ && !ctx_bak_.empty();
+    }
+
     void
     push(io_context_t ctx) {
+        if (ctx == nullptr) {
+            LOG_WARN("AioContextPool push gets null context");
+            return;
+        }
+
         {
             std::scoped_lock lk(ctx_mtx_);
             if (stop_) {
+                checked_out_ctxs_.erase(ctx);
+                return;
+            }
+
+            if (owned_ctxs_.find(ctx) == owned_ctxs_.end()) {
+                LOG_WARN("AioContextPool rejects unknown context: {}", static_cast<void*>(ctx));
+                return;
+            }
+
+            if (checked_out_ctxs_.erase(ctx) == 0) {
+                LOG_WARN("AioContextPool rejects context not checked out: {}", static_cast<void*>(ctx));
                 return;
             }
             ctx_q_.push(ctx);
@@ -52,6 +84,7 @@ class AioContextPool {
         }
         auto ret = ctx_q_.front();
         ctx_q_.pop();
+        checked_out_ctxs_.insert(ret);
         return ret;
     }
 
@@ -82,17 +115,78 @@ class AioContextPool {
     static void
     ResetGlobalForTest();
 
+    bool
+    ResetCheckedOut(io_context_t ctx) {
+        if (ctx == nullptr) {
+            LOG_WARN("AioContextPool reset gets null context");
+            return false;
+        }
+
+        {
+            std::scoped_lock lk(ctx_mtx_);
+            if (owned_ctxs_.find(ctx) == owned_ctxs_.end()) {
+                LOG_WARN("AioContextPool rejects reset for unknown context: {}", static_cast<void*>(ctx));
+                return false;
+            }
+            if (checked_out_ctxs_.find(ctx) == checked_out_ctxs_.end()) {
+                LOG_WARN("AioContextPool rejects reset for context not checked out: {}", static_cast<void*>(ctx));
+                return false;
+            }
+        }
+
+        io_destroy(ctx);
+        io_context_t new_ctx = 0;
+        const auto ret = io_setup(max_events_, &new_ctx);
+        if (ret == 0) {
+            std::scoped_lock lk(ctx_mtx_);
+            auto iter = std::find(ctx_bak_.begin(), ctx_bak_.end(), ctx);
+            if (iter != ctx_bak_.end()) {
+                *iter = new_ctx;
+            }
+            owned_ctxs_.erase(ctx);
+            owned_ctxs_.insert(new_ctx);
+            checked_out_ctxs_.erase(ctx);
+            ctx_q_.push(new_ctx);
+            ctx_cv_.notify_one();
+            return true;
+        }
+
+        LOG_ERROR("io_setup failed while resetting AIO context with ret={}, errno={}: {}", ret, -ret, ::strerror(-ret));
+        {
+            std::scoped_lock lk(ctx_mtx_);
+            checked_out_ctxs_.erase(ctx);
+            owned_ctxs_.erase(ctx);
+            auto iter = std::find(ctx_bak_.begin(), ctx_bak_.end(), ctx);
+            if (iter != ctx_bak_.end()) {
+                ctx_bak_.erase(iter);
+            }
+        }
+        return false;
+    }
+
     ~AioContextPool() {
         Shutdown();
+        std::unordered_set<io_context_t> checked_out;
+        {
+            std::scoped_lock lk(ctx_mtx_);
+            checked_out = checked_out_ctxs_;
+        }
+        if (!checked_out.empty()) {
+            LOG_WARN("AioContextPool shutdown with {} checked-out contexts still not returned", checked_out.size());
+        }
         for (auto ctx : ctx_bak_) {
-            io_destroy(ctx);
+            if (checked_out.find(ctx) == checked_out.end()) {
+                io_destroy(ctx);
+            }
         }
     }
 
  private:
     std::vector<io_context_t> ctx_bak_;
     std::queue<io_context_t> ctx_q_;
-    std::mutex ctx_mtx_;
+    std::unordered_set<io_context_t> owned_ctxs_;
+    std::unordered_set<io_context_t> checked_out_ctxs_;
+    mutable std::mutex ctx_mtx_;
     std::condition_variable ctx_cv_;
     bool stop_ = false;
     size_t num_ctx_;
@@ -116,7 +210,13 @@ class AioContextPool {
                 LOG_DEBUG("allocating ctx: {}", static_cast<void*>(ctx));
                 ctx_q_.push(ctx);
                 ctx_bak_.push_back(ctx);
+                owned_ctxs_.insert(ctx);
             }
+        }
+        if (ctx_bak_.size() != num_ctx_) {
+            stop_ = true;
+            LOG_ERROR("AioContextPool initialization failed: created {} of {} requested contexts", ctx_bak_.size(),
+                      num_ctx_);
         }
     }
 };
