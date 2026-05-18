@@ -78,14 +78,16 @@ UringContextPool::ResetCheckedOut(struct io_uring* ring) {
         return false;
     }
 
-    std::scoped_lock lk(ring_mtx_);
-    if (owned_rings_.find(ring) == owned_rings_.end()) {
-        LOG_WARN("UringContextPool rejects reset for unknown ring: {}", static_cast<void*>(ring));
-        return false;
-    }
-    if (checked_out_rings_.find(ring) == checked_out_rings_.end()) {
-        LOG_WARN("UringContextPool rejects reset for ring not checked out: {}", static_cast<void*>(ring));
-        return false;
+    {
+        std::scoped_lock lk(ring_mtx_);
+        if (owned_rings_.find(ring) == owned_rings_.end()) {
+            LOG_WARN("UringContextPool rejects reset for unknown ring: {}", static_cast<void*>(ring));
+            return false;
+        }
+        if (checked_out_rings_.find(ring) == checked_out_rings_.end()) {
+            LOG_WARN("UringContextPool rejects reset for ring not checked out: {}", static_cast<void*>(ring));
+            return false;
+        }
     }
 
     io_uring_queue_exit(ring);
@@ -96,11 +98,14 @@ UringContextPool::ResetCheckedOut(struct io_uring* ring) {
     }
 
     LOG_ERROR("io_uring_queue_init failed while resetting ring with ret={}, errno={}: {}", ret, -ret, ::strerror(-ret));
-    checked_out_rings_.erase(ring);
-    owned_rings_.erase(ring);
-    auto iter = std::find(ring_bak_.begin(), ring_bak_.end(), ring);
-    if (iter != ring_bak_.end()) {
-        ring_bak_.erase(iter);
+    {
+        std::scoped_lock lk(ring_mtx_);
+        checked_out_rings_.erase(ring);
+        owned_rings_.erase(ring);
+        auto iter = std::find(ring_bak_.begin(), ring_bak_.end(), ring);
+        if (iter != ring_bak_.end()) {
+            ring_bak_.erase(iter);
+        }
     }
     delete ring;
     return false;

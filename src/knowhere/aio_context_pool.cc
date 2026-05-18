@@ -82,6 +82,11 @@ AioContextPool::InitGlobalAioPool(size_t num_ctx, size_t max_events) {
 std::shared_ptr<AioContextPool>
 AioContextPool::GetGlobalAioPool() {
     auto io_pool = IOContextPool::GetGlobal();
+#if !defined(WITH_IO_URING)
+    if (io_pool == nullptr) {
+        io_pool = IOContextPool::GetGlobalOrInit();
+    }
+#endif
     if (io_pool == nullptr || !io_pool->IsInitialized()) {
         return nullptr;
     }

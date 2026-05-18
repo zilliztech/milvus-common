@@ -59,6 +59,9 @@ class IOContextPool {
     static std::shared_ptr<IOContextPool>
     GetGlobal();
 
+    static std::shared_ptr<IOContextPool>
+    GetGlobalOrInit(const IOContextPoolConfig& cfg = IOContextPoolConfig{});
+
     static void
     ResetGlobalForTest();
 

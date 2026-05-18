@@ -2,6 +2,8 @@
 
 #include "io_reader_internal.h"
 
+#include "syncpoint/sync_point.h"
+
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
@@ -47,6 +49,21 @@ class IOContextHandleGuard {
             active_ = false;
         }
     }
+
+#ifdef WITH_IO_URING
+    void
+    ResetUring() {
+        if (!active_ || pool_ == nullptr || handle_.backend != IOBackend::IO_URING || handle_.uring == nullptr) {
+            return;
+        }
+        auto handle = handle_;
+        handle_ = IOContextHandle{};
+        active_ = false;
+        if (pool_->ResetUring(handle.uring)) {
+            pool_->Push(handle);
+        }
+    }
+#endif
 
  private:
     std::shared_ptr<IOContextPool> pool_;
@@ -243,6 +260,18 @@ ReadAioAsync(int fd, size_t size, std::vector<std::byte*>&& buffers, std::vector
 #endif
 
 #ifdef WITH_IO_URING
+int
+SubmitUring(io_uring* ring) {
+#ifdef ENABLE_SYNCPOINT
+    int forced_ret = 0;
+    TEST_SYNC_POINT_CALLBACK("IOReader::SubmitUring:Before", &forced_ret);
+    if (forced_ret != 0) {
+        return forced_ret;
+    }
+#endif
+    return io_uring_submit(ring);
+}
+
 size_t
 PrepareUringBatch(io_uring* ring, int fd, const std::vector<std::byte*>& buffers, size_t size,
                   const std::vector<size_t>& offsets, size_t start) {
@@ -314,6 +343,12 @@ class UringReadState {
         return guard_.Handle().uring;
     }
 
+    void
+    ResetRing() {
+        first_remaining_ = 0;
+        guard_.ResetUring();
+    }
+
     BatchWaitResult
     CollectFirst() {
         if (first_remaining_ == 0) {
@@ -344,11 +379,13 @@ ReadUringAsync(int fd, size_t size, std::vector<std::byte*>&& buffers, std::vect
     auto* ring = handle.uring;
     const size_t first_batch = PrepareUringBatch(ring, fd, buffers, size, offsets, 0);
     if (first_batch == 0) {
+        guard.ResetUring();
         return MakeReadyFuture(false);
     }
 
-    const auto submitted = io_uring_submit(ring);
+    const auto submitted = SubmitUring(ring);
     if (submitted <= 0) {
+        guard.ResetUring();
         return MakeReadyFuture(false);
     }
     const auto first_submitted = static_cast<size_t>(submitted);
@@ -359,7 +396,11 @@ ReadUringAsync(int fd, size_t size, std::vector<std::byte*>&& buffers, std::vect
          state = UringReadState(std::move(guard), size, first_submitted)]() mutable -> bool {
             auto* ring = state.Ring();
             const auto first_result = state.CollectFirst();
-            if (!first_result.complete || !first_result.ok || first_submitted != first_batch) {
+            if (!first_result.complete || first_submitted != first_batch) {
+                state.ResetRing();
+                return false;
+            }
+            if (!first_result.ok) {
                 return false;
             }
 
@@ -367,15 +408,21 @@ ReadUringAsync(int fd, size_t size, std::vector<std::byte*>&& buffers, std::vect
             while (processed < buffers.size()) {
                 const size_t batch = PrepareUringBatch(ring, fd, buffers, size, offsets, processed);
                 if (batch == 0) {
+                    state.ResetRing();
                     return false;
                 }
-                const auto submitted = io_uring_submit(ring);
+                const auto submitted = SubmitUring(ring);
                 if (submitted <= 0) {
+                    state.ResetRing();
                     return false;
                 }
                 const auto submitted_count = static_cast<size_t>(submitted);
                 const auto result = WaitUringBatch(ring, size, submitted_count);
-                if (!result.complete || !result.ok || submitted_count != batch) {
+                if (!result.complete || submitted_count != batch) {
+                    state.ResetRing();
+                    return false;
+                }
+                if (!result.ok) {
                     return false;
                 }
                 processed += batch;
@@ -386,10 +433,10 @@ ReadUringAsync(int fd, size_t size, std::vector<std::byte*>&& buffers, std::vect
 #endif
 }  // namespace
 
-IOReader::IOReader() : io_pool_(IOContextPool::GetGlobal()) {
+IOReader::IOReader() : io_pool_(IOContextPool::GetGlobalOrInit()) {
 }
 
-IOReader::IOReader(int fd) : fd_(fd), io_pool_(IOContextPool::GetGlobal()) {
+IOReader::IOReader(int fd) : fd_(fd), io_pool_(IOContextPool::GetGlobalOrInit()) {
 }
 
 IOReader::IOReader(int fd, std::shared_ptr<IOContextPool> io_pool) : fd_(fd), io_pool_(std::move(io_pool)) {
@@ -442,7 +489,7 @@ IOReader::ReadAsync(std::vector<std::byte*>&& buffers, size_t size, std::vector<
         }
     }
 
-    auto pool = io_pool_ ? io_pool_ : IOContextPool::GetGlobal();
+    auto pool = io_pool_ ? io_pool_ : IOContextPool::GetGlobalOrInit();
     if (pool == nullptr || !pool->IsInitialized()) {
         throw std::runtime_error("IOContextPool is not initialized");
     }
