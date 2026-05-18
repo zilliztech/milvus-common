@@ -50,6 +50,8 @@ jobs:
           conan profile detect --force \
           && conan remote add default-conan-local2 https://milvus01.jfrog.io/artifactory/api/conan/default-conan-local2 --force
       - name: Build & Run
+        env:
+          KNOWHERE_REQUIRE_IO_URING: "1"
         run: |
           make conan BUILD_TYPE=Release CONAN_EXTRA='-o \&:with_ut=True -o \&:with_asan=True -s compiler.version=12 -s compiler.cppstd=20'
           sudo apt update && sudo apt install -y liburing-dev

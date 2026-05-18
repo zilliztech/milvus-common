@@ -1,6 +1,8 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <utility>
@@ -21,10 +23,18 @@
 #include "knowhere/uring_context_pool.h"
 #endif
 
+class IOContextPool;
+
 enum class IOBackend {
     UNKNOWN,
     IO_URING,
     AIO,
+};
+
+enum class IOContextReleaseDisposition {
+    Clean,
+    Dirty,
+    Retire,
 };
 
 constexpr size_t default_io_ctx_pool_size = 65536 / 128;
@@ -38,33 +48,26 @@ struct IOContextPoolConfig {
     size_t max_events = 128;
 };
 
+// Lifecycle invariants:
+// - Healthy backend pools account every context as either available or leased.
+// - Dirty/retired contexts never return to the available queue without a successful reset.
+// - If reset/replacement cannot restore capacity, backend pools become fail-fast.
+// - IOContextHandle is the single lease token; moving or destroying it releases the old lease.
 struct IOContextHandle {
     IOContextHandle() = default;
+    ~IOContextHandle();
+
     IOContextHandle(const IOContextHandle&) = delete;
     IOContextHandle&
     operator=(const IOContextHandle&) = delete;
 
-    IOContextHandle(IOContextHandle&& other) noexcept {
-        *this = std::move(other);
-    }
+    IOContextHandle(IOContextHandle&& other) noexcept;
 
     IOContextHandle&
-    operator=(IOContextHandle&& other) noexcept {
-        if (this == &other) {
-            return *this;
-        }
-        backend = other.backend;
-#ifdef WITH_IO_URING
-        uring = other.uring;
-        other.uring = nullptr;
-#endif
-#ifdef MILVUS_COMMON_WITH_LIBAIO
-        aio = other.aio;
-        other.aio = nullptr;
-#endif
-        other.backend = IOBackend::UNKNOWN;
-        return *this;
-    }
+    operator=(IOContextHandle&& other) noexcept;
+
+    bool
+    HasContext() const noexcept;
 
     IOBackend backend = IOBackend::UNKNOWN;
 #ifdef WITH_IO_URING
@@ -73,9 +76,21 @@ struct IOContextHandle {
 #ifdef MILVUS_COMMON_WITH_LIBAIO
     io_context_t aio = nullptr;
 #endif
+
+ private:
+    friend class IOContextPool;
+
+    void
+    ClearNoRelease() noexcept;
+
+    void
+    ReleaseNoThrow() noexcept;
+
+    std::shared_ptr<IOContextPool> owner_;
+    uint64_t owner_generation_ = 0;
 };
 
-class IOContextPool {
+class IOContextPool : public std::enable_shared_from_this<IOContextPool> {
  public:
     IOContextPool(const IOContextPool&) = delete;
     IOContextPool&
@@ -108,21 +123,36 @@ class IOContextPool {
     IOContextHandle
     Pop();
 
-    void
+    bool
     Push(IOContextHandle&& handle);
 
-    void
+    bool
     Push(IOContextHandle& handle);
+
+    bool
+    Reset(IOContextHandle&& handle);
+
+    bool
+    Reset(IOContextHandle& handle);
+
+    bool
+    Release(IOContextHandle&& handle, IOContextReleaseDisposition disposition);
+
+    bool
+    Release(IOContextHandle& handle, IOContextReleaseDisposition disposition);
 
 #ifdef WITH_IO_URING
     struct io_uring*
     PopUring();
 
-    void
+    bool
     PushUring(struct io_uring* ring);
 
     bool
     ResetUring(struct io_uring* ring);
+
+    bool
+    RetireUring(struct io_uring* ring);
 
     std::shared_ptr<UringContextPool>
     GetUringPoolForLegacy() const;
@@ -132,11 +162,14 @@ class IOContextPool {
     io_context_t
     PopAio();
 
-    void
+    bool
     PushAio(io_context_t ctx);
 
     bool
     ResetAio(io_context_t ctx);
+
+    bool
+    RetireAio(io_context_t ctx);
 
     std::shared_ptr<AioContextPool>
     GetAioPoolForLegacy() const;
@@ -158,6 +191,8 @@ class IOContextPool {
     IOBackend backend_ = IOBackend::UNKNOWN;
     size_t num_ctx_ = 0;
     size_t max_events_per_ctx_ = 0;
+    uint64_t generation_ = 0;
+    static std::atomic<uint64_t> next_generation_;
 
 #ifdef WITH_IO_URING
     std::shared_ptr<UringContextPool> uring_pool_;

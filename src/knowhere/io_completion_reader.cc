@@ -11,6 +11,8 @@
 #include <string>
 #include <utility>
 
+#include "log/Log.h"
+
 namespace {
 constexpr size_t kNumRetries = 10;
 constexpr size_t kCleanupPeekLimit = 1024;
@@ -246,7 +248,8 @@ IOCompletionReader::ProcessCqe(struct io_uring_cqe* cqe) {
     const auto request_id = static_cast<RequestId>(cqe->user_data);
     auto iter = pending_requests_.find(request_id);
     if (iter == pending_requests_.end()) {
-        return std::string("unknown io_uring completion request id");
+        return "unknown io_uring completion request id " + std::to_string(request_id) + ", result " +
+               std::to_string(cqe->res) + ", pending requests " + std::to_string(pending_requests_.size());
     }
 
     auto& state = iter->second;
@@ -292,6 +295,9 @@ IOCompletionReader::WaitOneCompletion() {
         auto error = ProcessCqe(cqe);
         io_uring_cqe_seen(handle_.uring, cqe);
         if (error) {
+            LOG_ERROR("IOCompletionReader detected invalid CQE while waiting: {}", *error);
+            FailPendingRequests(0);
+            ResetHandleUring();
             throw std::runtime_error(*error);
         }
         return;
@@ -334,6 +340,9 @@ IOCompletionReader::ProcessAvailableCompletions() {
         auto error = ProcessCqe(cqe);
         io_uring_cqe_seen(handle_.uring, cqe);
         if (error) {
+            LOG_ERROR("IOCompletionReader detected invalid CQE while polling: {}", *error);
+            FailPendingRequests(0);
+            ResetHandleUring();
             throw std::runtime_error(*error);
         }
         retry = 0;
@@ -392,7 +401,14 @@ IOCompletionReader::DrainOutstandingNoThrow() noexcept {
                 drained = false;
                 break;
             }
+        } catch (const std::exception& e) {
+            LOG_WARN("IOCompletionReader cleanup failed with exception: {}, pending operations: {}", e.what(),
+                     PendingOperationCount());
+            drained = false;
+            break;
         } catch (...) {
+            LOG_WARN("IOCompletionReader cleanup failed with unknown exception, pending operations: {}",
+                     PendingOperationCount());
             drained = false;
             break;
         }
@@ -456,7 +472,13 @@ IOCompletionReader::TryDrainOutstanding(RequestId request_id) noexcept {
                 return false;
             }
             retry = 0;
+        } catch (const std::exception& e) {
+            LOG_WARN("IOCompletionReader request cleanup failed with exception: {}, pending operations: {}", e.what(),
+                     PendingOperationCount());
+            return false;
         } catch (...) {
+            LOG_WARN("IOCompletionReader request cleanup failed with unknown exception, pending operations: {}",
+                     PendingOperationCount());
             return false;
         }
     }
@@ -519,11 +541,7 @@ IOCompletionReader::ResetHandleUring() {
         return false;
     }
 
-    auto handle = std::move(handle_);
-    if (io_pool_->ResetUring(handle.uring)) {
-        io_pool_->Push(handle);
-        return true;
-    }
+    return io_pool_->Reset(handle_);
 #endif
     return false;
 }

@@ -76,6 +76,34 @@ TEST_F(IOContextPoolTestFixture, InitShouldFallbackToAioWhenUringUnavailable) {
     ASSERT_EQ(WEXITSTATUS(status), 0);
 }
 #endif
+
+#if defined(MILVUS_COMMON_WITH_LIBAIO) && defined(ENABLE_SYNCPOINT)
+TEST_F(IOContextPoolTestFixture, PartialUringInitShouldFallbackToAio) {
+    auto* sync_point = milvus::SyncPoint::GetInstance();
+    sync_point->ClearAllCallBacks();
+    sync_point->ClearTrace();
+    int init_calls = 0;
+    sync_point->SetCallBack("UringContextPool::Ctor:BeforeInit", [&](void* arg) {
+        if (init_calls++ == 1) {
+            *static_cast<int*>(arg) = -EMFILE;
+        }
+    });
+    sync_point->EnableProcessing();
+
+    IOContextPoolConfig cfg;
+    cfg.num_ctx = 2;
+    cfg.max_events = 128;
+    ASSERT_TRUE(IOContextPool::InitGlobal(cfg));
+
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+    sync_point->ClearTrace();
+
+    auto pool = IOContextPool::GetGlobal();
+    ASSERT_NE(pool, nullptr);
+    ASSERT_EQ(pool->Backend(), IOBackend::AIO);
+}
+#endif
 #endif
 
 TEST_F(IOContextPoolTestFixture, BackendIsSelectedAtInit) {
@@ -95,6 +123,24 @@ TEST_F(IOContextPoolTestFixture, BackendIsSelectedAtInit) {
     ASSERT_EQ(backend, IOBackend::AIO);
 #endif
 }
+
+#ifdef WITH_IO_URING
+TEST_F(IOContextPoolTestFixture, RequiredIoUringBackendShouldBeSelected) {
+    const char* require_uring = std::getenv("KNOWHERE_REQUIRE_IO_URING");
+    if (require_uring == nullptr || std::strcmp(require_uring, "1") != 0) {
+        GTEST_SKIP() << "io_uring backend is not required by this environment";
+    }
+
+    IOContextPoolConfig cfg;
+    cfg.num_ctx = 1;
+    cfg.max_events = 128;
+    ASSERT_TRUE(IOContextPool::InitGlobal(cfg));
+
+    auto pool = IOContextPool::GetGlobal();
+    ASSERT_NE(pool, nullptr);
+    ASSERT_EQ(pool->Backend(), IOBackend::IO_URING);
+}
+#endif
 
 TEST_F(IOContextPoolTestFixture, InvalidConfigRejected) {
     IOContextPoolConfig cfg;
@@ -194,6 +240,71 @@ TEST_F(IOContextPoolTestFixture, UnifiedPopPushShouldUseSelectedBackend) {
     pool->Push(second);
 }
 
+TEST_F(IOContextPoolTestFixture, HandleDestructorShouldReturnCheckedOutContext) {
+    IOContextPoolConfig cfg;
+    cfg.num_ctx = 1;
+    cfg.max_events = 128;
+    ASSERT_TRUE(IOContextPool::InitGlobal(cfg));
+
+    auto pool = IOContextPool::GetGlobal();
+    ASSERT_NE(pool, nullptr);
+
+    {
+        auto handle = pool->Pop();
+        ASSERT_TRUE(handle.HasContext());
+    }
+
+    auto second = std::async(std::launch::async, [&] { return pool->Pop(); });
+    ASSERT_EQ(second.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    auto handle = second.get();
+    ASSERT_TRUE(handle.HasContext());
+    pool->Push(handle);
+}
+
+TEST_F(IOContextPoolTestFixture, MoveAssignHandleShouldReturnPreviousContext) {
+    IOContextPoolConfig cfg;
+    cfg.num_ctx = 2;
+    cfg.max_events = 128;
+    ASSERT_TRUE(IOContextPool::InitGlobal(cfg));
+
+    auto pool = IOContextPool::GetGlobal();
+    ASSERT_NE(pool, nullptr);
+
+    auto first = pool->Pop();
+    auto second = pool->Pop();
+    ASSERT_TRUE(first.HasContext());
+    ASSERT_TRUE(second.HasContext());
+
+    second = std::move(first);
+    ASSERT_TRUE(second.HasContext());
+
+    auto returned = std::async(std::launch::async, [&] { return pool->Pop(); });
+    ASSERT_EQ(returned.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    auto returned_handle = returned.get();
+    ASSERT_TRUE(returned_handle.HasContext());
+
+    pool->Push(returned_handle);
+    pool->Push(second);
+}
+
+TEST_F(IOContextPoolTestFixture, RetireHandleShouldMakePoolFailFast) {
+    IOContextPoolConfig cfg;
+    cfg.num_ctx = 1;
+    cfg.max_events = 128;
+    ASSERT_TRUE(IOContextPool::InitGlobal(cfg));
+
+    auto pool = IOContextPool::GetGlobal();
+    ASSERT_NE(pool, nullptr);
+
+    auto handle = pool->Pop();
+    ASSERT_TRUE(handle.HasContext());
+    ASSERT_TRUE(pool->Release(handle, IOContextReleaseDisposition::Retire));
+
+    auto failed = std::async(std::launch::async, [&] { return pool->Pop(); });
+    ASSERT_EQ(failed.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    ASSERT_FALSE(failed.get().HasContext());
+}
+
 TEST_F(IOContextPoolTestFixture, PushShouldRejectHandleFromDifferentBackend) {
     IOContextPoolConfig cfg;
     cfg.num_ctx = 1;
@@ -233,6 +344,46 @@ TEST_F(IOContextPoolTestFixture, InterruptedSyscallRetryShouldHaveBound) {
     EXPECT_FALSE(knowhere_internal::ShouldRetryInterruptedSyscall(retry, 2));
     EXPECT_EQ(retry, 3u);
 }
+
+#ifdef ENABLE_SYNCPOINT
+TEST_F(IOContextPoolTestFixture, ResetFailureShouldMakePoolFailFast) {
+    IOContextPoolConfig cfg;
+    cfg.num_ctx = 1;
+    cfg.max_events = 128;
+    ASSERT_TRUE(IOContextPool::InitGlobal(cfg));
+
+    auto pool = IOContextPool::GetGlobal();
+    ASSERT_NE(pool, nullptr);
+
+    auto* sync_point = milvus::SyncPoint::GetInstance();
+    sync_point->ClearAllCallBacks();
+    sync_point->ClearTrace();
+#ifdef WITH_IO_URING
+    sync_point->SetCallBack("UringContextPool::ResetCheckedOut:BeforeInit", [](void* arg) {
+        *static_cast<int*>(arg) = -EMFILE;
+    });
+#endif
+#ifdef MILVUS_COMMON_WITH_LIBAIO
+    sync_point->SetCallBack("AioContextPool::ResetCheckedOut:BeforeSetup", [](void* arg) {
+        *static_cast<int*>(arg) = -EAGAIN;
+    });
+#endif
+    sync_point->EnableProcessing();
+
+    auto handle = pool->Pop();
+    ASSERT_TRUE(handle.HasContext());
+    ASSERT_FALSE(pool->Reset(handle));
+
+    auto blocked = std::async(std::launch::async, [&] { return pool->Pop(); });
+    ASSERT_EQ(blocked.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    auto failed = blocked.get();
+    ASSERT_FALSE(failed.HasContext());
+
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+    sync_point->ClearTrace();
+}
+#endif
 
 #ifdef MILVUS_COMMON_WITH_LIBAIO
 TEST_F(IOContextPoolTestFixture, LegacyAioInitStillWorksViaUnifiedPath) {
@@ -674,6 +825,89 @@ TEST_F(IOContextPoolTestFixture, DroppedReadAsyncFutureShouldResetPartialUringSu
     ASSERT_EQ(std::memcmp(retry.get(), content.get(), kIOReaderTestBlockSize), 0);
 
     ::close(fd);
+    ::unlink(path);
+}
+#endif
+
+#if defined(MILVUS_COMMON_WITH_LIBAIO) && defined(ENABLE_SYNCPOINT)
+TEST_F(IOContextPoolTestFixture, AioLaterBatchCleanupFailureShouldResetContext) {
+    IOContextPoolConfig cfg;
+    cfg.num_ctx = 1;
+    cfg.max_events = 2;
+    ASSERT_TRUE(IOContextPool::InitGlobal(cfg));
+
+    auto pool = IOContextPool::GetGlobal();
+    ASSERT_NE(pool, nullptr);
+    if (pool->Backend() != IOBackend::AIO) {
+        GTEST_SKIP() << "AIO backend unavailable";
+    }
+
+    char path[] = "/tmp/io_reader_aio_later_cleanup_XXXXXX";
+    int fd = OpenIOReaderTestFile(path, true);
+    if (fd < 0 && errno == EINVAL) {
+        GTEST_SKIP() << "direct I/O is not available for AIO ReadAsync test";
+    }
+    ASSERT_GE(fd, 0);
+
+    constexpr size_t kBlocks = 4;
+    constexpr size_t kTotalSize = kIOReaderTestBlockSize * kBlocks;
+    auto content = AllocateAlignedBuffer(kTotalSize);
+    ASSERT_NE(content, nullptr);
+    std::fill(content.get(), content.get() + kTotalSize, std::byte{0x4});
+    ASSERT_EQ(::pwrite(fd, content.get(), kTotalSize, 0), static_cast<ssize_t>(kTotalSize));
+    ASSERT_EQ(::fsync(fd), 0);
+
+    std::vector<AlignedBuffer> owned_buffers;
+    std::vector<std::byte*> buffers;
+    std::vector<size_t> offsets;
+    for (size_t i = 0; i < kBlocks; ++i) {
+        auto buffer = AllocateAlignedBuffer(kIOReaderTestBlockSize);
+        ASSERT_NE(buffer, nullptr);
+        buffers.push_back(buffer.get());
+        offsets.push_back(i * kIOReaderTestBlockSize);
+        owned_buffers.push_back(std::move(buffer));
+    }
+
+    auto* sync_point = milvus::SyncPoint::GetInstance();
+    sync_point->ClearAllCallBacks();
+    sync_point->ClearTrace();
+    int submit_calls = 0;
+    int wait_calls = 0;
+    int reset_calls = 0;
+    sync_point->SetCallBack("IOReader::SubmitAioBatch:BeforeSubmit", [&](void* arg) {
+        if (submit_calls++ == 1) {
+            *static_cast<size_t*>(arg) = 1;
+        }
+    });
+    sync_point->SetCallBack("IOReader::WaitAioBatch:BeforeReturn", [&](void* arg) {
+        if (wait_calls++ == 1) {
+            *static_cast<bool*>(arg) = true;
+        }
+    });
+    sync_point->SetCallBack("AioContextPool::ResetCheckedOut:BeforeSetup", [&](void* arg) {
+        ++reset_calls;
+        *static_cast<int*>(arg) = 0;
+    });
+    sync_point->EnableProcessing();
+
+    IOReader reader(fd, pool);
+    auto failed = reader.ReadAsync(std::move(buffers), kIOReaderTestBlockSize, std::move(offsets));
+    ASSERT_FALSE(failed.get());
+    ASSERT_GT(reset_calls, 0);
+
+    sync_point->DisableProcessing();
+    sync_point->ClearAllCallBacks();
+    sync_point->ClearTrace();
+
+    auto retry = AllocateAlignedBuffer(kIOReaderTestBlockSize);
+    ASSERT_NE(retry, nullptr);
+    std::vector<std::byte*> retry_buffers{retry.get()};
+    std::vector<size_t> retry_offsets{0};
+    auto retried = reader.ReadAsync(std::move(retry_buffers), kIOReaderTestBlockSize, std::move(retry_offsets));
+    ASSERT_TRUE(retried.get());
+    ASSERT_EQ(std::memcmp(retry.get(), content.get(), kIOReaderTestBlockSize), 0);
+
+    ASSERT_EQ(::close(fd), 0);
     ::unlink(path);
 }
 #endif

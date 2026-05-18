@@ -1,5 +1,6 @@
 #include "knowhere/io_context_pool.h"
 
+#include <exception>
 #include <mutex>
 #include <utility>
 
@@ -9,6 +10,92 @@ namespace {
 std::shared_ptr<IOContextPool> g_io_pool;
 std::mutex g_io_pool_mutex;
 }  // namespace
+
+std::atomic<uint64_t> IOContextPool::next_generation_{1};
+
+IOContextHandle::~IOContextHandle() {
+    ReleaseNoThrow();
+}
+
+IOContextHandle::IOContextHandle(IOContextHandle&& other) noexcept {
+    *this = std::move(other);
+}
+
+IOContextHandle&
+IOContextHandle::operator=(IOContextHandle&& other) noexcept {
+    if (this == &other) {
+        return *this;
+    }
+    ReleaseNoThrow();
+    backend = other.backend;
+#ifdef WITH_IO_URING
+    uring = other.uring;
+    other.uring = nullptr;
+#endif
+#ifdef MILVUS_COMMON_WITH_LIBAIO
+    aio = other.aio;
+    other.aio = nullptr;
+#endif
+    owner_ = std::move(other.owner_);
+    owner_generation_ = other.owner_generation_;
+    other.backend = IOBackend::UNKNOWN;
+    other.owner_generation_ = 0;
+    return *this;
+}
+
+bool
+IOContextHandle::HasContext() const noexcept {
+    switch (backend) {
+#ifdef WITH_IO_URING
+        case IOBackend::IO_URING:
+            return uring != nullptr;
+#endif
+#ifdef MILVUS_COMMON_WITH_LIBAIO
+        case IOBackend::AIO:
+            return aio != nullptr;
+#endif
+        default:
+            return false;
+    }
+}
+
+void
+IOContextHandle::ClearNoRelease() noexcept {
+    backend = IOBackend::UNKNOWN;
+#ifdef WITH_IO_URING
+    uring = nullptr;
+#endif
+#ifdef MILVUS_COMMON_WITH_LIBAIO
+    aio = nullptr;
+#endif
+    owner_.reset();
+    owner_generation_ = 0;
+}
+
+void
+IOContextHandle::ReleaseNoThrow() noexcept {
+    if (!HasContext()) {
+        ClearNoRelease();
+        return;
+    }
+
+    auto owner = owner_;
+    if (owner == nullptr) {
+        LOG_WARN("IOContextHandle drops context without owner for backend {}", static_cast<int>(backend));
+        ClearNoRelease();
+        return;
+    }
+
+    try {
+        owner->Release(*this, IOContextReleaseDisposition::Clean);
+    } catch (const std::exception& e) {
+        LOG_ERROR("IOContextHandle failed to release context: {}", e.what());
+        ClearNoRelease();
+    } catch (...) {
+        LOG_ERROR("IOContextHandle failed to release context: unknown exception");
+        ClearNoRelease();
+    }
+}
 
 #ifdef WITH_IO_URING
 bool
@@ -20,6 +107,7 @@ IOContextPool::TryInitUring(const IOContextPoolConfig& cfg, const std::shared_pt
     auto pool = UringContextPool::GetGlobalUringPoolDirect();
     if (pool == nullptr || !pool->IsUsable()) {
         LOG_ERROR("Global UringContextPool is unavailable after initialization");
+        UringContextPool::ResetGlobalForTest();
         return false;
     }
 
@@ -82,6 +170,7 @@ IOContextPool::InitGlobal(const IOContextPoolConfig& cfg) {
     }
 
     auto io_pool = std::shared_ptr<IOContextPool>(new IOContextPool());
+    io_pool->generation_ = next_generation_.fetch_add(1, std::memory_order_relaxed);
 
 #ifdef WITH_IO_URING
     if (TryInitUring(cfg, io_pool)) {
@@ -189,38 +278,95 @@ IOContextPool::Pop() {
         default:
             break;
     }
+    if (handle.HasContext()) {
+        handle.owner_ = shared_from_this();
+        handle.owner_generation_ = generation_;
+    } else {
+        handle.backend = IOBackend::UNKNOWN;
+    }
     return handle;
 }
 
-void
+bool
 IOContextPool::Push(IOContextHandle&& handle) {
+    return Release(std::move(handle), IOContextReleaseDisposition::Clean);
+}
+
+bool
+IOContextPool::Push(IOContextHandle& handle) {
+    return Push(std::move(handle));
+}
+
+bool
+IOContextPool::Reset(IOContextHandle&& handle) {
+    return Release(std::move(handle), IOContextReleaseDisposition::Dirty);
+}
+
+bool
+IOContextPool::Reset(IOContextHandle& handle) {
+    return Reset(std::move(handle));
+}
+
+bool
+IOContextPool::Release(IOContextHandle&& handle, IOContextReleaseDisposition disposition) {
+    if (!handle.HasContext()) {
+        handle.ClearNoRelease();
+        return true;
+    }
+    if (handle.owner_.get() != this) {
+        LOG_WARN("IOContextPool rejects release for handle owned by a different pool");
+        return false;
+    }
+    if (handle.owner_generation_ != generation_) {
+        LOG_WARN("IOContextPool rejects stale handle for generation {} while active generation is {}",
+                 handle.owner_generation_, generation_);
+        handle.ClearNoRelease();
+        return false;
+    }
     if (handle.backend != backend_) {
-        LOG_WARN("IOContextPool rejects handle for backend {} while active backend is {}",
+        LOG_WARN("IOContextPool rejects release for backend {} while active backend is {}",
                  static_cast<int>(handle.backend), static_cast<int>(backend_));
-        handle = IOContextHandle{};
-        return;
+        handle.ClearNoRelease();
+        return false;
     }
 
+    bool released = false;
     switch (handle.backend) {
 #ifdef WITH_IO_URING
         case IOBackend::IO_URING:
-            PushUring(handle.uring);
+            if (disposition == IOContextReleaseDisposition::Clean) {
+                released = PushUring(handle.uring);
+            } else if (disposition == IOContextReleaseDisposition::Dirty) {
+                released = ResetUring(handle.uring);
+                if (released) {
+                    released = PushUring(handle.uring);
+                }
+            } else {
+                released = RetireUring(handle.uring);
+            }
             break;
 #endif
 #ifdef MILVUS_COMMON_WITH_LIBAIO
         case IOBackend::AIO:
-            PushAio(handle.aio);
+            if (disposition == IOContextReleaseDisposition::Clean) {
+                released = PushAio(handle.aio);
+            } else if (disposition == IOContextReleaseDisposition::Dirty) {
+                released = ResetAio(handle.aio);
+            } else {
+                released = RetireAio(handle.aio);
+            }
             break;
 #endif
         default:
             break;
     }
-    handle = IOContextHandle{};
+    handle.ClearNoRelease();
+    return released;
 }
 
-void
-IOContextPool::Push(IOContextHandle& handle) {
-    Push(std::move(handle));
+bool
+IOContextPool::Release(IOContextHandle& handle, IOContextReleaseDisposition disposition) {
+    return Release(std::move(handle), disposition);
 }
 
 #ifdef WITH_IO_URING
@@ -232,16 +378,22 @@ IOContextPool::PopUring() {
     return uring_pool_->pop();
 }
 
-void
+bool
 IOContextPool::PushUring(struct io_uring* ring) {
     if (uring_pool_ != nullptr) {
-        uring_pool_->push(ring);
+        return uring_pool_->push(ring);
     }
+    return false;
 }
 
 bool
 IOContextPool::ResetUring(struct io_uring* ring) {
     return uring_pool_ != nullptr && uring_pool_->ResetCheckedOut(ring);
+}
+
+bool
+IOContextPool::RetireUring(struct io_uring* ring) {
+    return uring_pool_ != nullptr && uring_pool_->RetireCheckedOut(ring);
 }
 
 std::shared_ptr<UringContextPool>
@@ -259,16 +411,22 @@ IOContextPool::PopAio() {
     return aio_pool_->pop();
 }
 
-void
+bool
 IOContextPool::PushAio(io_context_t ctx) {
     if (aio_pool_ != nullptr) {
-        aio_pool_->push(ctx);
+        return aio_pool_->push(ctx);
     }
+    return false;
 }
 
 bool
 IOContextPool::ResetAio(io_context_t ctx) {
     return aio_pool_ != nullptr && aio_pool_->ResetCheckedOut(ctx);
+}
+
+bool
+IOContextPool::RetireAio(io_context_t ctx) {
+    return aio_pool_ != nullptr && aio_pool_->RetireCheckedOut(ctx);
 }
 
 std::shared_ptr<AioContextPool>

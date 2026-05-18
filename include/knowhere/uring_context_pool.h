@@ -4,6 +4,7 @@
 
 #include <liburing.h>
 
+#include <algorithm>
 #include <condition_variable>
 #include <cstddef>
 #include <memory>
@@ -18,6 +19,12 @@ constexpr size_t default_uring_max_entries = 128;
 
 class UringContextPool {
  public:
+    enum class State {
+        Healthy,
+        Unusable,
+        Stopped,
+    };
+
     UringContextPool(const UringContextPool&) = delete;
 
     UringContextPool&
@@ -35,44 +42,57 @@ class UringContextPool {
 
     bool
     IsUsable() const {
-        return !ring_bak_.empty();
+        std::scoped_lock lk(ring_mtx_);
+        return state_ == State::Healthy && ring_bak_.size() == num_ctx_ && !ring_bak_.empty();
     }
 
-    void
+    bool
     push(struct io_uring* ring) {
         if (ring == nullptr) {
             LOG_WARN("UringContextPool push gets null ring");
-            return;
+            return false;
         }
 
+        bool should_destroy = false;
         {
             std::scoped_lock lk(ring_mtx_);
-            if (stop_) {
-                checked_out_rings_.erase(ring);
-                return;
-            }
-
             if (owned_rings_.find(ring) == owned_rings_.end()) {
                 LOG_WARN("UringContextPool rejects unknown ring: {}", static_cast<void*>(ring));
-                return;
+                return false;
             }
 
             if (checked_out_rings_.erase(ring) == 0) {
                 LOG_WARN("UringContextPool rejects ring not checked out: {}", static_cast<void*>(ring));
-                return;
+                return false;
             }
 
-            ring_q_.push(ring);
+            if (state_ != State::Healthy) {
+                owned_rings_.erase(ring);
+                auto iter = std::find(ring_bak_.begin(), ring_bak_.end(), ring);
+                if (iter != ring_bak_.end()) {
+                    ring_bak_.erase(iter);
+                }
+                should_destroy = true;
+            } else {
+                ring_q_.push(ring);
+            }
+        }
+
+        if (should_destroy) {
+            io_uring_queue_exit(ring);
+            delete ring;
+            return false;
         }
 
         ring_cv_.notify_one();
+        return true;
     }
 
     struct io_uring*
     pop() {
         std::unique_lock lk(ring_mtx_);
-        ring_cv_.wait(lk, [this] { return stop_ || !ring_q_.empty(); });
-        if (stop_) {
+        ring_cv_.wait(lk, [this] { return state_ != State::Healthy || !ring_q_.empty(); });
+        if (state_ != State::Healthy) {
             return nullptr;
         }
         auto ret = ring_q_.front();
@@ -83,6 +103,9 @@ class UringContextPool {
 
     bool
     ResetCheckedOut(struct io_uring* ring);
+
+    bool
+    RetireCheckedOut(struct io_uring* ring);
 
     static bool
     InitGlobalUringPool(size_t num_ctx, size_t max_entries);
@@ -106,9 +129,9 @@ class UringContextPool {
     std::queue<struct io_uring*> ring_q_;
     std::unordered_set<struct io_uring*> owned_rings_;
     std::unordered_set<struct io_uring*> checked_out_rings_;
-    std::mutex ring_mtx_;
+    mutable std::mutex ring_mtx_;
     std::condition_variable ring_cv_;
-    bool stop_ = false;
+    State state_ = State::Healthy;
     size_t num_ctx_;
     size_t max_entries_;
 

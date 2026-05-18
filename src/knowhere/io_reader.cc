@@ -57,9 +57,8 @@ class IOContextHandleGuard {
         if (!active_ || pool_ == nullptr || handle_.backend != IOBackend::AIO || handle_.aio == nullptr) {
             return;
         }
-        auto handle = std::move(handle_);
         active_ = false;
-        pool_->ResetAio(handle.aio);
+        pool_->Reset(handle_);
     }
 #endif
 
@@ -69,11 +68,8 @@ class IOContextHandleGuard {
         if (!active_ || pool_ == nullptr || handle_.backend != IOBackend::IO_URING || handle_.uring == nullptr) {
             return;
         }
-        auto handle = std::move(handle_);
         active_ = false;
-        if (pool_->ResetUring(handle.uring)) {
-            pool_->Push(handle);
-        }
+        pool_->Reset(handle_);
     }
 #endif
 
@@ -106,8 +102,15 @@ SubmitAioBatch(io_context_t ctx, int fd, const std::vector<std::byte*>& buffers,
     size_t submitted_total = 0;
     size_t retry = 0;
     while (submitted_total < batch) {
-        const auto submitted =
-            io_submit(ctx, static_cast<long>(batch - submitted_total), cb_ptrs.data() + submitted_total);
+        long submit_count = static_cast<long>(batch - submitted_total);
+#ifdef ENABLE_SYNCPOINT
+        size_t forced_submit_limit = 0;
+        TEST_SYNC_POINT_CALLBACK("IOReader::SubmitAioBatch:BeforeSubmit", &forced_submit_limit);
+        if (forced_submit_limit > 0) {
+            submit_count = static_cast<long>(std::min(static_cast<size_t>(submit_count), forced_submit_limit));
+        }
+#endif
+        const auto submitted = io_submit(ctx, submit_count, cb_ptrs.data() + submitted_total);
         if (submitted < 0) {
             if (-submitted == EINTR) {
                 if (!knowhere_internal::ShouldRetryInterruptedSyscall(retry, kNumRetries)) {
@@ -177,6 +180,14 @@ WaitAioBatch(io_context_t ctx, size_t size, const std::vector<struct iocb>& cbs,
     }
     result.complete = result.completed == submitted_total;
     result.ok = result.ok && result.complete;
+#ifdef ENABLE_SYNCPOINT
+    bool force_bad_cleanup = false;
+    TEST_SYNC_POINT_CALLBACK("IOReader::WaitAioBatch:BeforeReturn", &force_bad_cleanup);
+    if (force_bad_cleanup) {
+        result.complete = false;
+        result.ok = false;
+    }
+#endif
     return result;
 }
 
@@ -279,7 +290,10 @@ ReadAioAsync(int fd, size_t size, std::vector<std::byte*>&& buffers, std::vector
                 std::vector<struct iocb> cbs;
                 const size_t submitted = SubmitAioBatch(ctx, fd, buffers, size, offsets, processed, batch, cbs);
                 if (submitted != batch) {
-                    WaitAioBatch(ctx, size, cbs, submitted);
+                    const auto cleanup = WaitAioBatch(ctx, size, cbs, submitted);
+                    if (!cleanup.complete || !cleanup.ok) {
+                        state.ResetContext();
+                    }
                     return false;
                 }
                 const auto result = WaitAioBatch(ctx, size, cbs, submitted);

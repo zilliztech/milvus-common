@@ -7,6 +7,7 @@
 #include <cstring>
 
 #include "knowhere/io_context_pool.h"
+#include "syncpoint/sync_point.h"
 
 namespace {
 std::shared_ptr<UringContextPool> g_uring_pool;
@@ -22,7 +23,13 @@ UringContextPool::UringContextPool(size_t num_ctx, size_t max_entries) : num_ctx
     for (size_t i = 0; i < num_ctx_; ++i) {
         auto* ring = new io_uring();
         std::memset(ring, 0, sizeof(io_uring));
-        int ret = io_uring_queue_init(static_cast<unsigned>(max_entries_), ring, 0);
+        int ret = 0;
+#ifdef ENABLE_SYNCPOINT
+        TEST_SYNC_POINT_CALLBACK("UringContextPool::Ctor:BeforeInit", &ret);
+#endif
+        if (ret == 0) {
+            ret = io_uring_queue_init(static_cast<unsigned>(max_entries_), ring, 0);
+        }
         if (ret < 0) {
             LOG_ERROR("io_uring_queue_init failed with ret={}, errno={}: {}", ret, -ret, ::strerror(-ret));
             delete ring;
@@ -34,9 +41,10 @@ UringContextPool::UringContextPool(size_t num_ctx, size_t max_entries) : num_ctx
         owned_rings_.insert(ring);
     }
 
-    if (ring_bak_.empty()) {
-        stop_ = true;
-        LOG_ERROR("UringContextPool initialization failed: no valid io_uring context created");
+    if (ring_bak_.size() != num_ctx_) {
+        state_ = State::Unusable;
+        LOG_ERROR("UringContextPool initialization failed: created {} of {} requested contexts", ring_bak_.size(),
+                  num_ctx_);
     }
 }
 
@@ -91,9 +99,35 @@ UringContextPool::ResetCheckedOut(struct io_uring* ring) {
 
     io_uring_queue_exit(ring);
     std::memset(ring, 0, sizeof(io_uring));
-    const auto ret = io_uring_queue_init(static_cast<unsigned>(max_entries_), ring, 0);
+    int ret = 0;
+#ifdef ENABLE_SYNCPOINT
+    TEST_SYNC_POINT_CALLBACK("UringContextPool::ResetCheckedOut:BeforeInit", &ret);
+#endif
     if (ret == 0) {
-        return true;
+        ret = io_uring_queue_init(static_cast<unsigned>(max_entries_), ring, 0);
+    }
+    if (ret == 0) {
+        bool reusable = false;
+        {
+            std::scoped_lock lk(ring_mtx_);
+            if (state_ == State::Healthy) {
+                reusable = true;
+            } else {
+                checked_out_rings_.erase(ring);
+                owned_rings_.erase(ring);
+                auto iter = std::find(ring_bak_.begin(), ring_bak_.end(), ring);
+                if (iter != ring_bak_.end()) {
+                    ring_bak_.erase(iter);
+                }
+            }
+        }
+        if (reusable) {
+            return true;
+        }
+        io_uring_queue_exit(ring);
+        delete ring;
+        ring_cv_.notify_all();
+        return false;
     }
 
     LOG_ERROR("io_uring_queue_init failed while resetting ring with ret={}, errno={}: {}", ret, -ret, ::strerror(-ret));
@@ -105,9 +139,45 @@ UringContextPool::ResetCheckedOut(struct io_uring* ring) {
         if (iter != ring_bak_.end()) {
             ring_bak_.erase(iter);
         }
+        state_ = State::Unusable;
     }
+    ring_cv_.notify_all();
     delete ring;
     return false;
+}
+
+bool
+UringContextPool::RetireCheckedOut(struct io_uring* ring) {
+    if (ring == nullptr) {
+        LOG_WARN("UringContextPool retire gets null ring");
+        return false;
+    }
+
+    {
+        std::scoped_lock lk(ring_mtx_);
+        if (owned_rings_.find(ring) == owned_rings_.end()) {
+            LOG_WARN("UringContextPool rejects retire for unknown ring: {}", static_cast<void*>(ring));
+            return false;
+        }
+        if (checked_out_rings_.erase(ring) == 0) {
+            LOG_WARN("UringContextPool rejects retire for ring not checked out: {}", static_cast<void*>(ring));
+            return false;
+        }
+
+        owned_rings_.erase(ring);
+        auto iter = std::find(ring_bak_.begin(), ring_bak_.end(), ring);
+        if (iter != ring_bak_.end()) {
+            ring_bak_.erase(iter);
+        }
+        if (state_ == State::Healthy) {
+            state_ = State::Unusable;
+        }
+    }
+
+    io_uring_queue_exit(ring);
+    delete ring;
+    ring_cv_.notify_all();
+    return true;
 }
 
 std::shared_ptr<UringContextPool>
@@ -172,7 +242,7 @@ UringContextPool::ResetGlobalForTest() {
 UringContextPool::~UringContextPool() {
     {
         std::scoped_lock lk(ring_mtx_);
-        stop_ = true;
+        state_ = State::Stopped;
     }
     ring_cv_.notify_all();
 
