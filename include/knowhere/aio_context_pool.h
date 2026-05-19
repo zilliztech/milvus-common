@@ -6,6 +6,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstring>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <queue>
@@ -62,6 +63,8 @@ class AioContextPool {
         }
 
         bool should_destroy = false;
+        bool released = false;
+        bool notify_all = false;
         {
             std::scoped_lock lk(ctx_mtx_);
             if (owned_ctxs_.find(ctx) == owned_ctxs_.end()) {
@@ -69,29 +72,46 @@ class AioContextPool {
                 return false;
             }
 
-            if (checked_out_ctxs_.erase(ctx) == 0) {
+            if (checked_out_ctxs_.find(ctx) == checked_out_ctxs_.end()) {
                 LOG_WARN("AioContextPool rejects context not checked out: {}", static_cast<void*>(ctx));
                 return false;
             }
             if (state_ != State::Healthy) {
-                owned_ctxs_.erase(ctx);
-                auto iter = std::find(ctx_bak_.begin(), ctx_bak_.end(), ctx);
-                if (iter != ctx_bak_.end()) {
-                    ctx_bak_.erase(iter);
-                }
+                RemoveTrackedContextLocked(ctx);
                 should_destroy = true;
+                notify_all = true;
             } else {
-                ctx_q_.push(ctx);
+                try {
+                    ctx_q_.push(ctx);
+                    checked_out_ctxs_.erase(ctx);
+                    released = true;
+                } catch (const std::exception& e) {
+                    LOG_ERROR("AioContextPool failed to requeue context {}: {}", static_cast<void*>(ctx), e.what());
+                    RemoveTrackedContextLocked(ctx);
+                    MarkUnusableLocked();
+                    should_destroy = true;
+                    notify_all = true;
+                } catch (...) {
+                    LOG_ERROR("AioContextPool failed to requeue context {}: unknown exception",
+                              static_cast<void*>(ctx));
+                    RemoveTrackedContextLocked(ctx);
+                    MarkUnusableLocked();
+                    should_destroy = true;
+                    notify_all = true;
+                }
             }
         }
 
         if (should_destroy) {
-            io_destroy(ctx);
+            DestroyContextNoThrow(ctx, "releasing");
+            if (notify_all) {
+                ctx_cv_.notify_all();
+            }
             return false;
         }
 
         ctx_cv_.notify_one();
-        return true;
+        return released;
     }
 
     io_context_t
@@ -102,8 +122,29 @@ class AioContextPool {
             return nullptr;
         }
         auto ret = ctx_q_.front();
+        try {
+            const auto inserted = checked_out_ctxs_.insert(ret).second;
+            if (!inserted) {
+                LOG_ERROR("AioContextPool detected duplicate checked-out context: {}", static_cast<void*>(ret));
+                MarkUnusableLocked();
+                lk.unlock();
+                ctx_cv_.notify_all();
+                return nullptr;
+            }
+        } catch (const std::exception& e) {
+            LOG_ERROR("AioContextPool failed to mark context checked out: {}", e.what());
+            MarkUnusableLocked();
+            lk.unlock();
+            ctx_cv_.notify_all();
+            return nullptr;
+        } catch (...) {
+            LOG_ERROR("AioContextPool failed to mark context checked out: unknown exception");
+            MarkUnusableLocked();
+            lk.unlock();
+            ctx_cv_.notify_all();
+            return nullptr;
+        }
         ctx_q_.pop();
-        checked_out_ctxs_.insert(ret);
         return ret;
     }
 
@@ -153,7 +194,16 @@ class AioContextPool {
             }
         }
 
-        io_destroy(ctx);
+        if (!DestroyContextNoThrow(ctx, "resetting")) {
+            {
+                std::scoped_lock lk(ctx_mtx_);
+                RemoveTrackedContextLocked(ctx);
+                MarkUnusableLocked();
+            }
+            ctx_cv_.notify_all();
+            return false;
+        }
+
         io_context_t new_ctx = 0;
         int ret = 0;
 #ifdef ENABLE_SYNCPOINT
@@ -164,27 +214,54 @@ class AioContextPool {
         }
         if (ret == 0) {
             bool reusable = false;
+            bool should_destroy_new_ctx = false;
             {
                 std::scoped_lock lk(ctx_mtx_);
                 auto iter = std::find(ctx_bak_.begin(), ctx_bak_.end(), ctx);
-                owned_ctxs_.erase(ctx);
-                checked_out_ctxs_.erase(ctx);
-                if (state_ == State::Healthy) {
-                    if (iter != ctx_bak_.end()) {
-                        *iter = new_ctx;
+                if (state_ == State::Healthy && iter != ctx_bak_.end()) {
+                    owned_ctxs_.erase(ctx);
+                    checked_out_ctxs_.erase(ctx);
+                    try {
+                        const auto inserted = owned_ctxs_.insert(new_ctx).second;
+                        if (!inserted) {
+                            LOG_ERROR("AioContextPool replacement context already exists: {}",
+                                      static_cast<void*>(new_ctx));
+                            RemoveTrackedContextLocked(ctx);
+                            MarkUnusableLocked();
+                            should_destroy_new_ctx = true;
+                        } else {
+                            try {
+                                ctx_q_.push(new_ctx);
+                            } catch (...) {
+                                owned_ctxs_.erase(new_ctx);
+                                throw;
+                            }
+                            *iter = new_ctx;
+                            reusable = true;
+                        }
+                    } catch (const std::exception& e) {
+                        LOG_ERROR("AioContextPool failed to install replacement context: {}", e.what());
+                        RemoveTrackedContextLocked(ctx);
+                        MarkUnusableLocked();
+                        should_destroy_new_ctx = true;
+                    } catch (...) {
+                        LOG_ERROR("AioContextPool failed to install replacement context: unknown exception");
+                        RemoveTrackedContextLocked(ctx);
+                        MarkUnusableLocked();
+                        should_destroy_new_ctx = true;
                     }
-                    owned_ctxs_.insert(new_ctx);
-                    ctx_q_.push(new_ctx);
-                    reusable = true;
-                } else if (iter != ctx_bak_.end()) {
-                    ctx_bak_.erase(iter);
+                } else {
+                    RemoveTrackedContextLocked(ctx);
+                    should_destroy_new_ctx = true;
                 }
             }
             if (reusable) {
                 ctx_cv_.notify_one();
                 return true;
             }
-            io_destroy(new_ctx);
+            if (should_destroy_new_ctx) {
+                DestroyContextNoThrow(new_ctx, "discarding replacement");
+            }
             ctx_cv_.notify_all();
             return false;
         }
@@ -192,13 +269,8 @@ class AioContextPool {
         LOG_ERROR("io_setup failed while resetting AIO context with ret={}, errno={}: {}", ret, -ret, ::strerror(-ret));
         {
             std::scoped_lock lk(ctx_mtx_);
-            checked_out_ctxs_.erase(ctx);
-            owned_ctxs_.erase(ctx);
-            auto iter = std::find(ctx_bak_.begin(), ctx_bak_.end(), ctx);
-            if (iter != ctx_bak_.end()) {
-                ctx_bak_.erase(iter);
-            }
-            state_ = State::Unusable;
+            RemoveTrackedContextLocked(ctx);
+            MarkUnusableLocked();
         }
         ctx_cv_.notify_all();
         return false;
@@ -217,24 +289,18 @@ class AioContextPool {
                 LOG_WARN("AioContextPool rejects retire for unknown context: {}", static_cast<void*>(ctx));
                 return false;
             }
-            if (checked_out_ctxs_.erase(ctx) == 0) {
+            if (checked_out_ctxs_.find(ctx) == checked_out_ctxs_.end()) {
                 LOG_WARN("AioContextPool rejects retire for context not checked out: {}", static_cast<void*>(ctx));
                 return false;
             }
 
-            owned_ctxs_.erase(ctx);
-            auto iter = std::find(ctx_bak_.begin(), ctx_bak_.end(), ctx);
-            if (iter != ctx_bak_.end()) {
-                ctx_bak_.erase(iter);
-            }
-            if (state_ == State::Healthy) {
-                state_ = State::Unusable;
-            }
+            RemoveTrackedContextLocked(ctx);
+            MarkUnusableLocked();
         }
 
-        io_destroy(ctx);
+        const bool destroyed = DestroyContextNoThrow(ctx, "retiring");
         ctx_cv_.notify_all();
-        return true;
+        return destroyed;
     }
 
     ~AioContextPool() {
@@ -249,12 +315,44 @@ class AioContextPool {
         }
         for (auto ctx : ctx_bak_) {
             if (checked_out.find(ctx) == checked_out.end()) {
-                io_destroy(ctx);
+                DestroyContextNoThrow(ctx, "destroying during shutdown");
             }
         }
     }
 
  private:
+    void
+    MarkUnusableLocked() noexcept {
+        if (state_ == State::Healthy) {
+            state_ = State::Unusable;
+        }
+    }
+
+    void
+    RemoveTrackedContextLocked(io_context_t ctx) {
+        checked_out_ctxs_.erase(ctx);
+        owned_ctxs_.erase(ctx);
+        auto iter = std::find(ctx_bak_.begin(), ctx_bak_.end(), ctx);
+        if (iter != ctx_bak_.end()) {
+            ctx_bak_.erase(iter);
+        }
+    }
+
+    bool
+    DestroyContextNoThrow(io_context_t ctx, const char* action) noexcept {
+        int ret = io_destroy(ctx);
+#ifdef ENABLE_SYNCPOINT
+        TEST_SYNC_POINT_CALLBACK("AioContextPool::DestroyContext:AfterDestroy", &ret);
+#endif
+        if (ret != 0) {
+            const int err = ret < 0 ? -ret : ret;
+            LOG_ERROR("io_destroy failed while {} AIO context {} with ret={}, errno={}: {}", action,
+                      static_cast<void*>(ctx), ret, err, ::strerror(err));
+            return false;
+        }
+        return true;
+    }
+
     std::vector<io_context_t> ctx_bak_;
     std::queue<io_context_t> ctx_q_;
     std::unordered_set<io_context_t> owned_ctxs_;

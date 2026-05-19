@@ -206,13 +206,6 @@ IOContextPool::GetGlobal() {
 
 std::shared_ptr<IOContextPool>
 IOContextPool::GetGlobalOrInit(const IOContextPoolConfig& cfg) {
-    {
-        std::scoped_lock lk(g_io_pool_mutex);
-        if (g_io_pool != nullptr) {
-            return g_io_pool;
-        }
-    }
-
     if (!InitGlobal(cfg)) {
         return nullptr;
     }

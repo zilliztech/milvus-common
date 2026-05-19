@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <condition_variable>
 #include <cstddef>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <queue>
@@ -54,6 +55,8 @@ class UringContextPool {
         }
 
         bool should_destroy = false;
+        bool released = false;
+        bool notify_all = false;
         {
             std::scoped_lock lk(ring_mtx_);
             if (owned_rings_.find(ring) == owned_rings_.end()) {
@@ -61,31 +64,47 @@ class UringContextPool {
                 return false;
             }
 
-            if (checked_out_rings_.erase(ring) == 0) {
+            if (checked_out_rings_.find(ring) == checked_out_rings_.end()) {
                 LOG_WARN("UringContextPool rejects ring not checked out: {}", static_cast<void*>(ring));
                 return false;
             }
 
             if (state_ != State::Healthy) {
-                owned_rings_.erase(ring);
-                auto iter = std::find(ring_bak_.begin(), ring_bak_.end(), ring);
-                if (iter != ring_bak_.end()) {
-                    ring_bak_.erase(iter);
-                }
+                RemoveTrackedRingLocked(ring);
                 should_destroy = true;
+                notify_all = true;
             } else {
-                ring_q_.push(ring);
+                try {
+                    ring_q_.push(ring);
+                    checked_out_rings_.erase(ring);
+                    released = true;
+                } catch (const std::exception& e) {
+                    LOG_ERROR("UringContextPool failed to requeue ring {}: {}", static_cast<void*>(ring), e.what());
+                    RemoveTrackedRingLocked(ring);
+                    MarkUnusableLocked();
+                    should_destroy = true;
+                    notify_all = true;
+                } catch (...) {
+                    LOG_ERROR("UringContextPool failed to requeue ring {}: unknown exception",
+                              static_cast<void*>(ring));
+                    RemoveTrackedRingLocked(ring);
+                    MarkUnusableLocked();
+                    should_destroy = true;
+                    notify_all = true;
+                }
             }
         }
 
         if (should_destroy) {
-            io_uring_queue_exit(ring);
-            delete ring;
+            DestroyRing(ring);
+            if (notify_all) {
+                ring_cv_.notify_all();
+            }
             return false;
         }
 
         ring_cv_.notify_one();
-        return true;
+        return released;
     }
 
     struct io_uring*
@@ -96,8 +115,29 @@ class UringContextPool {
             return nullptr;
         }
         auto ret = ring_q_.front();
+        try {
+            const auto inserted = checked_out_rings_.insert(ret).second;
+            if (!inserted) {
+                LOG_ERROR("UringContextPool detected duplicate checked-out ring: {}", static_cast<void*>(ret));
+                MarkUnusableLocked();
+                lk.unlock();
+                ring_cv_.notify_all();
+                return nullptr;
+            }
+        } catch (const std::exception& e) {
+            LOG_ERROR("UringContextPool failed to mark ring checked out: {}", e.what());
+            MarkUnusableLocked();
+            lk.unlock();
+            ring_cv_.notify_all();
+            return nullptr;
+        } catch (...) {
+            LOG_ERROR("UringContextPool failed to mark ring checked out: unknown exception");
+            MarkUnusableLocked();
+            lk.unlock();
+            ring_cv_.notify_all();
+            return nullptr;
+        }
         ring_q_.pop();
-        checked_out_rings_.insert(ret);
         return ret;
     }
 
@@ -125,6 +165,29 @@ class UringContextPool {
     ~UringContextPool();
 
  private:
+    void
+    MarkUnusableLocked() noexcept {
+        if (state_ == State::Healthy) {
+            state_ = State::Unusable;
+        }
+    }
+
+    void
+    RemoveTrackedRingLocked(struct io_uring* ring) {
+        checked_out_rings_.erase(ring);
+        owned_rings_.erase(ring);
+        auto iter = std::find(ring_bak_.begin(), ring_bak_.end(), ring);
+        if (iter != ring_bak_.end()) {
+            ring_bak_.erase(iter);
+        }
+    }
+
+    static void
+    DestroyRing(struct io_uring* ring) noexcept {
+        io_uring_queue_exit(ring);
+        delete ring;
+    }
+
     std::vector<struct io_uring*> ring_bak_;
     std::queue<struct io_uring*> ring_q_;
     std::unordered_set<struct io_uring*> owned_rings_;

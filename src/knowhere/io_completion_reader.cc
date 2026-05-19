@@ -371,6 +371,14 @@ IOCompletionReader::DrainOutstandingNoThrow() noexcept {
     bool drained = true;
     size_t retry = 0;
     size_t attempts = 0;
+#ifdef ENABLE_SYNCPOINT
+    bool skip_drain = false;
+    TEST_SYNC_POINT_CALLBACK("IOCompletionReader::DrainOutstandingNoThrow:Skip", &skip_drain);
+    if (skip_drain) {
+        drained = false;
+        attempts = kCleanupPeekLimit;
+    }
+#endif
     while (!pending_requests_.empty() && attempts++ < kCleanupPeekLimit) {
         try {
             io_uring_cqe* cqe = nullptr;

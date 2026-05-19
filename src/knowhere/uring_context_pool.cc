@@ -113,19 +113,13 @@ UringContextPool::ResetCheckedOut(struct io_uring* ring) {
             if (state_ == State::Healthy) {
                 reusable = true;
             } else {
-                checked_out_rings_.erase(ring);
-                owned_rings_.erase(ring);
-                auto iter = std::find(ring_bak_.begin(), ring_bak_.end(), ring);
-                if (iter != ring_bak_.end()) {
-                    ring_bak_.erase(iter);
-                }
+                RemoveTrackedRingLocked(ring);
             }
         }
         if (reusable) {
             return true;
         }
-        io_uring_queue_exit(ring);
-        delete ring;
+        DestroyRing(ring);
         ring_cv_.notify_all();
         return false;
     }
@@ -133,13 +127,8 @@ UringContextPool::ResetCheckedOut(struct io_uring* ring) {
     LOG_ERROR("io_uring_queue_init failed while resetting ring with ret={}, errno={}: {}", ret, -ret, ::strerror(-ret));
     {
         std::scoped_lock lk(ring_mtx_);
-        checked_out_rings_.erase(ring);
-        owned_rings_.erase(ring);
-        auto iter = std::find(ring_bak_.begin(), ring_bak_.end(), ring);
-        if (iter != ring_bak_.end()) {
-            ring_bak_.erase(iter);
-        }
-        state_ = State::Unusable;
+        RemoveTrackedRingLocked(ring);
+        MarkUnusableLocked();
     }
     ring_cv_.notify_all();
     delete ring;
@@ -159,23 +148,16 @@ UringContextPool::RetireCheckedOut(struct io_uring* ring) {
             LOG_WARN("UringContextPool rejects retire for unknown ring: {}", static_cast<void*>(ring));
             return false;
         }
-        if (checked_out_rings_.erase(ring) == 0) {
+        if (checked_out_rings_.find(ring) == checked_out_rings_.end()) {
             LOG_WARN("UringContextPool rejects retire for ring not checked out: {}", static_cast<void*>(ring));
             return false;
         }
 
-        owned_rings_.erase(ring);
-        auto iter = std::find(ring_bak_.begin(), ring_bak_.end(), ring);
-        if (iter != ring_bak_.end()) {
-            ring_bak_.erase(iter);
-        }
-        if (state_ == State::Healthy) {
-            state_ = State::Unusable;
-        }
+        RemoveTrackedRingLocked(ring);
+        MarkUnusableLocked();
     }
 
-    io_uring_queue_exit(ring);
-    delete ring;
+    DestroyRing(ring);
     ring_cv_.notify_all();
     return true;
 }
@@ -257,8 +239,7 @@ UringContextPool::~UringContextPool() {
 
     for (auto* ring : ring_bak_) {
         if (checked_out.find(ring) == checked_out.end()) {
-            io_uring_queue_exit(ring);
-            delete ring;
+            DestroyRing(ring);
         }
     }
     ring_bak_.clear();
