@@ -146,6 +146,30 @@ ThreadPool::GetFetchThreadPoolPendingTaskCount() {
     return ThreadPool::GetGlobalFetchThreadPool()->GetPendingTaskCount();
 }
 
+size_t
+ThreadPool::GetGlobalBuildThreadPoolActiveThreadCount() {
+    std::lock_guard<std::mutex> lock(build_pool_mutex_);
+    return build_pool_ == nullptr
+               ? 0
+               : build_pool_->GetPool().getPoolStats().activeThreadCount;
+}
+
+size_t
+ThreadPool::GetGlobalSearchThreadPoolActiveThreadCount() {
+    std::lock_guard<std::mutex> lock(search_pool_mutex_);
+    return search_pool_ == nullptr
+               ? 0
+               : search_pool_->GetPool().getPoolStats().activeThreadCount;
+}
+
+size_t
+ThreadPool::GetGlobalFetchThreadPoolActiveThreadCount() {
+    std::lock_guard<std::mutex> lock(fetch_object_pool_mutex_);
+    return fetch_object_pool_ == nullptr
+               ? 0
+               : fetch_object_pool_->GetPool().getPoolStats().activeThreadCount;
+}
+
 std::shared_ptr<ThreadPool>
 ThreadPool::GetGlobalBuildThreadPool() {
     if (build_pool_ == nullptr) {

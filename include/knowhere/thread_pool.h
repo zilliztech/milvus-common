@@ -200,6 +200,15 @@ class ThreadPool {
     static size_t
     GetFetchThreadPoolPendingTaskCount();
 
+    static size_t
+    GetGlobalBuildThreadPoolActiveThreadCount();
+
+    static size_t
+    GetGlobalSearchThreadPoolActiveThreadCount();
+
+    static size_t
+    GetGlobalFetchThreadPoolActiveThreadCount();
+
     static std::shared_ptr<ThreadPool>
     GetGlobalBuildThreadPool();
 
