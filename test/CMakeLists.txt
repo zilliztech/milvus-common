@@ -18,6 +18,7 @@ set(ALL_TEST_FILES
     init_gtest.cpp
     TracerTest.cpp
     StreamTest.cpp
+    IOContextPoolTest.cpp
 )
 
 add_executable(all_tests
