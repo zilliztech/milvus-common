@@ -288,7 +288,21 @@ IOCompletionReader::WaitOneCompletion() {
             }
             throw std::runtime_error("io_uring_wait_cqe failed");
         }
+#ifdef ENABLE_SYNCPOINT
+        bool force_null_cqe = false;
+        TEST_SYNC_POINT_CALLBACK("IOCompletionReader::WaitOneCompletion:ForceNullCqe", &force_null_cqe);
+        if (force_null_cqe) {
+            cqe = nullptr;
+        }
+#endif
         if (cqe == nullptr) {
+            if (!knowhere_internal::ShouldRetryInterruptedSyscall(retry, kNumRetries)) {
+                LOG_ERROR("io_uring_wait_cqe returned success with null CQE, pending operations: {}",
+                          PendingOperationCount());
+                FailPendingRequests(0);
+                ResetHandleUring();
+                throw std::runtime_error("io_uring_wait_cqe returned null CQE too many times");
+            }
             continue;
         }
 

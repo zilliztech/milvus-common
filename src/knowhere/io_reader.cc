@@ -127,9 +127,7 @@ SubmitAioBatch(io_context_t ctx, int fd, const std::vector<std::byte*>& buffers,
             continue;
         }
         submitted_total += static_cast<size_t>(submitted);
-        if (submitted_total < batch && ++retry > kNumRetries) {
-            break;
-        }
+        retry = 0;
     }
     return submitted_total;
 }
@@ -140,9 +138,9 @@ WaitAioBatch(io_context_t ctx, size_t size, const std::vector<struct iocb>& cbs,
         return {0, true, true};
     }
 
-    std::unordered_set<struct iocb*> expected_cbs;
+    std::unordered_set<const struct iocb*> expected_cbs;
     for (size_t i = 0; i < submitted_total; ++i) {
-        expected_cbs.insert(const_cast<struct iocb*>(&cbs[i]));
+        expected_cbs.insert(&cbs[i]);
     }
 
     std::vector<struct io_event> events(submitted_total);
@@ -150,8 +148,16 @@ WaitAioBatch(io_context_t ctx, size_t size, const std::vector<struct iocb>& cbs,
     result.ok = true;
     size_t retry = 0;
     while (result.completed < submitted_total) {
-        const auto completed = io_getevents(ctx, 1, static_cast<long>(submitted_total - result.completed),
-                                            events.data() + result.completed, nullptr);
+        size_t max_events = submitted_total - result.completed;
+#ifdef ENABLE_SYNCPOINT
+        size_t forced_max_events = 0;
+        TEST_SYNC_POINT_CALLBACK("IOReader::WaitAioBatch:BeforeGetEvents", &forced_max_events);
+        if (forced_max_events > 0) {
+            max_events = std::min(max_events, forced_max_events);
+        }
+#endif
+        const auto completed =
+            io_getevents(ctx, 1, static_cast<long>(max_events), events.data() + result.completed, nullptr);
         if (completed < 0) {
             if (-completed == EINTR) {
                 if (!knowhere_internal::ShouldRetryInterruptedSyscall(retry, kNumRetries)) {
@@ -168,15 +174,13 @@ WaitAioBatch(io_context_t ctx, size_t size, const std::vector<struct iocb>& cbs,
             continue;
         }
         for (size_t i = result.completed; i < result.completed + static_cast<size_t>(completed); ++i) {
-            if (expected_cbs.erase(events[i].obj) == 0 || events[i].res < 0 ||
+            if (expected_cbs.erase(static_cast<const struct iocb*>(events[i].obj)) == 0 || events[i].res < 0 ||
                 static_cast<size_t>(events[i].res) != size) {
                 result.ok = false;
             }
         }
         result.completed += static_cast<size_t>(completed);
-        if (result.completed < submitted_total && ++retry > kNumRetries) {
-            break;
-        }
+        retry = 0;
     }
     result.complete = result.completed == submitted_total;
     result.ok = result.ok && result.complete;
