@@ -47,6 +47,12 @@ class UringContextPool {
         return state_ == State::Healthy && ring_bak_.size() == num_ctx_ && !ring_bak_.empty();
     }
 
+    size_t
+    created_context_count() const {
+        std::scoped_lock lk(ring_mtx_);
+        return ring_bak_.size();
+    }
+
     bool
     push(struct io_uring* ring) {
         if (ring == nullptr) {

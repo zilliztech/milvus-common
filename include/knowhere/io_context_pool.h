@@ -124,19 +124,10 @@ class IOContextPool : public std::enable_shared_from_this<IOContextPool> {
     Push(IOContextHandle&& handle);
 
     bool
-    Push(IOContextHandle& handle);
-
-    bool
     Reset(IOContextHandle&& handle);
 
     bool
-    Reset(IOContextHandle& handle);
-
-    bool
     Release(IOContextHandle&& handle, IOContextReleaseDisposition disposition);
-
-    bool
-    Release(IOContextHandle& handle, IOContextReleaseDisposition disposition);
 
 #ifdef WITH_IO_URING
     struct io_uring*

@@ -4,8 +4,11 @@
 
 #include "syncpoint/sync_point.h"
 
+#include <fcntl.h>
+
 #include <algorithm>
 #include <cerrno>
+#include <cstdint>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -16,6 +19,43 @@
 namespace {
 constexpr size_t kNumRetries = 10;
 constexpr size_t kCleanupPeekLimit = 1024;
+
+#ifdef WITH_IO_URING
+constexpr size_t kDirectIoAlignment = 512;
+
+bool
+IsAlignedForDirectIo(const void* ptr, size_t alignment) {
+    return reinterpret_cast<uintptr_t>(ptr) % alignment == 0;
+}
+
+void
+ValidateDirectIoAlignment(int fd, size_t size, IOCompletionReaderSpan<std::byte* const> buffers,
+                          IOCompletionReaderSpan<const size_t> offsets) {
+#ifdef O_DIRECT
+    const auto flags = fcntl(fd, F_GETFL);
+    if (flags < 0 || (flags & O_DIRECT) == 0) {
+        return;
+    }
+
+    if (size % kDirectIoAlignment != 0) {
+        throw std::invalid_argument("O_DIRECT read size must be 512-byte aligned");
+    }
+    for (size_t i = 0; i < buffers.size(); ++i) {
+        if (!IsAlignedForDirectIo(buffers[i], kDirectIoAlignment)) {
+            throw std::invalid_argument("O_DIRECT read buffer address must be 512-byte aligned");
+        }
+        if (offsets[i] % kDirectIoAlignment != 0) {
+            throw std::invalid_argument("O_DIRECT read offset must be 512-byte aligned");
+        }
+    }
+#else
+    (void)fd;
+    (void)size;
+    (void)buffers;
+    (void)offsets;
+#endif
+}
+#endif
 
 #ifdef WITH_IO_URING
 int
@@ -72,7 +112,7 @@ IOCompletionReader::IOCompletionReader(IOCompletionReader&& other) noexcept
 }
 
 IOCompletionReader&
-IOCompletionReader::operator=(IOCompletionReader&& other) {
+IOCompletionReader::operator=(IOCompletionReader&& other) noexcept {
     if (this == &other) {
         return *this;
     }
@@ -124,6 +164,7 @@ IOCompletionReader::Submit(IOCompletionReaderSpan<std::byte* const> buffers, siz
             throw std::invalid_argument("buffer pointer should not be null");
         }
     }
+    ValidateDirectIoAlignment(fd_, size, buffers, offsets);
 
     const auto max_events = io_pool_->MaxEventsPerCtx();
     if (max_events == 0) {
@@ -547,7 +588,7 @@ IOCompletionReader::ResetHandleUring() {
         return false;
     }
 
-    return io_pool_->Reset(handle_);
+    return io_pool_->Reset(std::move(handle_));
 #endif
     return false;
 }
@@ -555,7 +596,7 @@ IOCompletionReader::ResetHandleUring() {
 void
 IOCompletionReader::ReleaseHandle() {
     if (io_pool_ != nullptr && handle_.backend != IOBackend::UNKNOWN) {
-        io_pool_->Push(handle_);
+        io_pool_->Push(std::move(handle_));
     }
     handle_ = IOContextHandle{};
 }

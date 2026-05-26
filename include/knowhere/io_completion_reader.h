@@ -33,7 +33,7 @@ class IOCompletionReader {
 
     IOCompletionReader(IOCompletionReader&& other) noexcept;
     IOCompletionReader&
-    operator=(IOCompletionReader&& other);
+    operator=(IOCompletionReader&& other) noexcept;
 
     ~IOCompletionReader();
 

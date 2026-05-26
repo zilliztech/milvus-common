@@ -49,7 +49,7 @@ class IOContextHandleGuard {
     void
     Reset() {
         if (active_ && pool_ != nullptr) {
-            pool_->Push(handle_);
+            pool_->Push(std::move(handle_));
             active_ = false;
         }
     }
@@ -61,7 +61,7 @@ class IOContextHandleGuard {
             return;
         }
         active_ = false;
-        pool_->Reset(handle_);
+        pool_->Reset(std::move(handle_));
     }
 #endif
 
@@ -72,7 +72,7 @@ class IOContextHandleGuard {
             return;
         }
         active_ = false;
-        pool_->Reset(handle_);
+        pool_->Reset(std::move(handle_));
     }
 #endif
 
@@ -235,7 +235,7 @@ WaitAioBatch(io_context_t ctx, size_t size, const std::vector<struct iocb>& cbs,
 class AioReadState {
  public:
     AioReadState(IOContextHandleGuard guard, size_t size, size_t first_submitted,
-                 std::vector<struct iocb>&& first_cbs)
+                 std::shared_ptr<std::vector<struct iocb>> first_cbs)
         : guard_(std::move(guard)),
           size_(size),
           first_remaining_(first_submitted),
@@ -273,7 +273,7 @@ class AioReadState {
         if (first_remaining_ == 0) {
             return {0, true, true};
         }
-        auto result = WaitAioBatch(Context(), size_, first_cbs_, first_remaining_);
+        auto result = WaitAioBatch(Context(), size_, *first_cbs_, first_remaining_);
         first_remaining_ -= result.completed;
         result.complete = first_remaining_ == 0;
         result.ok = result.ok && result.complete;
@@ -290,7 +290,7 @@ class AioReadState {
     IOContextHandleGuard guard_;
     size_t size_ = 0;
     size_t first_remaining_ = 0;
-    std::vector<struct iocb> first_cbs_;
+    std::shared_ptr<std::vector<struct iocb>> first_cbs_;
 };
 
 std::future<bool>
@@ -309,8 +309,8 @@ ReadAioAsync(int fd, size_t size, std::vector<std::byte*>&& buffers, std::vector
     }
 
     const size_t first_batch = std::min(max_batch, buffers.size());
-    std::vector<struct iocb> first_cbs;
-    const size_t first_submitted = SubmitAioBatch(ctx, fd, buffers, size, offsets, 0, first_batch, first_cbs);
+    auto first_cbs = std::make_shared<std::vector<struct iocb>>();
+    const size_t first_submitted = SubmitAioBatch(ctx, fd, buffers, size, offsets, 0, first_batch, *first_cbs);
     if (first_submitted == 0) {
         return MakeReadyFuture(false);
     }
@@ -367,9 +367,9 @@ SubmitUring(io_uring* ring) {
 
 size_t
 PrepareUringBatch(io_uring* ring, int fd, const std::vector<std::byte*>& buffers, size_t size,
-                  const std::vector<size_t>& offsets, size_t start) {
+                  const std::vector<size_t>& offsets, size_t start, size_t max_batch) {
     size_t batch = 0;
-    for (; start + batch < buffers.size(); ++batch) {
+    for (; batch < max_batch && start + batch < buffers.size(); ++batch) {
         auto* sqe = io_uring_get_sqe(ring);
         if (sqe == nullptr) {
             break;
@@ -491,7 +491,11 @@ ReadUringAsync(int fd, size_t size, std::vector<std::byte*>&& buffers, std::vect
 
     auto* ring = handle.uring;
     IOContextHandleGuard guard(pool, std::move(handle));
-    const size_t first_batch = PrepareUringBatch(ring, fd, buffers, size, offsets, 0);
+    const size_t max_batch = pool->MaxEventsPerCtx();
+    if (max_batch == 0) {
+        return MakeReadyFuture(false);
+    }
+    const size_t first_batch = PrepareUringBatch(ring, fd, buffers, size, offsets, 0, max_batch);
     if (first_batch == 0) {
         guard.ResetUring();
         return MakeReadyFuture(false);
@@ -507,7 +511,7 @@ ReadUringAsync(int fd, size_t size, std::vector<std::byte*>&& buffers, std::vect
     return std::async(
         std::launch::deferred,
         [fd, size, buffers = std::move(buffers), offsets = std::move(offsets), first_batch, first_submitted,
-         state = UringReadState(std::move(guard), size, first_batch, first_submitted)]() mutable -> bool {
+         max_batch, state = UringReadState(std::move(guard), size, first_batch, first_submitted)]() mutable -> bool {
             auto* ring = state.Ring();
             const auto first_result = state.CollectFirst();
             if (!first_result.complete || first_submitted != first_batch) {
@@ -521,7 +525,7 @@ ReadUringAsync(int fd, size_t size, std::vector<std::byte*>&& buffers, std::vect
 
             size_t processed = first_batch;
             while (processed < buffers.size()) {
-                const size_t batch = PrepareUringBatch(ring, fd, buffers, size, offsets, processed);
+                const size_t batch = PrepareUringBatch(ring, fd, buffers, size, offsets, processed, max_batch);
                 if (batch == 0) {
                     state.ResetRing();
                     return false;

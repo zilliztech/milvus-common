@@ -60,40 +60,21 @@ AioContextPool::GetGlobalAioPoolDirect() {
 
 bool
 AioContextPool::InitGlobalAioPool(size_t num_ctx, size_t max_events) {
-    IOContextPoolConfig cfg;
-    cfg.num_ctx = num_ctx;
-    cfg.max_events = max_events;
-
-    if (!IOContextPool::InitGlobal(cfg)) {
-        return false;
-    }
-
-    auto io_pool = IOContextPool::GetGlobal();
-    if (io_pool == nullptr || !io_pool->IsInitialized()) {
-        return false;
-    }
-    if (io_pool->Backend() != IOBackend::AIO) {
-        LOG_ERROR("Global IOContextPool backend is {}, legacy AIO API is unavailable", io_pool->BackendName());
-        return false;
-    }
-    return true;
+    return InitGlobalAioPoolWithValidation(num_ctx, max_events) && GetGlobalAioPoolDirect() != nullptr;
 }
 
 std::shared_ptr<AioContextPool>
 AioContextPool::GetGlobalAioPool() {
     auto io_pool = IOContextPool::GetGlobal();
-#if !defined(WITH_IO_URING)
-    if (io_pool == nullptr) {
-        io_pool = IOContextPool::GetGlobalOrInit();
+    if (io_pool != nullptr && io_pool->IsInitialized() && io_pool->Backend() == IOBackend::AIO) {
+        return io_pool->GetAioPoolForLegacy();
     }
-#endif
-    if (io_pool == nullptr || !io_pool->IsInitialized()) {
-        return nullptr;
+
+    if (io_pool != nullptr && io_pool->IsInitialized()) {
+        LOG_WARN("Returning independent legacy AIO pool while unified IOContextPool backend is {}",
+                 io_pool->BackendName());
     }
-    if (io_pool->Backend() != IOBackend::AIO) {
-        return nullptr;
-    }
-    return io_pool->GetAioPoolForLegacy();
+    return GetGlobalAioPoolDirect();
 }
 
 void

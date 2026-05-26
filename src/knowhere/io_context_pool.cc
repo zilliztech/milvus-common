@@ -82,7 +82,7 @@ IOContextHandle::ReleaseNoThrow() noexcept {
     }
 
     try {
-        owner->Release(*this, IOContextReleaseDisposition::Clean);
+        owner->Release(std::move(*this), IOContextReleaseDisposition::Clean);
     } catch (const std::exception& e) {
         LOG_ERROR("IOContextHandle failed to release context: {}", e.what());
         ClearNoRelease();
@@ -279,18 +279,8 @@ IOContextPool::Push(IOContextHandle&& handle) {
 }
 
 bool
-IOContextPool::Push(IOContextHandle& handle) {
-    return Push(std::move(handle));
-}
-
-bool
 IOContextPool::Reset(IOContextHandle&& handle) {
     return Release(std::move(handle), IOContextReleaseDisposition::Dirty);
-}
-
-bool
-IOContextPool::Reset(IOContextHandle& handle) {
-    return Reset(std::move(handle));
 }
 
 bool
@@ -318,9 +308,6 @@ IOContextPool::Release(IOContextHandle&& handle, IOContextReleaseDisposition dis
                 released = PushUring(handle.uring);
             } else if (disposition == IOContextReleaseDisposition::Dirty) {
                 released = ResetUring(handle.uring);
-                if (released) {
-                    released = PushUring(handle.uring);
-                }
             } else {
                 released = RetireUring(handle.uring);
             }
@@ -342,11 +329,6 @@ IOContextPool::Release(IOContextHandle&& handle, IOContextReleaseDisposition dis
     }
     handle.ClearNoRelease();
     return released;
-}
-
-bool
-IOContextPool::Release(IOContextHandle& handle, IOContextReleaseDisposition disposition) {
-    return Release(std::move(handle), disposition);
 }
 
 #ifdef WITH_IO_URING

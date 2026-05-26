@@ -246,11 +246,11 @@ TEST_F(IOContextPoolTestFixture, UnifiedPopPushShouldUseSelectedBackend) {
     ASSERT_EQ(handle.backend, IOBackend::AIO);
     ASSERT_NE(handle.aio, nullptr);
 #endif
-    pool->Push(handle);
+    pool->Push(std::move(handle));
 
     auto second = pool->Pop();
     ASSERT_EQ(second.backend, pool->Backend());
-    pool->Push(second);
+    pool->Push(std::move(second));
 }
 
 TEST_F(IOContextPoolTestFixture, HandleDestructorShouldReturnCheckedOutContext) {
@@ -271,7 +271,7 @@ TEST_F(IOContextPoolTestFixture, HandleDestructorShouldReturnCheckedOutContext) 
     ASSERT_EQ(second.wait_for(std::chrono::seconds(1)), std::future_status::ready);
     auto handle = second.get();
     ASSERT_TRUE(handle.HasContext());
-    pool->Push(handle);
+    pool->Push(std::move(handle));
 }
 
 TEST_F(IOContextPoolTestFixture, MoveAssignHandleShouldReturnPreviousContext) {
@@ -296,8 +296,8 @@ TEST_F(IOContextPoolTestFixture, MoveAssignHandleShouldReturnPreviousContext) {
     auto returned_handle = returned.get();
     ASSERT_TRUE(returned_handle.HasContext());
 
-    pool->Push(returned_handle);
-    pool->Push(second);
+    pool->Push(std::move(returned_handle));
+    pool->Push(std::move(second));
 }
 
 TEST_F(IOContextPoolTestFixture, RetireHandleShouldMakePoolFailFast) {
@@ -311,7 +311,7 @@ TEST_F(IOContextPoolTestFixture, RetireHandleShouldMakePoolFailFast) {
 
     auto handle = pool->Pop();
     ASSERT_TRUE(handle.HasContext());
-    ASSERT_TRUE(pool->Release(handle, IOContextReleaseDisposition::Retire));
+    ASSERT_TRUE(pool->Release(std::move(handle), IOContextReleaseDisposition::Retire));
 
     auto failed = std::async(std::launch::async, [&] { return pool->Pop(); });
     ASSERT_EQ(failed.wait_for(std::chrono::seconds(1)), std::future_status::ready);
@@ -332,12 +332,12 @@ TEST_F(IOContextPoolTestFixture, PushShouldRejectHandleFromDifferentBackend) {
 
     IOContextHandle mismatched;
     mismatched.backend = handle.backend == IOBackend::AIO ? IOBackend::IO_URING : IOBackend::AIO;
-    pool->Push(mismatched);
-    pool->Push(handle);
+    pool->Push(std::move(mismatched));
+    pool->Push(std::move(handle));
 
     auto second = pool->Pop();
     ASSERT_EQ(second.backend, pool->Backend());
-    pool->Push(second);
+    pool->Push(std::move(second));
 }
 
 TEST_F(IOContextPoolTestFixture, IoReaderSpanShouldUseCompatSpanType) {
@@ -385,7 +385,7 @@ TEST_F(IOContextPoolTestFixture, ResetFailureShouldMakePoolFailFast) {
 
     auto handle = pool->Pop();
     ASSERT_TRUE(handle.HasContext());
-    ASSERT_FALSE(pool->Reset(handle));
+    ASSERT_FALSE(pool->Reset(std::move(handle)));
 
     auto blocked = std::async(std::launch::async, [&] { return pool->Pop(); });
     ASSERT_EQ(blocked.wait_for(std::chrono::seconds(1)), std::future_status::ready);
@@ -424,7 +424,7 @@ TEST_F(IOContextPoolTestFixture, AioDestroyFailureShouldMakePoolFailFast) {
 
     auto handle = pool->Pop();
     ASSERT_TRUE(handle.HasContext());
-    ASSERT_FALSE(pool->Reset(handle));
+    ASSERT_FALSE(pool->Reset(std::move(handle)));
 
     auto failed = std::async(std::launch::async, [&] { return pool->Pop(); });
     ASSERT_EQ(failed.wait_for(std::chrono::seconds(1)), std::future_status::ready);
@@ -438,18 +438,14 @@ TEST_F(IOContextPoolTestFixture, AioDestroyFailureShouldMakePoolFailFast) {
 
 #ifdef MILVUS_COMMON_WITH_LIBAIO
 TEST_F(IOContextPoolTestFixture, LegacyAioInitStillWorksViaUnifiedPath) {
-#ifdef WITH_IO_URING
-    ASSERT_FALSE(AioContextPool::InitGlobalAioPool(2, 128));
-    ASSERT_EQ(AioContextPool::GetGlobalAioPool(), nullptr);
-#else
     ASSERT_TRUE(AioContextPool::InitGlobalAioPool(2, 64));
     auto p = AioContextPool::GetGlobalAioPool();
     ASSERT_NE(p, nullptr);
+    ASSERT_EQ(p->max_events_per_ctx(), 64u);
     auto io_pool = IOContextPool::GetGlobal();
-    ASSERT_NE(io_pool, nullptr);
-    ASSERT_EQ(io_pool->Backend(), IOBackend::AIO);
-    ASSERT_EQ(io_pool->MaxEventsPerCtx(), 64u);
-#endif
+    if (io_pool != nullptr && io_pool->IsInitialized()) {
+        ASSERT_NE(io_pool->Backend(), IOBackend::AIO);
+    }
 }
 
 TEST_F(IOContextPoolTestFixture, LegacyAioValidationReinitMismatchShouldFail) {
@@ -547,22 +543,11 @@ TEST_F(IOContextPoolTestFixture, LegacyUringDirectDefaultShouldProvideMultipleCo
     if (!pool->IsUsable()) {
         GTEST_SKIP() << "io_uring backend unavailable";
     }
+    ASSERT_GT(pool->created_context_count(), 1u);
 
     auto* first = pool->pop();
     ASSERT_NE(first, nullptr);
-
-    auto second_future = std::async(std::launch::async, [&] { return pool->pop(); });
-    if (second_future.wait_for(std::chrono::milliseconds(100)) != std::future_status::ready) {
-        pool->push(first);
-        first = nullptr;
-        auto* second = second_future.get();
-        if (second != nullptr) {
-            pool->push(second);
-        }
-        FAIL() << "direct uring default should expose more than one context";
-    }
-
-    auto* second = second_future.get();
+    auto* second = pool->pop();
     ASSERT_NE(second, nullptr);
     pool->push(second);
     pool->push(first);
@@ -1283,6 +1268,40 @@ TEST_F(IOContextPoolTestFixture, CompletionReaderReportsNegativeCqeFailure) {
     ASSERT_EQ(completion.request_id, request);
     ASSERT_FALSE(completion.ok);
 
+    ::unlink(path);
+}
+
+TEST_F(IOContextPoolTestFixture, CompletionReaderShouldRejectMisalignedDirectIoBuffer) {
+    IOContextPoolConfig cfg;
+    cfg.num_ctx = 1;
+    cfg.max_events = 8;
+    ASSERT_TRUE(IOContextPool::InitGlobal(cfg));
+
+    auto pool = IOContextPool::GetGlobal();
+    ASSERT_NE(pool, nullptr);
+    if (pool->Backend() != IOBackend::IO_URING) {
+        GTEST_SKIP() << "io_uring backend unavailable";
+    }
+
+    char path[] = "/tmp/io_completion_reader_direct_alignment_XXXXXX";
+    int fd = OpenIOReaderTestFile(path, true);
+    if (fd < 0 && errno == EINVAL) {
+        ::unlink(path);
+        GTEST_SKIP() << "direct I/O is not available for alignment test";
+    }
+    ASSERT_GE(fd, 0);
+
+    auto buffer = AllocateAlignedBuffer(kIOReaderTestBlockSize + 1);
+    ASSERT_NE(buffer, nullptr);
+
+    IOCompletionReader reader(fd, pool);
+    std::array<std::byte*, 1> buffers{buffer.get() + 1};
+    std::array<size_t, 1> offsets{0};
+    EXPECT_THROW(reader.Submit(IOCompletionReaderSpan<std::byte* const>(buffers.data(), buffers.size()),
+                               kIOReaderTestBlockSize, IOCompletionReaderSpan<const size_t>(offsets.data(), offsets.size())),
+                 std::invalid_argument);
+
+    ASSERT_EQ(::close(fd), 0);
     ::unlink(path);
 }
 

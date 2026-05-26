@@ -107,19 +107,40 @@ UringContextPool::ResetCheckedOut(struct io_uring* ring) {
         ret = io_uring_queue_init(static_cast<unsigned>(max_entries_), ring, 0);
     }
     if (ret == 0) {
-        bool reusable = false;
+        bool released = false;
+        bool should_destroy = false;
         {
             std::scoped_lock lk(ring_mtx_);
             if (state_ == State::Healthy) {
-                reusable = true;
+                try {
+                    ring_q_.push(ring);
+                    checked_out_rings_.erase(ring);
+                    released = true;
+                } catch (const std::exception& e) {
+                    LOG_ERROR("UringContextPool failed to requeue reset ring {}: {}", static_cast<void*>(ring),
+                              e.what());
+                    RemoveTrackedRingLocked(ring);
+                    MarkUnusableLocked();
+                    should_destroy = true;
+                } catch (...) {
+                    LOG_ERROR("UringContextPool failed to requeue reset ring {}: unknown exception",
+                              static_cast<void*>(ring));
+                    RemoveTrackedRingLocked(ring);
+                    MarkUnusableLocked();
+                    should_destroy = true;
+                }
             } else {
                 RemoveTrackedRingLocked(ring);
+                should_destroy = true;
             }
         }
-        if (reusable) {
+        if (released) {
+            ring_cv_.notify_one();
             return true;
         }
-        DestroyRing(ring);
+        if (should_destroy) {
+            DestroyRing(ring);
+        }
         ring_cv_.notify_all();
         return false;
     }
