@@ -129,7 +129,7 @@ else()
 endif()
 
 add_library(milvus-common SHARED ${SRC_FILES})
-target_compile_features(milvus-common PUBLIC cxx_std_20)
+target_compile_features(milvus-common PRIVATE cxx_std_20)
 
 # Use std::shared_ptr etc. instead of opentelemetry::nostd:: equivalents
 target_compile_definitions(milvus-common PUBLIC OPENTELEMETRY_STL_VERSION=2017)

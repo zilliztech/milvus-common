@@ -4,8 +4,11 @@
 
 #include "syncpoint/sync_point.h"
 
+#include <fcntl.h>
+
 #include <algorithm>
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <stdexcept>
 #include <unordered_set>
@@ -80,12 +83,46 @@ class IOContextHandleGuard {
 };
 
 constexpr size_t kNumRetries = 10;
+constexpr size_t kDirectIoAlignment = 512;
 
 struct BatchWaitResult {
     size_t completed = 0;
     bool complete = false;
     bool ok = false;
 };
+
+bool
+IsAlignedForDirectIo(const void* ptr, size_t alignment) {
+    return reinterpret_cast<uintptr_t>(ptr) % alignment == 0;
+}
+
+void
+ValidateDirectIoAlignment(int fd, size_t size, const std::vector<std::byte*>& buffers,
+                          const std::vector<size_t>& offsets) {
+#ifdef O_DIRECT
+    const auto flags = fcntl(fd, F_GETFL);
+    if (flags < 0 || (flags & O_DIRECT) == 0) {
+        return;
+    }
+
+    if (size % kDirectIoAlignment != 0) {
+        throw std::invalid_argument("O_DIRECT read size must be 512-byte aligned");
+    }
+    for (size_t i = 0; i < buffers.size(); ++i) {
+        if (!IsAlignedForDirectIo(buffers[i], kDirectIoAlignment)) {
+            throw std::invalid_argument("O_DIRECT read buffer address must be 512-byte aligned");
+        }
+        if (offsets[i] % kDirectIoAlignment != 0) {
+            throw std::invalid_argument("O_DIRECT read offset must be 512-byte aligned");
+        }
+    }
+#else
+    (void)fd;
+    (void)size;
+    (void)buffers;
+    (void)offsets;
+#endif
+}
 
 #ifdef MILVUS_COMMON_WITH_LIBAIO
 size_t
@@ -219,7 +256,10 @@ class AioReadState {
 
     ~AioReadState() {
         if (first_remaining_ != 0) {
-            ResetContext();
+            const auto result = CollectFirst();
+            if (!result.complete) {
+                ResetContext();
+            }
         }
     }
 
@@ -378,8 +418,11 @@ WaitUringBatch(io_uring* ring, size_t size, size_t submitted_total, size_t start
 
 class UringReadState {
  public:
-    UringReadState(IOContextHandleGuard guard, size_t size, size_t first_submitted)
-        : guard_(std::move(guard)), size_(size), first_remaining_(first_submitted) {
+    UringReadState(IOContextHandleGuard guard, size_t size, size_t first_prepared, size_t first_submitted)
+        : guard_(std::move(guard)),
+          size_(size),
+          first_prepared_(first_prepared),
+          first_remaining_(first_submitted) {
     }
 
     UringReadState(const UringReadState&) = delete;
@@ -389,12 +432,19 @@ class UringReadState {
     UringReadState(UringReadState&& other) noexcept
         : guard_(std::move(other.guard_)),
           size_(other.size_),
+          first_prepared_(other.first_prepared_),
           first_remaining_(other.first_remaining_) {
+        other.first_prepared_ = 0;
         other.first_remaining_ = 0;
     }
 
     ~UringReadState() {
-        if (first_remaining_ != 0) {
+        if (first_remaining_ == 0) {
+            return;
+        }
+
+        const auto result = CollectFirst();
+        if (!result.complete || !result.ok || first_prepared_ != result.completed) {
             ResetRing();
         }
     }
@@ -415,16 +465,19 @@ class UringReadState {
         if (first_remaining_ == 0) {
             return {0, true, true};
         }
+        const auto waiting = first_remaining_;
         auto result = WaitUringBatch(Ring(), size_, first_remaining_, 0);
         first_remaining_ -= result.completed;
         result.complete = first_remaining_ == 0;
         result.ok = result.ok && result.complete;
+        result.completed = waiting - first_remaining_;
         return result;
     }
 
  private:
     IOContextHandleGuard guard_;
     size_t size_ = 0;
+    size_t first_prepared_ = 0;
     size_t first_remaining_ = 0;
 };
 
@@ -454,7 +507,7 @@ ReadUringAsync(int fd, size_t size, std::vector<std::byte*>&& buffers, std::vect
     return std::async(
         std::launch::deferred,
         [fd, size, buffers = std::move(buffers), offsets = std::move(offsets), first_batch, first_submitted,
-         state = UringReadState(std::move(guard), size, first_submitted)]() mutable -> bool {
+         state = UringReadState(std::move(guard), size, first_batch, first_submitted)]() mutable -> bool {
             auto* ring = state.Ring();
             const auto first_result = state.CollectFirst();
             if (!first_result.complete || first_submitted != first_batch) {
@@ -551,6 +604,7 @@ IOReader::ReadAsync(std::vector<std::byte*>&& buffers, size_t size, std::vector<
             throw std::invalid_argument("buffer pointer should not be null");
         }
     }
+    ValidateDirectIoAlignment(fd_, size, buffers, offsets);
 
     auto pool = io_pool_ ? io_pool_ : IOContextPool::GetGlobal();
     if (pool == nullptr || !pool->IsInitialized()) {

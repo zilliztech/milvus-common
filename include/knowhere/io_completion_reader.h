@@ -5,12 +5,15 @@
 #include <deque>
 #include <memory>
 #include <optional>
-#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "knowhere/io_context_pool.h"
+#include "knowhere/io_span.h"
+
+template <typename T>
+using IOCompletionReaderSpan = knowhere_compat::span<T>;
 
 // Worker-local, single-threaded completion reader. Not thread-safe.
 class IOCompletionReader {
@@ -35,7 +38,7 @@ class IOCompletionReader {
     ~IOCompletionReader();
 
     RequestId
-    Submit(std::span<std::byte* const> buffers, size_t size, std::span<const size_t> offsets);
+    Submit(IOCompletionReaderSpan<std::byte* const> buffers, size_t size, IOCompletionReaderSpan<const size_t> offsets);
 
     Completion
     WaitCompleted();
@@ -67,6 +70,9 @@ class IOCompletionReader {
 
     void
     DrainOutstandingNoThrow() noexcept;
+
+    bool
+    DrainOutstandingBlockingNoThrow() noexcept;
 
     void
     DrainOutstanding();

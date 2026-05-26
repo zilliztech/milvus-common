@@ -99,7 +99,8 @@ IOCompletionReader::~IOCompletionReader() {
 }
 
 IOCompletionReader::RequestId
-IOCompletionReader::Submit(std::span<std::byte* const> buffers, size_t size, std::span<const size_t> offsets) {
+IOCompletionReader::Submit(IOCompletionReaderSpan<std::byte* const> buffers, size_t size,
+                           IOCompletionReaderSpan<const size_t> offsets) {
 #ifndef WITH_IO_URING
     (void)buffers;
     (void)size;
@@ -376,71 +377,45 @@ IOCompletionReader::PendingOperationCount() const {
 void
 IOCompletionReader::DrainOutstandingNoThrow() noexcept {
 #ifdef WITH_IO_URING
-    if (!IsReady()) {
-        ready_completions_.clear();
+    const bool drained = DrainOutstandingBlockingNoThrow();
+    ready_completions_.clear();
+    if (!drained) {
         pending_requests_.clear();
-        return;
+        ResetHandleUring();
+    }
+#endif
+}
+
+bool
+IOCompletionReader::DrainOutstandingBlockingNoThrow() noexcept {
+#ifdef WITH_IO_URING
+    if (!IsReady()) {
+        return pending_requests_.empty();
     }
 
-    bool drained = true;
-    size_t retry = 0;
-    size_t attempts = 0;
 #ifdef ENABLE_SYNCPOINT
     bool skip_drain = false;
     TEST_SYNC_POINT_CALLBACK("IOCompletionReader::DrainOutstandingNoThrow:Skip", &skip_drain);
     if (skip_drain) {
-        drained = false;
-        attempts = kCleanupPeekLimit;
+        return false;
     }
 #endif
-    while (!pending_requests_.empty() && attempts++ < kCleanupPeekLimit) {
+    while (!pending_requests_.empty()) {
         try {
-            io_uring_cqe* cqe = nullptr;
-            const auto ret = io_uring_peek_cqe(handle_.uring, &cqe);
-            if (ret == -EAGAIN) {
-                drained = false;
-                break;
-            }
-            if (ret < 0) {
-                if (-ret == EINTR) {
-                    if (!knowhere_internal::ShouldRetryInterruptedSyscall(retry, kNumRetries)) {
-                        drained = false;
-                        break;
-                    }
-                    continue;
-                }
-                drained = false;
-                break;
-            }
-            if (cqe == nullptr) {
-                drained = false;
-                break;
-            }
-
-            auto error = ProcessCqe(cqe);
-            io_uring_cqe_seen(handle_.uring, cqe);
-            if (error) {
-                drained = false;
-                break;
-            }
+            WaitOneCompletion();
         } catch (const std::exception& e) {
             LOG_WARN("IOCompletionReader cleanup failed with exception: {}, pending operations: {}", e.what(),
                      PendingOperationCount());
-            drained = false;
-            break;
+            return false;
         } catch (...) {
             LOG_WARN("IOCompletionReader cleanup failed with unknown exception, pending operations: {}",
                      PendingOperationCount());
-            drained = false;
-            break;
+            return false;
         }
     }
-    drained = drained && pending_requests_.empty();
-    ready_completions_.clear();
-    pending_requests_.clear();
-    if (!drained) {
-        ResetHandleUring();
-    }
+    return true;
+#else
+    return true;
 #endif
 }
 
@@ -515,7 +490,13 @@ void
 IOCompletionReader::CleanupFailedSubmit(RequestId request_id, size_t prepared, size_t submitted) {
 #ifdef WITH_IO_URING
     if (prepared > submitted) {
-        FailPendingRequests(request_id);
+        if (submitted == 0) {
+            pending_requests_.erase(request_id);
+        }
+        if (!DrainOutstandingBlockingNoThrow()) {
+            FailPendingRequests(request_id);
+        }
+        RemoveReadyCompletion(request_id);
         ResetHandleUring();
         return;
     }
@@ -524,7 +505,10 @@ IOCompletionReader::CleanupFailedSubmit(RequestId request_id, size_t prepared, s
         if (TryDrainOutstanding(request_id)) {
             RemoveReadyCompletion(request_id);
         } else {
-            FailPendingRequests(request_id);
+            if (!DrainOutstandingBlockingNoThrow()) {
+                FailPendingRequests(request_id);
+            }
+            RemoveReadyCompletion(request_id);
             ResetHandleUring();
         }
     } else {

@@ -147,6 +147,9 @@ class UringContextPool {
     bool
     RetireCheckedOut(struct io_uring* ring);
 
+    void
+    Shutdown();
+
     static bool
     InitGlobalUringPool(size_t num_ctx, size_t max_entries);
 

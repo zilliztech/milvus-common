@@ -8,35 +8,8 @@
 #include <string>
 #include <vector>
 
-namespace knowhere_compat {
-template <typename T>
-class span {
- public:
-    span(T* data, size_t size) : data_(data), size_(size) {
-    }
-
-    T&
-    operator[](size_t idx) const {
-        return data_[idx];
-    }
-
-    size_t
-    size() const {
-        return size_;
-    }
-
-    T*
-    data() const {
-        return data_;
-    }
-
- private:
-    T* data_;
-    size_t size_;
-};
-}  // namespace knowhere_compat
-
 #include "knowhere/io_context_pool.h"
+#include "knowhere/io_span.h"
 
 template <typename T>
 using IOReaderSpan = knowhere_compat::span<T>;

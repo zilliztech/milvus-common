@@ -13,6 +13,7 @@
 #include <cstring>
 #include <future>
 #include <memory>
+#include <span>
 #include <thread>
 #include <type_traits>
 #include <vector>
@@ -752,6 +753,38 @@ TEST_F(IOContextPoolTestFixture, ReadAsyncShouldReturnFalseOnShortRead) {
     ::unlink(path);
 }
 
+TEST_F(IOContextPoolTestFixture, ReadAsyncShouldRejectMisalignedDirectIoBuffer) {
+    IOContextPoolConfig cfg;
+    cfg.num_ctx = 1;
+    cfg.max_events = 128;
+    ASSERT_TRUE(IOContextPool::InitGlobal(cfg));
+
+    char path[] = "/tmp/io_reader_direct_alignment_XXXXXX";
+    int fd = OpenIOReaderTestFile(path, true);
+    if (fd < 0 && errno == EINVAL) {
+        ::unlink(path);
+        GTEST_SKIP() << "direct I/O is not available for alignment test";
+    }
+    ASSERT_GE(fd, 0);
+
+    auto content = AllocateAlignedBuffer(kIOReaderTestBlockSize);
+    auto buffer = AllocateAlignedBuffer(kIOReaderTestBlockSize + 1);
+    ASSERT_NE(content, nullptr);
+    ASSERT_NE(buffer, nullptr);
+    std::fill(content.get(), content.get() + kIOReaderTestBlockSize, std::byte{0x15});
+    ASSERT_EQ(::pwrite(fd, content.get(), kIOReaderTestBlockSize, 0), static_cast<ssize_t>(kIOReaderTestBlockSize));
+    ASSERT_EQ(::fsync(fd), 0);
+
+    IOReader reader(fd, IOContextPool::GetGlobal());
+    std::vector<std::byte*> buffers{buffer.get() + 1};
+    std::vector<size_t> offsets{0};
+    EXPECT_THROW(reader.ReadAsync(std::move(buffers), kIOReaderTestBlockSize, std::move(offsets)),
+                 std::invalid_argument);
+
+    ::close(fd);
+    ::unlink(path);
+}
+
 #if defined(WITH_IO_URING) && defined(ENABLE_SYNCPOINT)
 TEST_F(IOContextPoolTestFixture, ReadAsyncSubmitFailureShouldResetUringHandle) {
     IOContextPoolConfig cfg;
@@ -815,7 +848,7 @@ TEST_F(IOContextPoolTestFixture, ReadAsyncSubmitFailureShouldResetUringHandle) {
     ::unlink(path);
 }
 
-TEST_F(IOContextPoolTestFixture, DroppedReadAsyncFutureShouldResetPartialUringSubmit) {
+TEST_F(IOContextPoolTestFixture, DroppedReadAsyncFutureShouldDrainSubmittedUringIo) {
     IOContextPoolConfig cfg;
     cfg.num_ctx = 1;
     cfg.max_events = 128;
@@ -846,27 +879,12 @@ TEST_F(IOContextPoolTestFixture, DroppedReadAsyncFutureShouldResetPartialUringSu
     ASSERT_EQ(::pwrite(fd, content.get(), kTotalSize, 0), static_cast<ssize_t>(kTotalSize));
     ASSERT_EQ(::fsync(fd), 0);
 
-    auto* sync_point = milvus::SyncPoint::GetInstance();
-    sync_point->ClearAllCallBacks();
-    sync_point->ClearTrace();
-    int submit_calls = 0;
-    sync_point->SetCallBack("IOReader::SubmitUring:Before", [&](void* arg) {
-        if (submit_calls++ == 0) {
-            *static_cast<int*>(arg) = 1;
-        }
-    });
-    sync_point->EnableProcessing();
-
     auto reader = IOReader(fd, pool);
     {
         std::vector<std::byte*> buffers{first.get(), second.get()};
         std::vector<size_t> offsets{0, kIOReaderTestBlockSize};
         auto dropped = reader.ReadAsync(std::move(buffers), kIOReaderTestBlockSize, std::move(offsets));
     }
-
-    sync_point->DisableProcessing();
-    sync_point->ClearAllCallBacks();
-    sync_point->ClearTrace();
 
     std::vector<std::byte*> retry_buffers{retry.get()};
     std::vector<size_t> retry_offsets{0};
@@ -880,7 +898,7 @@ TEST_F(IOContextPoolTestFixture, DroppedReadAsyncFutureShouldResetPartialUringSu
 #endif
 
 #if defined(MILVUS_COMMON_WITH_LIBAIO) && defined(ENABLE_SYNCPOINT)
-TEST_F(IOContextPoolTestFixture, DroppedAioReadAsyncFutureShouldResetContext) {
+TEST_F(IOContextPoolTestFixture, DroppedAioReadAsyncFutureShouldDrainContext) {
     IOContextPoolConfig cfg;
     cfg.num_ctx = 1;
     cfg.max_events = 2;
@@ -909,27 +927,12 @@ TEST_F(IOContextPoolTestFixture, DroppedAioReadAsyncFutureShouldResetContext) {
     ASSERT_EQ(::pwrite(fd, content.get(), kIOReaderTestBlockSize, 0), static_cast<ssize_t>(kIOReaderTestBlockSize));
     ASSERT_EQ(::fsync(fd), 0);
 
-    auto* sync_point = milvus::SyncPoint::GetInstance();
-    sync_point->ClearAllCallBacks();
-    sync_point->ClearTrace();
-    int reset_calls = 0;
-    sync_point->SetCallBack("AioContextPool::ResetCheckedOut:BeforeSetup", [&](void* arg) {
-        ++reset_calls;
-        *static_cast<int*>(arg) = 0;
-    });
-    sync_point->EnableProcessing();
-
     IOReader reader(fd, pool);
     {
         std::vector<std::byte*> buffers{first.get()};
         std::vector<size_t> offsets{0};
         auto dropped = reader.ReadAsync(std::move(buffers), kIOReaderTestBlockSize, std::move(offsets));
     }
-    ASSERT_GT(reset_calls, 0);
-
-    sync_point->DisableProcessing();
-    sync_point->ClearAllCallBacks();
-    sync_point->ClearTrace();
 
     std::vector<std::byte*> retry_buffers{retry.get()};
     std::vector<size_t> retry_offsets{0};
@@ -1130,12 +1133,12 @@ TEST_F(IOContextPoolTestFixture, CompletionReaderReturnsSubmittedRequestIds) {
     std::array<std::byte*, 1> second_buffers{second.get()};
     std::array<size_t, 1> second_offsets{kIOReaderTestBlockSize};
 
-    const auto request_1 = reader.Submit(std::span<std::byte* const>(first_buffers.data(), first_buffers.size()),
+    const auto request_1 = reader.Submit(IOCompletionReaderSpan<std::byte* const>(first_buffers.data(), first_buffers.size()),
                                          kIOReaderTestBlockSize,
-                                         std::span<const size_t>(first_offsets.data(), first_offsets.size()));
-    const auto request_2 = reader.Submit(std::span<std::byte* const>(second_buffers.data(), second_buffers.size()),
+                                         IOCompletionReaderSpan<const size_t>(first_offsets.data(), first_offsets.size()));
+    const auto request_2 = reader.Submit(IOCompletionReaderSpan<std::byte* const>(second_buffers.data(), second_buffers.size()),
                                          kIOReaderTestBlockSize,
-                                         std::span<const size_t>(second_offsets.data(), second_offsets.size()));
+                                         IOCompletionReaderSpan<const size_t>(second_offsets.data(), second_offsets.size()));
     ASSERT_NE(request_1, request_2);
 
     std::vector<IOCompletionReader::Completion> completions;
@@ -1195,9 +1198,9 @@ TEST_F(IOContextPoolTestFixture, CompletionReaderWaitsForAllBuffersInRequest) {
     std::array<std::byte*, 2> buffers{first.get(), second.get()};
     std::array<size_t, 2> offsets{0, kIOReaderTestBlockSize};
 
-    const auto request = reader.Submit(std::span<std::byte* const>(buffers.data(), buffers.size()),
+    const auto request = reader.Submit(IOCompletionReaderSpan<std::byte* const>(buffers.data(), buffers.size()),
                                        kIOReaderTestBlockSize,
-                                       std::span<const size_t>(offsets.data(), offsets.size()));
+                                       IOCompletionReaderSpan<const size_t>(offsets.data(), offsets.size()));
     auto completion = reader.WaitCompleted();
     ASSERT_EQ(completion.request_id, request);
     ASSERT_TRUE(completion.ok);
@@ -1237,9 +1240,9 @@ TEST_F(IOContextPoolTestFixture, CompletionReaderReportsShortReadFailure) {
     IOCompletionReader reader(fd, pool);
     std::array<std::byte*, 1> buffers{buffer.get()};
     std::array<size_t, 1> offsets{kIOReaderTestBlockSize};
-    const auto request = reader.Submit(std::span<std::byte* const>(buffers.data(), buffers.size()),
+    const auto request = reader.Submit(IOCompletionReaderSpan<std::byte* const>(buffers.data(), buffers.size()),
                                        kIOReaderTestBlockSize,
-                                       std::span<const size_t>(offsets.data(), offsets.size()));
+                                       IOCompletionReaderSpan<const size_t>(offsets.data(), offsets.size()));
     auto completion = reader.WaitCompleted();
     ASSERT_EQ(completion.request_id, request);
     ASSERT_FALSE(completion.ok);
@@ -1273,9 +1276,9 @@ TEST_F(IOContextPoolTestFixture, CompletionReaderReportsNegativeCqeFailure) {
 
     std::array<std::byte*, 1> buffers{buffer.get()};
     std::array<size_t, 1> offsets{0};
-    const auto request = reader.Submit(std::span<std::byte* const>(buffers.data(), buffers.size()),
+    const auto request = reader.Submit(IOCompletionReaderSpan<std::byte* const>(buffers.data(), buffers.size()),
                                        kIOReaderTestBlockSize,
-                                       std::span<const size_t>(offsets.data(), offsets.size()));
+                                       IOCompletionReaderSpan<const size_t>(offsets.data(), offsets.size()));
     auto completion = reader.WaitCompleted();
     ASSERT_EQ(completion.request_id, request);
     ASSERT_FALSE(completion.ok);
@@ -1308,8 +1311,8 @@ TEST_F(IOContextPoolTestFixture, CompletionReaderRejectsBatchLargerThanCapacity)
     std::array<std::byte*, 2> buffers{first.get(), second.get()};
     std::array<size_t, 2> offsets{0, kIOReaderTestBlockSize};
 
-    EXPECT_THROW(reader.Submit(std::span<std::byte* const>(buffers.data(), buffers.size()), kIOReaderTestBlockSize,
-                               std::span<const size_t>(offsets.data(), offsets.size())),
+    EXPECT_THROW(reader.Submit(IOCompletionReaderSpan<std::byte* const>(buffers.data(), buffers.size()), kIOReaderTestBlockSize,
+                               IOCompletionReaderSpan<const size_t>(offsets.data(), offsets.size())),
                  std::invalid_argument);
 
     ASSERT_EQ(::close(fd), 0);
@@ -1359,14 +1362,14 @@ TEST_F(IOContextPoolTestFixture, CompletionReaderRejectsOutstandingRequestsBeyon
     std::array<std::byte*, 1> first_buffers{first.get()};
     std::array<std::byte*, 1> second_buffers{second.get()};
     std::array<std::byte*, 1> third_buffers{third.get()};
-    ASSERT_NE(reader.Submit(std::span<std::byte* const>(first_buffers.data(), first_buffers.size()),
-                            kIOReaderTestBlockSize, std::span<const size_t>(offsets.data(), offsets.size())),
+    ASSERT_NE(reader.Submit(IOCompletionReaderSpan<std::byte* const>(first_buffers.data(), first_buffers.size()),
+                            kIOReaderTestBlockSize, IOCompletionReaderSpan<const size_t>(offsets.data(), offsets.size())),
               0u);
-    ASSERT_NE(reader.Submit(std::span<std::byte* const>(second_buffers.data(), second_buffers.size()),
-                            kIOReaderTestBlockSize, std::span<const size_t>(offsets.data(), offsets.size())),
+    ASSERT_NE(reader.Submit(IOCompletionReaderSpan<std::byte* const>(second_buffers.data(), second_buffers.size()),
+                            kIOReaderTestBlockSize, IOCompletionReaderSpan<const size_t>(offsets.data(), offsets.size())),
               0u);
-    EXPECT_THROW(reader.Submit(std::span<std::byte* const>(third_buffers.data(), third_buffers.size()),
-                               kIOReaderTestBlockSize, std::span<const size_t>(offsets.data(), offsets.size())),
+    EXPECT_THROW(reader.Submit(IOCompletionReaderSpan<std::byte* const>(third_buffers.data(), third_buffers.size()),
+                               kIOReaderTestBlockSize, IOCompletionReaderSpan<const size_t>(offsets.data(), offsets.size())),
                  std::runtime_error);
 
     sync_point->DisableProcessing();
@@ -1410,9 +1413,9 @@ TEST_F(IOContextPoolTestFixture, CompletionReaderSubmitFailureKeepsExistingReque
     IOCompletionReader reader(fd, pool);
     std::array<std::byte*, 1> first_buffers{first.get()};
     std::array<size_t, 1> first_offsets{0};
-    const auto request_1 = reader.Submit(std::span<std::byte* const>(first_buffers.data(), first_buffers.size()),
+    const auto request_1 = reader.Submit(IOCompletionReaderSpan<std::byte* const>(first_buffers.data(), first_buffers.size()),
                                          kIOReaderTestBlockSize,
-                                         std::span<const size_t>(first_offsets.data(), first_offsets.size()));
+                                         IOCompletionReaderSpan<const size_t>(first_offsets.data(), first_offsets.size()));
 
     auto* sync_point = milvus::SyncPoint::GetInstance();
     sync_point->ClearAllCallBacks();
@@ -1433,9 +1436,9 @@ TEST_F(IOContextPoolTestFixture, CompletionReaderSubmitFailureKeepsExistingReque
 
     std::array<std::byte*, 1> second_buffers{second.get()};
     std::array<size_t, 1> second_offsets{kIOReaderTestBlockSize};
-    EXPECT_THROW(reader.Submit(std::span<std::byte* const>(second_buffers.data(), second_buffers.size()),
+    EXPECT_THROW(reader.Submit(IOCompletionReaderSpan<std::byte* const>(second_buffers.data(), second_buffers.size()),
                                kIOReaderTestBlockSize,
-                               std::span<const size_t>(second_offsets.data(), second_offsets.size())),
+                               IOCompletionReaderSpan<const size_t>(second_offsets.data(), second_offsets.size())),
                  std::runtime_error);
 
     sync_point->DisableProcessing();
@@ -1444,7 +1447,7 @@ TEST_F(IOContextPoolTestFixture, CompletionReaderSubmitFailureKeepsExistingReque
 
     auto completion = reader.WaitCompleted();
     EXPECT_EQ(completion.request_id, request_1);
-    EXPECT_FALSE(completion.ok);
+    EXPECT_TRUE(completion.ok);
     EXPECT_THROW(reader.WaitCompleted(), std::runtime_error);
 
     ASSERT_EQ(::close(fd), 0);
@@ -1489,8 +1492,8 @@ TEST_F(IOContextPoolTestFixture, CompletionReaderDestructorResetKeepsPoolReusabl
         IOCompletionReader reader(fd, pool);
         std::array<std::byte*, 1> buffers{first.get()};
         std::array<size_t, 1> offsets{0};
-        ASSERT_NE(reader.Submit(std::span<std::byte* const>(buffers.data(), buffers.size()),
-                                kIOReaderTestBlockSize, std::span<const size_t>(offsets.data(), offsets.size())),
+        ASSERT_NE(reader.Submit(IOCompletionReaderSpan<std::byte* const>(buffers.data(), buffers.size()),
+                                kIOReaderTestBlockSize, IOCompletionReaderSpan<const size_t>(offsets.data(), offsets.size())),
                   0u);
     }
 
@@ -1501,9 +1504,9 @@ TEST_F(IOContextPoolTestFixture, CompletionReaderDestructorResetKeepsPoolReusabl
     IOCompletionReader retry_reader(fd, pool);
     std::array<std::byte*, 1> retry_buffers{retry.get()};
     std::array<size_t, 1> retry_offsets{0};
-    const auto request = retry_reader.Submit(std::span<std::byte* const>(retry_buffers.data(), retry_buffers.size()),
+    const auto request = retry_reader.Submit(IOCompletionReaderSpan<std::byte* const>(retry_buffers.data(), retry_buffers.size()),
                                              kIOReaderTestBlockSize,
-                                             std::span<const size_t>(retry_offsets.data(), retry_offsets.size()));
+                                             IOCompletionReaderSpan<const size_t>(retry_offsets.data(), retry_offsets.size()));
     auto completion = retry_reader.WaitCompleted();
     ASSERT_EQ(completion.request_id, request);
     ASSERT_TRUE(completion.ok);
@@ -1551,8 +1554,8 @@ TEST_F(IOContextPoolTestFixture, CompletionReaderNullCqeShouldFailWithoutHanging
         IOCompletionReader reader(fd, pool);
         std::array<std::byte*, 1> buffers{first.get()};
         std::array<size_t, 1> offsets{0};
-        ASSERT_NE(reader.Submit(std::span<std::byte* const>(buffers.data(), buffers.size()),
-                                kIOReaderTestBlockSize, std::span<const size_t>(offsets.data(), offsets.size())),
+        ASSERT_NE(reader.Submit(IOCompletionReaderSpan<std::byte* const>(buffers.data(), buffers.size()),
+                                kIOReaderTestBlockSize, IOCompletionReaderSpan<const size_t>(offsets.data(), offsets.size())),
                   0u);
         EXPECT_THROW(reader.WaitCompleted(), std::runtime_error);
     }
@@ -1564,9 +1567,9 @@ TEST_F(IOContextPoolTestFixture, CompletionReaderNullCqeShouldFailWithoutHanging
     IOCompletionReader retry_reader(fd, pool);
     std::array<std::byte*, 1> retry_buffers{retry.get()};
     std::array<size_t, 1> retry_offsets{0};
-    const auto request = retry_reader.Submit(std::span<std::byte* const>(retry_buffers.data(), retry_buffers.size()),
+    const auto request = retry_reader.Submit(IOCompletionReaderSpan<std::byte* const>(retry_buffers.data(), retry_buffers.size()),
                                              kIOReaderTestBlockSize,
-                                             std::span<const size_t>(retry_offsets.data(), retry_offsets.size()));
+                                             IOCompletionReaderSpan<const size_t>(retry_offsets.data(), retry_offsets.size()));
     auto completion = retry_reader.WaitCompleted();
     ASSERT_EQ(completion.request_id, request);
     ASSERT_TRUE(completion.ok);

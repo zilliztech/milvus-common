@@ -162,6 +162,18 @@ UringContextPool::RetireCheckedOut(struct io_uring* ring) {
     return true;
 }
 
+void
+UringContextPool::Shutdown() {
+    {
+        std::scoped_lock lk(ring_mtx_);
+        if (state_ == State::Stopped) {
+            return;
+        }
+        state_ = State::Stopped;
+    }
+    ring_cv_.notify_all();
+}
+
 std::shared_ptr<UringContextPool>
 UringContextPool::GetGlobalUringPoolDirect() {
     std::scoped_lock lk(global_uring_pool_mut);
@@ -222,11 +234,7 @@ UringContextPool::ResetGlobalForTest() {
 }
 
 UringContextPool::~UringContextPool() {
-    {
-        std::scoped_lock lk(ring_mtx_);
-        state_ = State::Stopped;
-    }
-    ring_cv_.notify_all();
+    Shutdown();
 
     std::unordered_set<struct io_uring*> checked_out;
     {

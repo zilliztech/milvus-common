@@ -11,8 +11,6 @@ std::shared_ptr<IOContextPool> g_io_pool;
 std::mutex g_io_pool_mutex;
 }  // namespace
 
-std::atomic<uint64_t> IOContextPool::next_generation_{1};
-
 IOContextHandle::~IOContextHandle() {
     ReleaseNoThrow();
 }
@@ -37,9 +35,7 @@ IOContextHandle::operator=(IOContextHandle&& other) noexcept {
     other.aio = nullptr;
 #endif
     owner_ = std::move(other.owner_);
-    owner_generation_ = other.owner_generation_;
     other.backend = IOBackend::UNKNOWN;
-    other.owner_generation_ = 0;
     return *this;
 }
 
@@ -69,7 +65,6 @@ IOContextHandle::ClearNoRelease() noexcept {
     aio = nullptr;
 #endif
     owner_.reset();
-    owner_generation_ = 0;
 }
 
 void
@@ -170,7 +165,6 @@ IOContextPool::InitGlobal(const IOContextPoolConfig& cfg) {
     }
 
     auto io_pool = std::shared_ptr<IOContextPool>(new IOContextPool());
-    io_pool->generation_ = next_generation_.fetch_add(1, std::memory_order_relaxed);
 
 #ifdef WITH_IO_URING
     if (TryInitUring(cfg, io_pool)) {
@@ -273,7 +267,6 @@ IOContextPool::Pop() {
     }
     if (handle.HasContext()) {
         handle.owner_ = shared_from_this();
-        handle.owner_generation_ = generation_;
     } else {
         handle.backend = IOBackend::UNKNOWN;
     }
@@ -308,12 +301,6 @@ IOContextPool::Release(IOContextHandle&& handle, IOContextReleaseDisposition dis
     }
     if (handle.owner_.get() != this) {
         LOG_WARN("IOContextPool rejects release for handle owned by a different pool");
-        return false;
-    }
-    if (handle.owner_generation_ != generation_) {
-        LOG_WARN("IOContextPool rejects stale handle for generation {} while active generation is {}",
-                 handle.owner_generation_, generation_);
-        handle.ClearNoRelease();
         return false;
     }
     if (handle.backend != backend_) {

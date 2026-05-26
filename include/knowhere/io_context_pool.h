@@ -1,8 +1,6 @@
 #pragma once
 
-#include <atomic>
 #include <cstddef>
-#include <cstdint>
 #include <memory>
 #include <string>
 #include <utility>
@@ -87,7 +85,6 @@ struct IOContextHandle {
     ReleaseNoThrow() noexcept;
 
     std::shared_ptr<IOContextPool> owner_;
-    uint64_t owner_generation_ = 0;
 };
 
 class IOContextPool : public std::enable_shared_from_this<IOContextPool> {
@@ -191,9 +188,6 @@ class IOContextPool : public std::enable_shared_from_this<IOContextPool> {
     IOBackend backend_ = IOBackend::UNKNOWN;
     size_t num_ctx_ = 0;
     size_t max_events_per_ctx_ = 0;
-    uint64_t generation_ = 0;
-    static std::atomic<uint64_t> next_generation_;
-
 #ifdef WITH_IO_URING
     std::shared_ptr<UringContextPool> uring_pool_;
 #endif
