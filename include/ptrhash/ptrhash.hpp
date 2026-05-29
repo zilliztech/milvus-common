@@ -6,6 +6,26 @@
 // https://arxiv.org/abs/2502.15539
 // Reference implementation:
 // https://github.com/RagnarGrootKoerkamp/PtrHash
+//
+// Usage:
+//   std::vector<uint64_t> keys = {10, 20, 30};
+//   auto hash = ptrhash::PtrHash::build(keys);
+//   size_t index = hash.index(20);  // in [0, hash.n()) for keys used to build the hash.
+//
+// PtrHash does not store the original keys and cannot prove membership by itself.
+// If queries may contain keys outside the build set, keep an index-addressed key
+// or fingerprint table and verify the candidate returned by index():
+//
+//   std::vector<uint64_t> keys_by_index(hash.n());
+//   for (uint64_t key : keys) {
+//       keys_by_index[hash.index(key)] = key;
+//   }
+//
+//   size_t candidate = hash.index(query);
+//   bool found = keys_by_index[candidate] == query;
+//
+// The serialized data contains the pilots and remap table required by index().
+// It can be persisted with hash.save(path) and restored with PtrHash::load(path).
 
 #include <algorithm>
 #include <array>
