@@ -7,10 +7,14 @@
 #include <cstdio>
 #include <fstream>
 #include <limits>
+#include <optional>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -108,6 +112,12 @@ IndexNoRemapKey(const Hash& hash, std::string_view key) {
 }
 
 template <typename Hash, typename Key>
+auto
+IndexKey(const Hash& hash, const Key& key) -> decltype(hash.index(key)) {
+    return hash.index(key);
+}
+
+template <typename Hash, typename Key>
 void
 ExpectMinimalPerfect(const Hash& hash, const std::vector<Key>& keys) {
     ASSERT_EQ(hash.n(), keys.size());
@@ -124,8 +134,9 @@ ExpectMinimalPerfect(const Hash& hash, const std::vector<Key>& keys) {
     }
 }
 
+template <typename Hash>
 void
-ExpectMinimalPerfectHashes(const PtrHash& hash, const std::vector<uint64_t>& hashes) {
+ExpectMinimalPerfectHashes(const Hash& hash, const std::vector<uint64_t>& hashes) {
     ASSERT_EQ(hash.n(), hashes.size());
     std::vector<uint8_t> seen(hashes.size(), 0);
     for (uint64_t key_hash : hashes) {
@@ -137,13 +148,118 @@ ExpectMinimalPerfectHashes(const PtrHash& hash, const std::vector<uint64_t>& has
     }
 }
 
+template <typename LhsHash, typename RhsHash, typename Key>
+void
+ExpectSameQueryResults(const LhsHash& lhs, const RhsHash& rhs, const std::vector<Key>& keys) {
+    for (const auto& key : keys) {
+        EXPECT_EQ(IndexKey(lhs, key), IndexKey(rhs, key));
+        EXPECT_EQ(IndexNoRemapKey(lhs, key), IndexNoRemapKey(rhs, key));
+    }
+}
+
 template <typename Key>
 void
 ExpectSameQueries(const PtrHash& lhs, const PtrHash& rhs, const std::vector<Key>& keys) {
     ASSERT_EQ(lhs.serialize(), rhs.serialize());
+    ExpectSameQueryResults(lhs, rhs, keys);
+}
+
+template <typename LhsHash, typename RhsHash>
+void
+ExpectSameHashQueries(const LhsHash& lhs, const RhsHash& rhs, const std::vector<uint64_t>& hashes) {
+    for (uint64_t key_hash : hashes) {
+        EXPECT_EQ(lhs.index_hash(key_hash), rhs.index_hash(key_hash));
+        EXPECT_EQ(lhs.index_no_remap_hash(key_hash), rhs.index_no_remap_hash(key_hash));
+    }
+}
+
+template <typename Hash, typename Key>
+std::vector<size_t>
+CollectIndexes(const Hash& hash, const std::vector<Key>& keys) {
+    std::vector<size_t> indexes;
+    indexes.reserve(keys.size());
     for (const auto& key : keys) {
-        EXPECT_EQ(IndexKey(lhs, key), IndexKey(rhs, key));
-        EXPECT_EQ(IndexNoRemapKey(lhs, key), IndexNoRemapKey(rhs, key));
+        indexes.push_back(IndexKey(hash, key));
+    }
+    return indexes;
+}
+
+template <typename Hash>
+std::vector<size_t>
+CollectHashIndexes(const Hash& hash, const std::vector<uint64_t>& hashes) {
+    std::vector<size_t> indexes;
+    indexes.reserve(hashes.size());
+    for (uint64_t key_hash : hashes) {
+        indexes.push_back(hash.index_hash(key_hash));
+    }
+    return indexes;
+}
+
+uint64_t
+StableFingerprint(const std::vector<uint8_t>& bytes) {
+    uint64_t hash = 1469598103934665603ull;
+    for (uint8_t byte : bytes) {
+        hash ^= byte;
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+template <typename Key, typename Value>
+struct StaticMapTables {
+    std::vector<Key> keys_by_index;
+    std::vector<Value> values_by_index;
+};
+
+template <typename Hash, typename Key, typename Value>
+StaticMapTables<Key, Value>
+MakeStaticMapTables(const Hash& hash, const std::vector<Key>& keys, const std::vector<Value>& values) {
+    StaticMapTables<Key, Value> tables;
+    tables.keys_by_index.resize(hash.n());
+    tables.values_by_index.resize(hash.n());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const size_t index = IndexKey(hash, keys[i]);
+        tables.keys_by_index[index] = keys[i];
+        tables.values_by_index[index] = values[i];
+    }
+    return tables;
+}
+
+template <typename Hash, typename Key, typename Value>
+std::optional<Value>
+StaticMapFind(const Hash& hash, const StaticMapTables<Key, Value>& tables, const Key& query) {
+    if (hash.n() == 0) {
+        return std::nullopt;
+    }
+    const size_t index = IndexKey(hash, query);
+    if (!(tables.keys_by_index[index] == query)) {
+        return std::nullopt;
+    }
+    return tables.values_by_index[index];
+}
+
+template <typename Key, typename Value, typename PtrHashType, typename UnorderedHasher = std::hash<Key>>
+void
+ExpectStaticMapMatchesUnorderedMap(const PtrHashType& hash, const std::vector<Key>& keys,
+                                   const std::vector<Value>& values, const std::vector<Key>& queries,
+                                   UnorderedHasher unordered_hasher = UnorderedHasher()) {
+    ASSERT_EQ(keys.size(), values.size());
+
+    std::unordered_map<Key, Value, UnorderedHasher> expected(0, unordered_hasher);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        expected.emplace(keys[i], values[i]);
+    }
+    const auto tables = MakeStaticMapTables(hash, keys, values);
+
+    for (const auto& query : queries) {
+        const auto actual = StaticMapFind(hash, tables, query);
+        const auto expected_it = expected.find(query);
+        if (expected_it == expected.end()) {
+            EXPECT_FALSE(actual.has_value());
+        } else {
+            ASSERT_TRUE(actual.has_value());
+            EXPECT_EQ(*actual, expected_it->second);
+        }
     }
 }
 
@@ -205,6 +321,78 @@ struct IdentityHasher {
         return key;
     }
 };
+
+struct CustomKey {
+    uint64_t tenant = 0;
+    std::string name;
+
+    bool
+    operator==(const CustomKey& other) const {
+        return tenant == other.tenant && name == other.name;
+    }
+};
+
+struct CustomKeyHasher {
+    uint64_t
+    operator()(const CustomKey& key) const {
+        uint64_t hash = key.tenant * 0x9e3779b97f4a7c15ull;
+        for (unsigned char byte : key.name) {
+            hash ^= static_cast<uint64_t>(byte);
+            hash *= 1099511628211ull;
+        }
+        return hash;
+    }
+};
+
+struct ConstantCustomKeyHasher {
+    uint64_t
+    operator()(const CustomKey&) const {
+        return 7;
+    }
+};
+
+std::vector<uint64_t>
+MakeRandomIntegerKeys(size_t n, uint64_t seed) {
+    std::mt19937_64 rng(seed);
+    std::unordered_set<uint64_t> seen;
+    std::vector<uint64_t> keys;
+    keys.reserve(n);
+    while (keys.size() < n) {
+        const uint64_t key = rng();
+        if (seen.insert(key).second) {
+            keys.push_back(key);
+        }
+    }
+    return keys;
+}
+
+std::string
+MakeRandomString(std::mt19937_64& rng) {
+    const size_t length = static_cast<size_t>(rng() % 32);
+    std::string value;
+    value.reserve(length);
+    for (size_t i = 0; i < length; ++i) {
+        const char c = static_cast<char>('a' + (rng() % 26));
+        value.push_back(c);
+    }
+    return value;
+}
+
+std::vector<std::string>
+MakeRandomStringKeys(size_t n, uint64_t seed) {
+    std::mt19937_64 rng(seed);
+    std::unordered_set<std::string> seen;
+    std::vector<std::string> keys;
+    keys.reserve(n);
+    while (keys.size() < n) {
+        std::string key = MakeRandomString(rng);
+        key += "#" + std::to_string(rng());
+        if (seen.insert(key).second) {
+            keys.push_back(std::move(key));
+        }
+    }
+    return keys;
+}
 
 constexpr size_t kSerializedHeaderSize = 88;
 constexpr size_t kSerializedNOffset = 16;
@@ -342,6 +530,30 @@ TEST(PtrHashTest, PtrHashWithHasherUsesExternalHasher) {
     ExpectMinimalPerfect(hash, keys);
 }
 
+TEST(PtrHashTest, PtrHashWithHasherSupportsCustomKeyStaticMapPattern) {
+    std::vector<CustomKey> keys = {{1, "alpha"}, {1, "beta"}, {2, "alpha"}, {3, "tenant-three"}, {99, "omega"}};
+    std::vector<std::string> values = {"a1", "b1", "a2", "t3", "o99"};
+    std::vector<CustomKey> queries = keys;
+    queries.push_back({1, "missing"});
+    queries.push_back({4, "alpha"});
+    queries.push_back({99, "omega-x"});
+
+    auto hash = PtrHashWithHasher<CustomKey, CustomKeyHasher>::build(keys, CustomKeyHasher{});
+    ExpectStaticMapMatchesUnorderedMap(hash, keys, values, queries, CustomKeyHasher{});
+}
+
+TEST(PtrHashTest, PtrHashWithHasherRejectsExternalHashCollisions) {
+    std::vector<CustomKey> keys = {{1, "alpha"}, {2, "beta"}};
+
+    std::unordered_map<CustomKey, int, ConstantCustomKeyHasher> unordered;
+    unordered.emplace(keys[0], 10);
+    unordered.emplace(keys[1], 20);
+    ASSERT_EQ(unordered.size(), 2);
+
+    EXPECT_THROW((PtrHashWithHasher<CustomKey, ConstantCustomKeyHasher>::build(keys, ConstantCustomKeyHasher{})),
+                 std::invalid_argument);
+}
+
 TEST(PtrHashTest, EmptyHashHasZeroSizeAndQueryThrows) {
     auto hash = PtrHash::build(std::vector<uint64_t>{});
     EXPECT_EQ(hash.n(), 0);
@@ -451,6 +663,41 @@ TEST(PtrHashTest, SerializedHeaderUsesPtrHashMagicAndVersionOne) {
     EXPECT_EQ(ReadU32(bytes, 8), 1u);
 }
 
+TEST(PtrHashTest, GoldenMappingsStayStableForRepresentativeKeyKinds) {
+    PtrHashParams params;
+    params.seed = 0x123456789abcdef0ull;
+    params.build_threads = 1;
+
+    params.bucket_function = BucketFunction::SquareEps;
+    std::vector<uint64_t> integer_keys = {
+        0, 1, 42, 999, std::numeric_limits<uint64_t>::max(), 1ull << 63, (1ull << 63) + 17};
+    auto integer_hash = PtrHash::build(integer_keys, params);
+    ExpectMinimalPerfect(integer_hash, integer_keys);
+
+    params.bucket_function = BucketFunction::CubicEps;
+    std::vector<std::string> string_keys = {
+        "", "alpha", "beta", "gamma", "delta", std::string("a\0b", 3), "longer-string-value"};
+    auto string_hash = PtrHash::build(string_keys, params);
+    ExpectMinimalPerfect(string_hash, string_keys);
+
+    params.bucket_function = BucketFunction::Linear;
+    std::vector<uint64_t> prehashed_keys = {11, 0x100000001ull, 0xabcdef1234567890ull,
+                                            99, 123456789,      0xfedcba9876543210ull};
+    auto prehashed_hash = PtrHash::build_hashes(prehashed_keys, params);
+    ExpectMinimalPerfectHashes(prehashed_hash, prehashed_keys);
+
+#if defined(__SIZEOF_INT128__)
+    EXPECT_EQ(CollectIndexes(integer_hash, integer_keys), (std::vector<size_t>{3, 5, 2, 0, 6, 1, 4}));
+    EXPECT_EQ(StableFingerprint(integer_hash.serialize()), 0xbff1bd6e24232c11ull);
+
+    EXPECT_EQ(CollectIndexes(string_hash, string_keys), (std::vector<size_t>{5, 2, 3, 4, 6, 1, 0}));
+    EXPECT_EQ(StableFingerprint(string_hash.serialize()), 0x3cbc60b3f568fd3bull);
+
+    EXPECT_EQ(CollectHashIndexes(prehashed_hash, prehashed_keys), (std::vector<size_t>{1, 3, 2, 4, 5, 0}));
+    EXPECT_EQ(StableFingerprint(prehashed_hash.serialize()), 0xd47690f139b34e71ull);
+#endif
+}
+
 TEST(PtrHashTest, SerializedBufferUsesExactCapacity) {
     auto hash = PtrHash::build(MakeIntegerKeys(1000));
     const auto& bytes = hash.serialize();
@@ -472,6 +719,44 @@ TEST(PtrHashTest, SaveLoadRoundTripPreservesQueries) {
 
     auto loaded = PtrHash::load(file.path());
     ExpectSameQueries(hash, loaded, keys);
+}
+
+TEST(PtrHashTest, SaveLoadRoundTripPreservesStringAndPrehashedQueries) {
+    std::vector<std::string> string_keys = {"", "alpha", "beta", std::string("a\0b", 3), "gamma"};
+    auto string_hash = PtrHash::build(string_keys);
+    TempFile string_file("save_load_string");
+    string_hash.save(string_file.path());
+
+    auto loaded_string = PtrHash::load(string_file.path());
+    ExpectSameQueries(string_hash, loaded_string, string_keys);
+    EXPECT_THROW(loaded_string.index(uint64_t{1}), std::invalid_argument);
+    EXPECT_THROW(loaded_string.index_hash(1), std::invalid_argument);
+
+    std::vector<std::string> backing = {"view-alpha", "view-beta", std::string("view\0gamma", 10)};
+    std::vector<std::string_view> string_views;
+    string_views.reserve(backing.size());
+    for (const auto& key : backing) {
+        string_views.emplace_back(key.data(), key.size());
+    }
+    auto string_view_hash = PtrHash::build(string_views);
+    TempFile string_view_file("save_load_string_view");
+    string_view_hash.save(string_view_file.path());
+
+    auto loaded_string_view = PtrHash::load(string_view_file.path());
+    ExpectSameQueries(string_view_hash, loaded_string_view, string_views);
+    EXPECT_THROW(loaded_string_view.index(uint64_t{1}), std::invalid_argument);
+    EXPECT_THROW(loaded_string_view.index_hash(1), std::invalid_argument);
+
+    auto prehashed_keys = MakeIntegerKeys(32);
+    auto prehashed_hash = PtrHash::build_hashes(prehashed_keys);
+    TempFile prehashed_file("save_load_prehashed");
+    prehashed_hash.save(prehashed_file.path());
+
+    auto loaded_prehashed = PtrHash::load(prehashed_file.path());
+    ASSERT_EQ(prehashed_hash.serialize(), loaded_prehashed.serialize());
+    ExpectSameHashQueries(prehashed_hash, loaded_prehashed, prehashed_keys);
+    EXPECT_THROW(loaded_prehashed.index(uint64_t{prehashed_keys.front()}), std::invalid_argument);
+    EXPECT_THROW(loaded_prehashed.index(std::string_view("not-a-prehash")), std::invalid_argument);
 }
 
 TEST(PtrHashTest, DeserializeRejectsCorruptInput) {
@@ -624,6 +909,76 @@ TEST(PtrHashTest, RepeatedBuildsStayMinimalForSkewedDistributions) {
     }
 }
 
+TEST(PtrHashTest, RandomizedStaticMapDifferentialMatchesUnorderedMap) {
+    const std::vector<size_t> sizes = {0, 1, 7, 64, 257};
+    const std::vector<BucketFunction> bucket_functions = {BucketFunction::Linear, BucketFunction::SquareEps,
+                                                          BucketFunction::CubicEps};
+    const std::vector<size_t> thread_counts = {1, 2, 4};
+
+    for (size_t n : sizes) {
+        for (BucketFunction bucket_function : bucket_functions) {
+            for (size_t threads : thread_counts) {
+                SCOPED_TRACE("integer n=" + std::to_string(n) + " bucket=" +
+                             std::to_string(static_cast<int>(bucket_function)) + " threads=" + std::to_string(threads));
+                PtrHashParams params;
+                params.seed = 0x72616e646f6d0000ull + n + threads;
+                params.bucket_function = bucket_function;
+                params.build_threads = threads;
+
+                auto keys = MakeRandomIntegerKeys(n, params.seed);
+                std::vector<uint64_t> values;
+                values.reserve(keys.size());
+                for (size_t i = 0; i < keys.size(); ++i) {
+                    values.push_back(keys[i] ^ (0x9e3779b97f4a7c15ull + i));
+                }
+
+                std::vector<uint64_t> queries = keys;
+                std::unordered_set<uint64_t> key_set(keys.begin(), keys.end());
+                for (uint64_t candidate : MakeRandomIntegerKeys(128, params.seed ^ 0x5eed5eedull)) {
+                    if (key_set.find(candidate) == key_set.end()) {
+                        queries.push_back(candidate);
+                    }
+                }
+
+                auto hash = PtrHash::build(keys, params);
+                ExpectStaticMapMatchesUnorderedMap(hash, keys, values, queries);
+            }
+        }
+    }
+
+    const std::vector<size_t> string_sizes = {0, 1, 9, 96};
+    for (size_t n : string_sizes) {
+        for (BucketFunction bucket_function : bucket_functions) {
+            for (size_t threads : {size_t{1}, size_t{2}}) {
+                SCOPED_TRACE("string n=" + std::to_string(n) + " bucket=" +
+                             std::to_string(static_cast<int>(bucket_function)) + " threads=" + std::to_string(threads));
+                PtrHashParams params;
+                params.seed = 0x737472696e670000ull + n + threads;
+                params.bucket_function = bucket_function;
+                params.build_threads = threads;
+
+                auto keys = MakeRandomStringKeys(n, params.seed);
+                std::vector<uint64_t> values;
+                values.reserve(keys.size());
+                for (size_t i = 0; i < keys.size(); ++i) {
+                    values.push_back((i + 1) * 17);
+                }
+
+                std::vector<std::string> queries = keys;
+                std::unordered_set<std::string> key_set(keys.begin(), keys.end());
+                for (const auto& candidate : MakeRandomStringKeys(128, params.seed ^ 0xabcddcbaull)) {
+                    if (key_set.find(candidate) == key_set.end()) {
+                        queries.push_back(candidate);
+                    }
+                }
+
+                auto hash = PtrHash::build(keys, params);
+                ExpectStaticMapMatchesUnorderedMap(hash, keys, values, queries);
+            }
+        }
+    }
+}
+
 TEST(PtrHashTest, ConcurrentQueriesPreserveResults) {
     auto keys = MakeIntegerKeys(10000);
     auto hash = PtrHash::build(keys);
@@ -674,6 +1029,26 @@ TEST(PtrHashTest, NonMemberQueriesStayInRange) {
     }
 }
 
+TEST(PtrHashTest, StaticMapPatternChecksKeysBeforeReturningValues) {
+    std::vector<uint64_t> integer_keys = {10, 20, 30, 40, 50};
+    std::vector<std::string> integer_values = {"ten", "twenty", "thirty", "forty", "fifty"};
+    std::vector<uint64_t> integer_queries = integer_keys;
+    integer_queries.insert(integer_queries.end(), {0, 1, 21, 9999, std::numeric_limits<uint64_t>::max()});
+
+    auto integer_hash = PtrHash::build(integer_keys);
+    ExpectStaticMapMatchesUnorderedMap(integer_hash, integer_keys, integer_values, integer_queries);
+
+    std::vector<std::string> string_keys = {"", "alpha", "beta", "gamma", std::string("a\0b", 3), "prefix"};
+    std::vector<uint64_t> string_values = {0, 1, 2, 3, 4, 5};
+    std::vector<std::string> string_queries = string_keys;
+    string_queries.push_back("delta");
+    string_queries.push_back(std::string("a\0c", 3));
+    string_queries.push_back("prefix_suffix");
+
+    auto string_hash = PtrHash::build(string_keys);
+    ExpectStaticMapMatchesUnorderedMap(string_hash, string_keys, string_values, string_queries);
+}
+
 TEST(PtrHashTest, MappedPtrHashOpenPreservesQueries) {
     auto keys = MakeIntegerKeys(128);
     auto hash = PtrHash::build(keys);
@@ -685,6 +1060,47 @@ TEST(PtrHashTest, MappedPtrHashOpenPreservesQueries) {
     ExpectMinimalPerfect(mapped, keys);
 #else
     EXPECT_THROW(MappedPtrHash::open(file.path()), std::runtime_error);
+#endif
+}
+
+TEST(PtrHashTest, MappedPtrHashOpenPreservesStringAndPrehashedQueries) {
+#if defined(__unix__) || defined(__APPLE__)
+    std::vector<std::string> string_keys = {"mapped-alpha", "mapped-beta", std::string("mapped\0gamma", 12), ""};
+    auto string_hash = PtrHash::build(string_keys);
+    TempFile string_file("mapped_string");
+    string_hash.save(string_file.path());
+
+    auto mapped_string = MappedPtrHash::open(string_file.path());
+    ExpectSameQueryResults(string_hash, mapped_string, string_keys);
+    EXPECT_THROW(mapped_string.index(uint64_t{1}), std::invalid_argument);
+    EXPECT_THROW(mapped_string.index_hash(1), std::invalid_argument);
+
+    std::vector<std::string> backing = {"mapped-view-alpha", "mapped-view-beta", std::string("mapped-view\0x", 13)};
+    std::vector<std::string_view> string_views;
+    string_views.reserve(backing.size());
+    for (const auto& key : backing) {
+        string_views.emplace_back(key.data(), key.size());
+    }
+    auto string_view_hash = PtrHash::build(string_views);
+    TempFile string_view_file("mapped_string_view");
+    string_view_hash.save(string_view_file.path());
+
+    auto mapped_string_view = MappedPtrHash::open(string_view_file.path());
+    ExpectSameQueryResults(string_view_hash, mapped_string_view, string_views);
+    EXPECT_THROW(mapped_string_view.index(uint64_t{1}), std::invalid_argument);
+    EXPECT_THROW(mapped_string_view.index_hash(1), std::invalid_argument);
+
+    auto prehashed_keys = MakeIntegerKeys(32);
+    auto prehashed_hash = PtrHash::build_hashes(prehashed_keys);
+    TempFile prehashed_file("mapped_prehashed");
+    prehashed_hash.save(prehashed_file.path());
+
+    auto mapped_prehashed = MappedPtrHash::open(prehashed_file.path());
+    ExpectSameHashQueries(prehashed_hash, mapped_prehashed, prehashed_keys);
+    EXPECT_THROW(mapped_prehashed.index(uint64_t{prehashed_keys.front()}), std::invalid_argument);
+    EXPECT_THROW(mapped_prehashed.index(std::string_view("not-a-prehash")), std::invalid_argument);
+#else
+    GTEST_SKIP() << "mmap loading is only available on POSIX platforms";
 #endif
 }
 
