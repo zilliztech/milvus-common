@@ -391,7 +391,15 @@ TEST(PtrHashTest, RejectsInvalidParams) {
     EXPECT_THROW(PtrHash::build(keys, params), std::invalid_argument);
 
     params = PtrHashParams();
+    params.alpha = 1e-300;
+    EXPECT_THROW(PtrHash::build(keys, params), std::overflow_error);
+
+    params = PtrHashParams();
     params.lambda = 0.0;
+    EXPECT_THROW(PtrHash::build(keys, params), std::invalid_argument);
+
+    params = PtrHashParams();
+    params.lambda = std::numeric_limits<double>::infinity();
     EXPECT_THROW(PtrHash::build(keys, params), std::invalid_argument);
 
     params = PtrHashParams();
@@ -508,6 +516,22 @@ TEST(PtrHashTest, DeserializeRejectsImpossibleEmptyLayout) {
     ASSERT_EQ(bytes.size(), kSerializedHeaderSize);
 
     WriteU64(bytes, kSerializedPartsOffset, 1);
+    EXPECT_THROW(Deserialize(bytes), std::invalid_argument);
+}
+
+TEST(PtrHashTest, DeserializeRejectsNonEmptyLayoutWithZeroBuckets) {
+    auto hash = PtrHash::build(std::vector<uint64_t>{});
+    auto bytes = hash.serialize();
+    ASSERT_EQ(bytes.size(), kSerializedHeaderSize);
+
+    WriteU64(bytes, kSerializedNOffset, 1);
+    WriteU64(bytes, kSerializedSlotsTotalOffset, 1);
+    WriteU64(bytes, kSerializedBucketsTotalOffset, 0);
+    WriteU64(bytes, kSerializedPilotCountOffset, 0);
+    WriteU64(bytes, kSerializedRemapCountOffset, 0);
+    WriteU64(bytes, kSerializedPartsOffset, 1);
+    WriteU64(bytes, kSerializedSlotsPerPartOffset, 1);
+    WriteU64(bytes, kSerializedBucketsPerPartOffset, 0);
     EXPECT_THROW(Deserialize(bytes), std::invalid_argument);
 }
 
@@ -679,6 +703,25 @@ TEST(PtrHashTest, MappedPtrHashOpenWithOffsetAndRejectsBadOffset) {
     EXPECT_THROW(MappedPtrHash::open(file.path(), prefix.size() + bytes.size() + 1), std::invalid_argument);
 #else
     EXPECT_THROW(MappedPtrHash::open(file.path(), prefix.size()), std::runtime_error);
+#endif
+}
+
+TEST(PtrHashTest, MappedPtrHashRejectsEmptyFileBeforeMapping) {
+    TempFile file("mapped_empty");
+    {
+        std::ofstream out(file.path(), std::ios::binary);
+        ASSERT_TRUE(out);
+    }
+
+#if defined(__unix__) || defined(__APPLE__)
+    try {
+        (void)MappedPtrHash::open(file.path());
+        FAIL() << "expected empty mmap file to be rejected";
+    } catch (const std::invalid_argument& e) {
+        EXPECT_STREQ("PtrHash mmap file is empty", e.what());
+    }
+#else
+    EXPECT_THROW(MappedPtrHash::open(file.path()), std::runtime_error);
 #endif
 }
 

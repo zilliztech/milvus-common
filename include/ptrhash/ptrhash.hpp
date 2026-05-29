@@ -294,14 +294,32 @@ read_u64(const uint8_t* p) {
 
 inline size_t
 ceil_division_as_size(double numerator, double denominator) {
-    if (!(denominator > 0.0)) {
+    if (!std::isfinite(denominator) || !(denominator > 0.0)) {
         throw std::invalid_argument("PtrHash parameter must be positive");
     }
-    const double value = numerator / denominator;
-    if (value > static_cast<double>(std::numeric_limits<size_t>::max())) {
+    if (!std::isfinite(numerator) || numerator < 0.0) {
         throw std::overflow_error("PtrHash size overflow");
     }
-    return static_cast<size_t>(value == static_cast<size_t>(value) ? value : static_cast<size_t>(value) + 1);
+    const double value = numerator / denominator;
+    if (!std::isfinite(value) || value < 0.0 || !(value < static_cast<double>(std::numeric_limits<size_t>::max()))) {
+        throw std::overflow_error("PtrHash size overflow");
+    }
+    const size_t truncated = static_cast<size_t>(value);
+    if (static_cast<double>(truncated) == value) {
+        return truncated;
+    }
+    if (truncated == std::numeric_limits<size_t>::max()) {
+        throw std::overflow_error("PtrHash size overflow");
+    }
+    return truncated + 1;
+}
+
+inline size_t
+checked_multiply_as_size(size_t lhs, size_t rhs, const char* message) {
+    if (lhs != 0 && rhs > std::numeric_limits<size_t>::max() / lhs) {
+        throw std::overflow_error(message);
+    }
+    return lhs * rhs;
 }
 
 inline size_t
@@ -397,6 +415,10 @@ class PtrHashView {
         }
         if (view.parts_ == 0 && view.n_ != 0) {
             throw std::invalid_argument("PtrHash part count is invalid");
+        }
+        if (view.n_ != 0 && (view.parts_ == 0 || view.slots_per_part_ == 0 || view.buckets_per_part_ == 0 ||
+                             view.slots_total_ == 0 || view.buckets_total_ == 0 || view.pilot_count_ == 0)) {
+            throw std::invalid_argument("PtrHash non-empty layout has zero counts");
         }
         if (view.parts_ != 0 && view.slots_per_part_ != 0 &&
             view.parts_ > std::numeric_limits<size_t>::max() / view.slots_per_part_) {
@@ -717,10 +739,10 @@ class PtrHash {
  private:
     static void
     validate_params(const PtrHashParams& params) {
-        if (!(params.alpha > 0.0 && params.alpha <= 1.0)) {
+        if (!std::isfinite(params.alpha) || !(params.alpha > 0.0 && params.alpha <= 1.0)) {
             throw std::invalid_argument("alpha must be in (0, 1]");
         }
-        if (!(params.lambda > 0.0)) {
+        if (!std::isfinite(params.lambda) || !(params.lambda > 0.0)) {
             throw std::invalid_argument("lambda must be positive");
         }
         if (params.max_pilot > std::numeric_limits<uint8_t>::max()) {
@@ -748,17 +770,20 @@ class PtrHash {
               size_t& buckets_total, size_t& slots_per_part, size_t& buckets_per_part, std::vector<uint8_t>& pilots,
               std::vector<uint32_t>& remap) {
         const size_t keys_per_part = std::max<size_t>(1, (keys.size() + parts - 1) / parts);
-        slots_per_part = std::max<size_t>(1, static_cast<size_t>(static_cast<double>(keys_per_part) / alpha));
+        slots_per_part = std::max<size_t>(1, detail::ceil_division_as_size(static_cast<double>(keys_per_part), alpha));
         if ((slots_per_part & (slots_per_part - 1)) == 0) {
             ++slots_per_part;
         }
-        buckets_per_part =
-            std::max<size_t>(1, detail::ceil_division_as_size(static_cast<double>(keys_per_part), lambda) + 3);
+        const size_t bucket_base = detail::ceil_division_as_size(static_cast<double>(keys_per_part), lambda);
+        if (bucket_base > std::numeric_limits<size_t>::max() - 3) {
+            throw std::overflow_error("PtrHash size overflow");
+        }
+        buckets_per_part = std::max<size_t>(1, bucket_base + 3);
         if (buckets_per_part > static_cast<size_t>(std::numeric_limits<BucketId>::max())) {
             throw std::overflow_error("too many buckets per part for compact build state");
         }
-        slots_total = parts * slots_per_part;
-        buckets_total = parts * buckets_per_part;
+        slots_total = detail::checked_multiply_as_size(parts, slots_per_part, "PtrHash slot layout overflow");
+        buckets_total = detail::checked_multiply_as_size(parts, buckets_per_part, "PtrHash bucket layout overflow");
         const uint64_t rem_slots_m = detail::fastmod32_multiplier(slots_per_part);
         std::array<uint64_t, 256> pilot_hashes{};
         for (size_t pilot = 0; pilot <= max_pilot; ++pilot) {
@@ -777,24 +802,27 @@ class PtrHash {
         const size_t thread_count = effective_thread_count(build_threads, parts);
         std::vector<std::thread> workers;
         workers.reserve(thread_count);
-        for (size_t thread = 0; thread < thread_count; ++thread) {
-            workers.emplace_back([&] {
-                while (ok.load(std::memory_order_relaxed)) {
-                    const size_t part = next_part.fetch_add(1, std::memory_order_relaxed);
-                    if (part >= parts) {
-                        break;
+        try {
+            for (size_t thread = 0; thread < thread_count; ++thread) {
+                workers.emplace_back([&] {
+                    while (ok.load(std::memory_order_relaxed)) {
+                        const size_t part = next_part.fetch_add(1, std::memory_order_relaxed);
+                        if (part >= parts) {
+                            break;
+                        }
+                        if (!build_part(part, buckets_per_part, slots_per_part, rem_slots_m, max_pilot, pilot_hashes,
+                                        bucket_hashes, bucket_starts, pilots, taken)) {
+                            ok.store(false, std::memory_order_relaxed);
+                            break;
+                        }
                     }
-                    if (!build_part(part, buckets_per_part, slots_per_part, rem_slots_m, max_pilot, pilot_hashes,
-                                    bucket_hashes, bucket_starts, pilots, taken)) {
-                        ok.store(false, std::memory_order_relaxed);
-                        break;
-                    }
-                }
-            });
+                });
+            }
+        } catch (...) {
+            join_workers(workers);
+            throw;
         }
-        for (auto& worker : workers) {
-            worker.join();
-        }
+        join_workers(workers);
         if (!ok.load(std::memory_order_relaxed)) {
             return false;
         }
@@ -817,6 +845,15 @@ class PtrHash {
             }
         }
         return free_cursor == free_minimal.size();
+    }
+
+    static void
+    join_workers(std::vector<std::thread>& workers) noexcept {
+        for (auto& worker : workers) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
     }
 
     static size_t
@@ -873,20 +910,24 @@ class PtrHash {
         std::vector<std::atomic<uint32_t>> counts(buckets_total);
         std::vector<std::thread> workers;
         workers.reserve(thread_count);
-        for (size_t thread = 0; thread < thread_count; ++thread) {
-            const size_t begin = keys.size() * thread / thread_count;
-            const size_t end = keys.size() * (thread + 1) / thread_count;
-            workers.emplace_back([&, begin, end] {
-                for (size_t i = begin; i < end; ++i) {
-                    const uint64_t hx = detail::hash_key_for(keys[i], seed);
-                    const size_t bucket = bucket_for_hash(hx, parts, buckets_per_part, buckets_total, bucket_function);
-                    counts[bucket].fetch_add(1, std::memory_order_relaxed);
-                }
-            });
+        try {
+            for (size_t thread = 0; thread < thread_count; ++thread) {
+                const size_t begin = keys.size() * thread / thread_count;
+                const size_t end = keys.size() * (thread + 1) / thread_count;
+                workers.emplace_back([&, begin, end] {
+                    for (size_t i = begin; i < end; ++i) {
+                        const uint64_t hx = detail::hash_key_for(keys[i], seed);
+                        const size_t bucket =
+                            bucket_for_hash(hx, parts, buckets_per_part, buckets_total, bucket_function);
+                        counts[bucket].fetch_add(1, std::memory_order_relaxed);
+                    }
+                });
+            }
+        } catch (...) {
+            join_workers(workers);
+            throw;
         }
-        for (auto& worker : workers) {
-            worker.join();
-        }
+        join_workers(workers);
 
         for (size_t i = 0; i < buckets_total; ++i) {
             bucket_starts[i + 1] = bucket_starts[i] + counts[i].load(std::memory_order_relaxed);
@@ -898,21 +939,25 @@ class PtrHash {
         }
 
         workers.clear();
-        for (size_t thread = 0; thread < thread_count; ++thread) {
-            const size_t begin = keys.size() * thread / thread_count;
-            const size_t end = keys.size() * (thread + 1) / thread_count;
-            workers.emplace_back([&, begin, end] {
-                for (size_t i = begin; i < end; ++i) {
-                    const uint64_t hx = detail::hash_key_for(keys[i], seed);
-                    const size_t bucket = bucket_for_hash(hx, parts, buckets_per_part, buckets_total, bucket_function);
-                    const uint32_t pos = cursor[bucket].fetch_add(1, std::memory_order_relaxed);
-                    bucket_hashes[pos] = hx;
-                }
-            });
+        try {
+            for (size_t thread = 0; thread < thread_count; ++thread) {
+                const size_t begin = keys.size() * thread / thread_count;
+                const size_t end = keys.size() * (thread + 1) / thread_count;
+                workers.emplace_back([&, begin, end] {
+                    for (size_t i = begin; i < end; ++i) {
+                        const uint64_t hx = detail::hash_key_for(keys[i], seed);
+                        const size_t bucket =
+                            bucket_for_hash(hx, parts, buckets_per_part, buckets_total, bucket_function);
+                        const uint32_t pos = cursor[bucket].fetch_add(1, std::memory_order_relaxed);
+                        bucket_hashes[pos] = hx;
+                    }
+                });
+            }
+        } catch (...) {
+            join_workers(workers);
+            throw;
         }
-        for (auto& worker : workers) {
-            worker.join();
-        }
+        join_workers(workers);
     }
 
     static size_t
@@ -1295,14 +1340,27 @@ class MappedPtrHash {
             ::close(fd);
             throw std::runtime_error("failed to stat PtrHash mmap file");
         }
-        if (offset > static_cast<size_t>(st.st_size)) {
+        if (st.st_size < 0) {
+            ::close(fd);
+            throw std::invalid_argument("PtrHash mmap file size is invalid");
+        }
+        const auto file_size = static_cast<uintmax_t>(st.st_size);
+        if (file_size > static_cast<uintmax_t>(std::numeric_limits<size_t>::max())) {
+            ::close(fd);
+            throw std::overflow_error("PtrHash mmap file is too large");
+        }
+        const size_t length = static_cast<size_t>(file_size);
+        if (offset > length) {
             ::close(fd);
             throw std::invalid_argument("PtrHash mmap offset is past end of file");
         }
-        const size_t length = static_cast<size_t>(st.st_size);
-        void* mapping = length == 0 ? nullptr : ::mmap(nullptr, length, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (length == 0) {
+            ::close(fd);
+            throw std::invalid_argument("PtrHash mmap file is empty");
+        }
+        void* mapping = ::mmap(nullptr, length, PROT_READ, MAP_PRIVATE, fd, 0);
         ::close(fd);
-        if (length != 0 && mapping == MAP_FAILED) {
+        if (mapping == MAP_FAILED) {
             throw std::runtime_error("failed to mmap PtrHash file");
         }
         MappedPtrHash result;
