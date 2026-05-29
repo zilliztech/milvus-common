@@ -451,6 +451,12 @@ TEST(PtrHashTest, SerializedHeaderUsesPtrHashMagicAndVersionOne) {
     EXPECT_EQ(ReadU32(bytes, 8), 1u);
 }
 
+TEST(PtrHashTest, SerializedBufferUsesExactCapacity) {
+    auto hash = PtrHash::build(MakeIntegerKeys(1000));
+    const auto& bytes = hash.serialize();
+    EXPECT_EQ(bytes.size(), bytes.capacity());
+}
+
 TEST(PtrHashTest, DeserializeRoundTripPreservesQueries) {
     auto keys = MakeIntegerKeys(128);
     auto hash = PtrHash::build(keys);

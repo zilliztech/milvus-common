@@ -827,14 +827,16 @@ class PtrHash {
             return false;
         }
 
+        const size_t remap_count = slots_total - keys.size();
         std::vector<uint32_t> free_minimal;
+        free_minimal.reserve(remap_count);
         for (size_t i = 0; i < keys.size(); ++i) {
             if (!taken[i]) {
                 free_minimal.push_back(static_cast<uint32_t>(i));
             }
         }
 
-        remap.assign(slots_total - keys.size(), 0);
+        remap.assign(remap_count, 0);
         size_t free_cursor = 0;
         for (size_t slot = keys.size(); slot < slots_total; ++slot) {
             if (taken[slot]) {
@@ -1186,6 +1188,13 @@ class PtrHash {
                size_t buckets_per_part, uint64_t seed, BucketFunction bucket_function,
                detail::KeyHashKind key_hash_kind, std::vector<uint8_t> pilots, std::vector<uint32_t> remap) {
         PtrHash hash;
+        const size_t remap_bytes =
+            detail::checked_multiply_as_size(remap.size(), sizeof(uint32_t), "PtrHash serialized size overflow");
+        if (pilots.size() > std::numeric_limits<size_t>::max() - detail::kHeaderSize ||
+            remap_bytes > std::numeric_limits<size_t>::max() - detail::kHeaderSize - pilots.size()) {
+            throw std::overflow_error("PtrHash serialized size overflow");
+        }
+        hash.storage_.reserve(detail::kHeaderSize + pilots.size() + remap_bytes);
         hash.storage_.insert(hash.storage_.end(), detail::kMagic, detail::kMagic + 8);
         detail::append_u32(hash.storage_, detail::kVersion);
         const uint32_t flags = detail::kRemapU32 |
