@@ -19,6 +19,7 @@ set(ALL_TEST_FILES
     init_gtest.cpp
     TracerTest.cpp
     StreamTest.cpp
+    PtrHashTest.cpp
 )
 
 add_executable(all_tests
