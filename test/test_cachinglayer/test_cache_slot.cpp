@@ -1298,8 +1298,8 @@ TEST(WarmupTraceContextTest, SyncWarmupPassesTraceContext) {
         std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
                                               std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
 
-    uint8_t trace_id[16]{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32,
-                         0x10};
+    uint8_t trace_id[16]{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+                         0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10};
     uint8_t span_id[8]{0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe};
     milvus::tracer::TraceContext trace_ctx{trace_id, span_id, 1};
 
@@ -1700,8 +1700,9 @@ TEST(AsyncWarmupTest, AsyncWarmupDoesNotInheritTraceContext) {
 
     std::vector<std::pair<cid_t, int64_t>> cell_sizes = {{0, 100}, {1, 100}};
     std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map = {{0, 0}, {1, 1}};
-    auto translator = std::make_unique<MockTranslatorWithWarmup>(
-        cell_sizes, uid_to_cid_map, "async_trace_slot", StorageType::MEMORY, CacheWarmupPolicy::CacheWarmupPolicy_Async);
+    auto translator =
+        std::make_unique<MockTranslatorWithWarmup>(cell_sizes, uid_to_cid_map, "async_trace_slot", StorageType::MEMORY,
+                                                   CacheWarmupPolicy::CacheWarmupPolicy_Async);
     auto* translator_ptr = translator.get();
 
     std::promise<void> load_started;
@@ -1714,8 +1715,8 @@ TEST(AsyncWarmupTest, AsyncWarmupDoesNotInheritTraceContext) {
         std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
                                               std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
 
-    uint8_t trace_id[16]{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32,
-                         0x10};
+    uint8_t trace_id[16]{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+                         0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10};
     uint8_t span_id[8]{0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe};
     milvus::tracer::TraceContext trace_ctx{trace_id, span_id, 1};
 
