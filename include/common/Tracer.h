@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include <algorithm>
+#include <array>
 #include <map>
 #include <memory>
 #include <string>
@@ -38,6 +40,46 @@ struct TraceContext {
     const uint8_t* traceID = nullptr;
     const uint8_t* spanID = nullptr;
     uint8_t traceFlags = 0;
+};
+
+struct OwnedTraceContext {
+    std::array<uint8_t, opentelemetry::trace::TraceId::kSize> trace_id{};
+    std::array<uint8_t, opentelemetry::trace::SpanId::kSize> span_id{};
+    uint8_t trace_flags = 0;
+    bool has_value = false;
+
+    OwnedTraceContext() = default;
+
+    explicit OwnedTraceContext(const TraceContext& ctx) {
+        if (ctx.traceID == nullptr || ctx.spanID == nullptr) {
+            return;
+        }
+        std::copy_n(ctx.traceID, trace_id.size(), trace_id.begin());
+        std::copy_n(ctx.spanID, span_id.size(), span_id.begin());
+        trace_flags = ctx.traceFlags;
+        has_value = true;
+    }
+
+    [[nodiscard]] bool
+    HasValue() const {
+        return has_value;
+    }
+
+    [[nodiscard]] TraceContext
+    AsTraceContext() const {
+        if (!has_value) {
+            return {};
+        }
+        return TraceContext{trace_id.data(), span_id.data(), trace_flags};
+    }
+
+    void
+    Clear() {
+        trace_id.fill(0);
+        span_id.fill(0);
+        trace_flags = 0;
+        has_value = false;
+    }
 };
 namespace trace = opentelemetry::trace;
 

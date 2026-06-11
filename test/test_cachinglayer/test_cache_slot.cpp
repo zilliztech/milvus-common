@@ -24,6 +24,7 @@
 #include "cachinglayer/lrucache/ListNode.h"
 #include "cachinglayer_test_utils.h"
 #include "common/OpContext.h"
+#include "common/Tracer.h"
 
 using namespace milvus::cachinglayer;
 using namespace milvus::cachinglayer::internal;
@@ -1070,6 +1071,15 @@ class MockTranslatorWithWarmup : public Translator<TestCell> {
             shared_call_counter_->fetch_add(1);
         }
         last_ctx_ = ctx;
+        last_ctx_has_trace_ = false;
+        last_trace_id_hex_.reset();
+        if (ctx) {
+            auto trace_view = ctx->MakeTraceContextView();
+            last_ctx_has_trace_ = trace_view.has_value();
+            if (trace_view) {
+                last_trace_id_hex_ = milvus::tracer::GetTraceIDAsHexStr(&*trace_view);
+            }
+        }
 
         // Signal that loading has started
         if (load_started_promise_) {
@@ -1121,6 +1131,16 @@ class MockTranslatorWithWarmup : public Translator<TestCell> {
         return last_ctx_;
     }
 
+    bool
+    LastCtxHasTrace() const {
+        return last_ctx_has_trace_;
+    }
+
+    const std::optional<std::string>&
+    LastTraceIdHex() const {
+        return last_trace_id_hex_;
+    }
+
     // Set a promise that will be signaled when loading starts
     void
     SetLoadStartedPromise(std::promise<void>* promise) {
@@ -1154,6 +1174,8 @@ class MockTranslatorWithWarmup : public Translator<TestCell> {
     std::unordered_map<cid_t, int> cid_load_delay_ms_;
     std::atomic<int> get_cells_call_count_ = 0;
     milvus::OpContext* last_ctx_ = nullptr;
+    bool last_ctx_has_trace_ = false;
+    std::optional<std::string> last_trace_id_hex_;
     std::promise<void>* load_started_promise_ = nullptr;
     std::function<void()> load_started_callback_;
     std::promise<void>* load_completed_promise_ = nullptr;
@@ -1260,6 +1282,36 @@ TEST(WarmupTest, WarmupPassesCtxToGetCells) {
     EXPECT_EQ(translator_ptr->GetCellsCallCount(), 1);
     // Verify that the ctx was passed through to get_cells
     EXPECT_EQ(translator_ptr->GetLastCtx(), op_ctx.get());
+}
+
+TEST(WarmupTraceContextTest, SyncWarmupPassesTraceContext) {
+    auto limit = ResourceUsage{10000, 0};
+    auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
+
+    std::vector<std::pair<cid_t, int64_t>> cell_sizes = {{0, 100}, {1, 100}};
+    std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map = {{0, 0}, {1, 1}};
+    auto translator = std::make_unique<MockTranslatorWithWarmup>(
+        cell_sizes, uid_to_cid_map, "sync_trace_slot", StorageType::MEMORY, CacheWarmupPolicy::CacheWarmupPolicy_Sync);
+    auto* translator_ptr = translator.get();
+
+    auto cache_slot =
+        std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                              std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
+
+    uint8_t trace_id[16]{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32,
+                         0x10};
+    uint8_t span_id[8]{0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe};
+    milvus::tracer::TraceContext trace_ctx{trace_id, span_id, 1};
+
+    auto op_ctx = std::make_unique<milvus::OpContext>();
+    op_ctx->SetTraceContext(trace_ctx);
+
+    cache_slot->Warmup(op_ctx.get());
+
+    EXPECT_EQ(translator_ptr->GetLastCtx(), op_ctx.get());
+    EXPECT_TRUE(translator_ptr->LastCtxHasTrace());
+    ASSERT_TRUE(translator_ptr->LastTraceIdHex().has_value());
+    EXPECT_EQ(*translator_ptr->LastTraceIdHex(), "0123456789abcdeffedcba9876543210");
 }
 
 // Test that Warmup with cancelled ctx during loading throws
@@ -1642,6 +1694,43 @@ TEST(AsyncWarmupTest, CancelWarmupBeforeStartPreventsLoading) {
 }
 
 // Test sync warmup still works (regression test)
+TEST(AsyncWarmupTest, AsyncWarmupDoesNotInheritTraceContext) {
+    auto limit = ResourceUsage{10000, 0};
+    auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
+
+    std::vector<std::pair<cid_t, int64_t>> cell_sizes = {{0, 100}, {1, 100}};
+    std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map = {{0, 0}, {1, 1}};
+    auto translator = std::make_unique<MockTranslatorWithWarmup>(
+        cell_sizes, uid_to_cid_map, "async_trace_slot", StorageType::MEMORY, CacheWarmupPolicy::CacheWarmupPolicy_Async);
+    auto* translator_ptr = translator.get();
+
+    std::promise<void> load_started;
+    auto load_started_future = load_started.get_future();
+    translator->SetLoadStartedPromise(&load_started);
+
+    auto prefetch_pool = std::make_shared<folly::CPUThreadPoolExecutor>(1);
+
+    auto cache_slot =
+        std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                              std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
+
+    uint8_t trace_id[16]{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32,
+                         0x10};
+    uint8_t span_id[8]{0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe};
+    milvus::tracer::TraceContext trace_ctx{trace_id, span_id, 1};
+
+    auto op_ctx = std::make_unique<milvus::OpContext>();
+    op_ctx->SetTraceContext(trace_ctx);
+
+    cache_slot->Warmup(op_ctx.get(), prefetch_pool);
+    ASSERT_EQ(load_started_future.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    prefetch_pool->join();
+
+    EXPECT_NE(translator_ptr->GetLastCtx(), op_ctx.get());
+    EXPECT_FALSE(translator_ptr->LastCtxHasTrace());
+    EXPECT_FALSE(translator_ptr->LastTraceIdHex().has_value());
+}
+
 TEST(AsyncWarmupTest, SyncWarmupStillWorks) {
     auto limit = ResourceUsage{10000, 0};
     auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});

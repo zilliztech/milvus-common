@@ -117,7 +117,8 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                                 return;
                             }
                             OpContext warmup_ctx(token);
-                            // Note: caller ctx is not captured - async warmup uses its own ctx with cancellation token
+                            // Note: caller ctx is not captured - async warmup intentionally inherits only the
+                            // cancellation token, not trace context, storage usage, or other caller metadata.
                             self->PinCellsDirect(&warmup_ctx, cids, self->warmup_loading_timeout_);
                             // If the slot is not evictable, we don't need to pin the cells anymore after warmup.
                             self->skip_pin_.store(!self->evictable_, std::memory_order_release);

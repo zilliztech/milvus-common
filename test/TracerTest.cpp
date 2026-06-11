@@ -3,6 +3,7 @@
 #include <memory>
 
 #include "common/EasyAssert.h"
+#include "common/OpContext.h"
 #include "common/Tracer.h"
 
 using namespace milvus;
@@ -53,6 +54,75 @@ TEST(Tracer, Span) {
 
     delete[] ctx->traceID;
     delete[] ctx->spanID;
+}
+
+TEST(Tracer, OwnedTraceSnapshotCopiesBytes) {
+    uint8_t trace_id[16]{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32,
+                         0x10};
+    uint8_t span_id[8]{0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe};
+    TraceContext view{trace_id, span_id, 1};
+
+    OwnedTraceContext owned(view);
+    auto copied = owned.AsTraceContext();
+
+    ASSERT_TRUE(owned.HasValue());
+    ASSERT_EQ(GetTraceIDAsHexStr(&copied), "0123456789abcdeffedcba9876543210");
+    ASSERT_EQ(GetSpanIDAsHexStr(&copied), "1032547698badcfe");
+}
+
+TEST(Tracer, OwnedTraceSnapshotCopiesBytesIndependently) {
+    uint8_t trace_id[16]{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32,
+                         0x10};
+    uint8_t span_id[8]{0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe};
+    TraceContext view{trace_id, span_id, 1};
+
+    OwnedTraceContext owned(view);
+    trace_id[0] = 0xff;
+    span_id[0] = 0xee;
+
+    auto copied = owned.AsTraceContext();
+    ASSERT_EQ(GetTraceIDAsHexStr(&copied), "0123456789abcdeffedcba9876543210");
+    ASSERT_EQ(GetSpanIDAsHexStr(&copied), "1032547698badcfe");
+}
+
+TEST(Tracer, OpContextStoresOwnedTraceSnapshot) {
+    uint8_t trace_id[16]{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32,
+                         0x10};
+    uint8_t span_id[8]{0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe};
+    TraceContext trace_ctx{trace_id, span_id, 1};
+
+    milvus::OpContext op_ctx;
+    op_ctx.SetTraceContext(trace_ctx);
+
+    auto view = op_ctx.MakeTraceContextView();
+    ASSERT_TRUE(view.has_value());
+    ASSERT_EQ(GetTraceIDAsHexStr(&*view), "0123456789abcdeffedcba9876543210");
+    ASSERT_EQ(GetSpanIDAsHexStr(&*view), "1032547698badcfe");
+}
+
+TEST(Tracer, OpContextDefaultsToNoTraceContext) {
+    milvus::OpContext op_ctx;
+    ASSERT_FALSE(op_ctx.MakeTraceContextView().has_value());
+}
+
+TEST(Tracer, StartSpanFromOpContextTraceView) {
+    auto config = std::make_shared<TraceConfig>();
+    config->exporter = "stdout";
+    config->nodeID = 1;
+    initTelemetry(*config);
+
+    uint8_t trace_id[16]{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32,
+                         0x10};
+    uint8_t span_id[8]{0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe};
+    TraceContext trace_ctx{trace_id, span_id, 1};
+
+    milvus::OpContext op_ctx;
+    op_ctx.SetTraceContext(trace_ctx);
+    auto view = op_ctx.MakeTraceContextView();
+    ASSERT_TRUE(view.has_value());
+
+    auto span = StartSpan("from_op_ctx", &*view);
+    ASSERT_TRUE(span->GetContext().trace_id() == trace::TraceId({view->traceID, 16}));
 }
 
 TEST(Tracer, GetTraceID) {
