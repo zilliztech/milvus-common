@@ -44,10 +44,12 @@ struct OpContext {
 
     void
     SetTraceContext(const tracer::TraceContext& ctx) {
-        trace_context.emplace(ctx);
-        if (!trace_context->HasValue()) {
+        tracer::OwnedTraceContext snapshot(ctx);
+        if (!snapshot.HasValue()) {
             trace_context.reset();
+            return;
         }
+        trace_context = snapshot;
     }
 
     void

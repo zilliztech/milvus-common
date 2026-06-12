@@ -18,7 +18,13 @@
 #include <string>
 
 #include "common/TracerBase.h"
-#include "opentelemetry/trace/provider.h"
+#include "opentelemetry/trace/span_id.h"
+#include "opentelemetry/trace/trace_id.h"
+
+namespace opentelemetry::trace {
+class Span;
+class Tracer;
+}  // namespace opentelemetry::trace
 
 #define TRACE_SERVICE_SEGCORE "segcore"
 
@@ -52,6 +58,11 @@ struct OwnedTraceContext {
 
     explicit OwnedTraceContext(const TraceContext& ctx) {
         if (ctx.traceID == nullptr || ctx.spanID == nullptr) {
+            return;
+        }
+        const auto source_trace_id = opentelemetry::trace::TraceId({ctx.traceID, opentelemetry::trace::TraceId::kSize});
+        const auto source_span_id = opentelemetry::trace::SpanId({ctx.spanID, opentelemetry::trace::SpanId::kSize});
+        if (!source_trace_id.IsValid() || !source_span_id.IsValid()) {
             return;
         }
         std::copy_n(ctx.traceID, trace_id.size(), trace_id.begin());

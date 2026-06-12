@@ -5,6 +5,7 @@
 #include "common/EasyAssert.h"
 #include "common/OpContext.h"
 #include "common/Tracer.h"
+#include "opentelemetry/trace/tracer.h"
 
 using namespace milvus;
 using namespace milvus::tracer;
@@ -85,6 +86,16 @@ TEST(Tracer, OwnedTraceSnapshotCopiesBytesIndependently) {
     ASSERT_EQ(GetSpanIDAsHexStr(&copied), "1032547698badcfe");
 }
 
+TEST(Tracer, OwnedTraceSnapshotIgnoresEmptyIds) {
+    uint8_t trace_id[16]{};
+    uint8_t span_id[8]{};
+    TraceContext view{trace_id, span_id, 1};
+
+    OwnedTraceContext owned(view);
+
+    ASSERT_FALSE(owned.HasValue());
+}
+
 TEST(Tracer, OpContextStoresOwnedTraceSnapshot) {
     uint8_t trace_id[16]{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
                          0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10};
@@ -103,6 +114,24 @@ TEST(Tracer, OpContextStoresOwnedTraceSnapshot) {
 TEST(Tracer, OpContextDefaultsToNoTraceContext) {
     milvus::OpContext op_ctx;
     ASSERT_FALSE(op_ctx.MakeTraceContextView().has_value());
+}
+
+TEST(Tracer, OpContextSetTraceContextSupportsAliasedView) {
+    uint8_t trace_id[16]{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+                         0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10};
+    uint8_t span_id[8]{0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe};
+    TraceContext trace_ctx{trace_id, span_id, 1};
+
+    milvus::OpContext op_ctx;
+    op_ctx.SetTraceContext(trace_ctx);
+
+    auto first_view = op_ctx.MakeTraceContextView().value();
+    op_ctx.SetTraceContext(first_view);
+
+    auto second_view = op_ctx.MakeTraceContextView();
+    ASSERT_TRUE(second_view.has_value());
+    ASSERT_EQ(GetTraceIDAsHexStr(&*second_view), "0123456789abcdeffedcba9876543210");
+    ASSERT_EQ(GetSpanIDAsHexStr(&*second_view), "1032547698badcfe");
 }
 
 TEST(Tracer, StartSpanFromOpContextTraceView) {
