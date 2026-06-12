@@ -77,12 +77,15 @@ struct OwnedTraceContext {
     }
 
     [[nodiscard]] TraceContext
-    AsTraceContext() const {
+    AsTraceContext() const& {
         if (!has_value) {
             return {};
         }
         return TraceContext{trace_id.data(), span_id.data(), trace_flags};
     }
+
+    [[nodiscard]] TraceContext
+    AsTraceContext() const&& = delete;
 
     void
     Clear() {

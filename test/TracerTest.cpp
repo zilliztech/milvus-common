@@ -96,6 +96,19 @@ TEST(Tracer, OwnedTraceSnapshotIgnoresEmptyIds) {
     ASSERT_FALSE(owned.HasValue());
 }
 
+TEST(Tracer, OwnedTraceSnapshotCreatesViewFromLvalue) {
+    uint8_t trace_id[16]{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+                         0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10};
+    uint8_t span_id[8]{0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe};
+    TraceContext view{trace_id, span_id, 1};
+
+    OwnedTraceContext owned(view);
+    auto copied = owned.AsTraceContext();
+
+    ASSERT_EQ(GetTraceIDAsHexStr(&copied), "0123456789abcdeffedcba9876543210");
+    ASSERT_EQ(GetSpanIDAsHexStr(&copied), "1032547698badcfe");
+}
+
 TEST(Tracer, OpContextStoresOwnedTraceSnapshot) {
     uint8_t trace_id[16]{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
                          0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10};
