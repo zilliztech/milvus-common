@@ -87,40 +87,14 @@ FeatureReporter::recordAt(std::chrono::steady_clock::time_point now) {
     return false;
 }
 
-FeatureReporter&
-HybridSearch() {
-    static FeatureReporter reporter{kHybridSearch};
-    return reporter;
-}
+#define DEFINE_FEATURE_REPORTER(name, label)      \
+    FeatureReporter& name() {                     \
+        static FeatureReporter reporter{k##name}; \
+        return reporter;                          \
+    }
 
-FeatureReporter&
-PartitionKey() {
-    static FeatureReporter reporter{kPartitionKey};
-    return reporter;
-}
+MILVUS_FEATURE_REPORTERS(DEFINE_FEATURE_REPORTER)
 
-FeatureReporter&
-DynamicField() {
-    static FeatureReporter reporter{kDynamicField};
-    return reporter;
-}
-
-FeatureReporter&
-BM25Function() {
-    static FeatureReporter reporter{kBM25Function};
-    return reporter;
-}
-
-FeatureReporter&
-ResourceGroup() {
-    static FeatureReporter reporter{kResourceGroup};
-    return reporter;
-}
-
-FeatureReporter&
-BulkImport() {
-    static FeatureReporter reporter{kBulkImport};
-    return reporter;
-}
+#undef DEFINE_FEATURE_REPORTER
 
 }  // namespace milvus::monitor::feature_report
