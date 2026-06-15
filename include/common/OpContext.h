@@ -14,7 +14,10 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <optional>
+
+#include "common/Tracer.h"
 
 namespace milvus {
 
@@ -37,6 +40,9 @@ struct OpContext {
     // Runtime load priority that overrides the translator's cached priority.
     // Maps to proto::common::LoadPriority (milvus-proto): HIGH = 0, LOW = 1.
     std::optional<int32_t> runtime_load_priority;
+
+    // Stable trace parent propagated across Milvus/Knowhere/Cardinal boundaries.
+    std::shared_ptr<tracer::trace::Span> trace_parent_span = nullptr;
 
     OpContext() = default;
     OpContext(const folly::CancellationToken& cancellation_token) : cancellation_token(cancellation_token) {
