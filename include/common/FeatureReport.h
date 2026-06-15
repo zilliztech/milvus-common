@@ -20,12 +20,13 @@
 
 namespace milvus::monitor::feature_report {
 
-constexpr std::string_view kHybridSearch = "hybrid_search";
-constexpr std::string_view kPartitionKey = "partition_key";
-constexpr std::string_view kDynamicField = "dynamic_field";
-constexpr std::string_view kBM25Function = "bm25_function";
-constexpr std::string_view kResourceGroup = "resource_group";
-constexpr std::string_view kBulkImport = "bulk_import";
+#define MILVUS_FEATURE_REPORTERS(FEATURE)    \
+    FEATURE(HybridSearch, "hybrid_search")   \
+    FEATURE(PartitionKey, "partition_key")   \
+    FEATURE(DynamicField, "dynamic_field")   \
+    FEATURE(BM25Function, "bm25_function")   \
+    FEATURE(ResourceGroup, "resource_group") \
+    FEATURE(BulkImport, "bulk_import")
 
 class alignas(64) FeatureReporter {
  public:
@@ -58,22 +59,12 @@ class alignas(64) FeatureReporter {
     prometheus::Counter& counter_;
 };
 
-FeatureReporter&
-HybridSearch();
+#define DECLARE_FEATURE_REPORTER(name, label)   \
+    constexpr std::string_view k##name = label; \
+    FeatureReporter& name();
 
-FeatureReporter&
-PartitionKey();
+MILVUS_FEATURE_REPORTERS(DECLARE_FEATURE_REPORTER)
 
-FeatureReporter&
-DynamicField();
-
-FeatureReporter&
-BM25Function();
-
-FeatureReporter&
-ResourceGroup();
-
-FeatureReporter&
-BulkImport();
+#undef DECLARE_FEATURE_REPORTER
 
 }  // namespace milvus::monitor::feature_report
