@@ -17,6 +17,7 @@ find_package(BLAS REQUIRED)
 
 set(ALL_TEST_FILES
     init_gtest.cpp
+    FeatureReportTest.cpp
     TracerTest.cpp
     StreamTest.cpp
     PtrHashTest.cpp
