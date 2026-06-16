@@ -16,6 +16,8 @@
 #include <cstdint>
 #include <optional>
 
+#include "common/Tracer.h"
+
 namespace milvus {
 
 /**
@@ -37,6 +39,31 @@ struct OpContext {
     // Runtime load priority that overrides the translator's cached priority.
     // Maps to proto::common::LoadPriority (milvus-proto): HIGH = 0, LOW = 1.
     std::optional<int32_t> runtime_load_priority;
+
+    std::optional<tracer::OwnedTraceContext> trace_context;
+
+    void
+    SetTraceContext(const tracer::TraceContext& ctx) {
+        tracer::OwnedTraceContext snapshot(ctx);
+        if (!snapshot.HasValue()) {
+            trace_context.reset();
+            return;
+        }
+        trace_context = snapshot;
+    }
+
+    void
+    ClearTraceContext() {
+        trace_context.reset();
+    }
+
+    [[nodiscard]] std::optional<tracer::TraceContext>
+    MakeTraceContextView() const {
+        if (!trace_context.has_value() || !trace_context->HasValue()) {
+            return std::nullopt;
+        }
+        return trace_context->AsTraceContext();
+    }
 
     OpContext() = default;
     OpContext(const folly::CancellationToken& cancellation_token) : cancellation_token(cancellation_token) {

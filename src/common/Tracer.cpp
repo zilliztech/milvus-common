@@ -13,6 +13,8 @@
 
 #include <opentelemetry/exporters/otlp/otlp_http_exporter_factory.h>
 #include <opentelemetry/exporters/otlp/otlp_http_exporter_options.h>
+#include <opentelemetry/trace/provider.h>
+#include <opentelemetry/trace/tracer.h>
 
 #include <algorithm>
 #include <atomic>
