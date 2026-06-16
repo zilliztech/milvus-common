@@ -14,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -21,29 +22,63 @@
 #include "common/PrometheusClient.h"
 
 namespace milvus::monitor::feature_report {
+
+struct FeatureReporterTestPeer {
+    static bool
+    RecordAt(FeatureReporter& reporter, std::chrono::steady_clock::time_point now) {
+        return reporter.recordAt(now);
+    }
+
+    static void
+    Reset(FeatureReporter& reporter) {
+        reporter.reset();
+    }
+};
+
 namespace {
 
-bool
-MetricsContain(const std::string& metrics, const std::string& feature, const std::string& value) {
-    const auto expected = "milvus_feature_report_total{feature=\"" + feature + "\",source=\"cpp\"} " + value + "\n";
-    return metrics.find(expected) != std::string::npos;
+double
+FeatureReportValue(std::string_view feature) {
+    for (const auto& family : getPrometheusClient().GetRegistry().Collect()) {
+        if (family.name != "milvus_feature_report_total" || family.type != prometheus::MetricType::Counter) {
+            continue;
+        }
+
+        for (const auto& metric : family.metric) {
+            bool feature_match = false;
+            bool source_match = false;
+            for (const auto& label : metric.label) {
+                if (label.name == "feature" && std::string_view(label.value) == feature) {
+                    feature_match = true;
+                } else if (label.name == "source" && label.value == "cpp") {
+                    source_match = true;
+                }
+            }
+            if (feature_match && source_match) {
+                return metric.counter.value;
+            }
+        }
+    }
+    return 0.0;
 }
 
 TEST(FeatureReportTest, Throttle) {
     auto& reporter = HybridSearch();
-    reporter.ResetForTest();
+    FeatureReporterTestPeer::Reset(reporter);
+    const auto before = FeatureReportValue(reporter.Name());
     const auto now = std::chrono::steady_clock::time_point(std::chrono::seconds(100));
 
-    ASSERT_TRUE(reporter.RecordAtForTest(now));
-    ASSERT_FALSE(reporter.RecordAtForTest(now + std::chrono::minutes(1)));
-    ASSERT_TRUE(reporter.RecordAtForTest(now + std::chrono::hours(1)));
+    ASSERT_TRUE(FeatureReporterTestPeer::RecordAt(reporter, now));
+    ASSERT_FALSE(FeatureReporterTestPeer::RecordAt(reporter, now + std::chrono::minutes(1)));
+    ASSERT_TRUE(FeatureReporterTestPeer::RecordAt(reporter, now + std::chrono::hours(1)));
 
-    ASSERT_TRUE(MetricsContain(getPrometheusClient().GetMetrics(), std::string(reporter.Name()), "2"));
+    ASSERT_DOUBLE_EQ(FeatureReportValue(reporter.Name()) - before, 2.0);
 }
 
 TEST(FeatureReportTest, ConcurrentCalls) {
     auto& reporter = PartitionKey();
-    reporter.ResetForTest();
+    FeatureReporterTestPeer::Reset(reporter);
+    const auto before = FeatureReportValue(reporter.Name());
     const auto now = std::chrono::steady_clock::time_point(std::chrono::seconds(200));
     constexpr int kThreads = 32;
 
@@ -52,7 +87,7 @@ TEST(FeatureReportTest, ConcurrentCalls) {
     threads.reserve(kThreads);
     for (int i = 0; i < kThreads; ++i) {
         threads.emplace_back([&] {
-            if (reporter.RecordAtForTest(now)) {
+            if (FeatureReporterTestPeer::RecordAt(reporter, now)) {
                 reported.fetch_add(1, std::memory_order_relaxed);
             }
         });
@@ -62,13 +97,14 @@ TEST(FeatureReportTest, ConcurrentCalls) {
     }
 
     ASSERT_EQ(reported.load(std::memory_order_relaxed), 1);
-    ASSERT_TRUE(MetricsContain(getPrometheusClient().GetMetrics(), std::string(reporter.Name()), "1"));
+    ASSERT_DOUBLE_EQ(FeatureReportValue(reporter.Name()) - before, 1.0);
 }
 
 TEST(FeatureReportTest, PredeclaredReporter) {
-    DynamicField().ResetForTest();
+    FeatureReporterTestPeer::Reset(DynamicField());
     ASSERT_EQ(DynamicField().Name(), kDynamicField);
-    ASSERT_TRUE(DynamicField().RecordAtForTest(std::chrono::steady_clock::time_point(std::chrono::seconds(300))));
+    ASSERT_TRUE(FeatureReporterTestPeer::RecordAt(DynamicField(),
+                                                  std::chrono::steady_clock::time_point(std::chrono::seconds(300))));
 }
 
 }  // namespace
