@@ -40,17 +40,16 @@ class alignas(64) FeatureReporter {
     bool
     Record();
 
-    bool
-    RecordAtForTest(std::chrono::steady_clock::time_point now);
-
-    void
-    ResetForTest();
-
  private:
     explicit FeatureReporter(std::string_view name);
 
     bool
     recordAt(std::chrono::steady_clock::time_point now);
+
+    void
+    reset();
+
+    friend struct FeatureReporterTestPeer;
 
 #define FRIEND_FEATURE_REPORTER(name, label) friend FeatureReporter& name();
 

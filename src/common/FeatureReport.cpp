@@ -27,7 +27,7 @@ prometheus::Family<prometheus::Counter>&
 FeatureReportFamily() {
     static auto& family = prometheus::BuildCounter()
                               .Name("milvus_feature_report_total")
-                              .Help("Count of throttled feature reports.")
+                              .Help("Count of feature reports emitted.")
                               .Register(milvus::monitor::getPrometheusClient().GetRegistry());
     return family;
 }
@@ -57,13 +57,8 @@ FeatureReporter::Record() {
     return recordAt(std::chrono::steady_clock::now());
 }
 
-bool
-FeatureReporter::RecordAtForTest(std::chrono::steady_clock::time_point now) {
-    return recordAt(now);
-}
-
 void
-FeatureReporter::ResetForTest() {
+FeatureReporter::reset() {
     next_allowed_nanos_.store(0, std::memory_order_release);
 }
 
