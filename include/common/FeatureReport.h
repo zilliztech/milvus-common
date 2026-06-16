@@ -30,9 +30,6 @@ namespace milvus::monitor::feature_report {
 
 class alignas(64) FeatureReporter {
  public:
-    // Prefer the predeclared static reporters below on hot paths.
-    explicit FeatureReporter(std::string_view name);
-
     FeatureReporter(const FeatureReporter&) = delete;
     FeatureReporter&
     operator=(const FeatureReporter&) = delete;
@@ -50,8 +47,16 @@ class alignas(64) FeatureReporter {
     ResetForTest();
 
  private:
+    explicit FeatureReporter(std::string_view name);
+
     bool
     recordAt(std::chrono::steady_clock::time_point now);
+
+#define FRIEND_FEATURE_REPORTER(name, label) friend FeatureReporter& name();
+
+    MILVUS_FEATURE_REPORTERS(FRIEND_FEATURE_REPORTER)
+
+#undef FRIEND_FEATURE_REPORTER
 
  private:
     std::atomic<int64_t> next_allowed_nanos_{0};
