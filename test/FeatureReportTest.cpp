@@ -25,12 +25,13 @@ namespace {
 
 bool
 MetricsContain(const std::string& metrics, const std::string& feature, const std::string& value) {
-    const auto expected = "milvus_feature_report_total{feature=\"" + feature + "\",source=\"cpp\"} " + value;
+    const auto expected = "milvus_feature_report_total{feature=\"" + feature + "\",source=\"cpp\"} " + value + "\n";
     return metrics.find(expected) != std::string::npos;
 }
 
 TEST(FeatureReportTest, Throttle) {
-    FeatureReporter reporter{"feature_report_test_throttle"};
+    auto& reporter = HybridSearch();
+    reporter.ResetForTest();
     const auto now = std::chrono::steady_clock::time_point(std::chrono::seconds(100));
 
     ASSERT_TRUE(reporter.RecordAtForTest(now));
@@ -41,7 +42,8 @@ TEST(FeatureReportTest, Throttle) {
 }
 
 TEST(FeatureReportTest, ConcurrentCalls) {
-    FeatureReporter reporter{"feature_report_test_concurrent"};
+    auto& reporter = PartitionKey();
+    reporter.ResetForTest();
     const auto now = std::chrono::steady_clock::time_point(std::chrono::seconds(200));
     constexpr int kThreads = 32;
 
@@ -64,9 +66,9 @@ TEST(FeatureReportTest, ConcurrentCalls) {
 }
 
 TEST(FeatureReportTest, PredeclaredReporter) {
-    HybridSearch().ResetForTest();
-    ASSERT_EQ(HybridSearch().Name(), kHybridSearch);
-    ASSERT_TRUE(HybridSearch().RecordAtForTest(std::chrono::steady_clock::time_point(std::chrono::seconds(300))));
+    DynamicField().ResetForTest();
+    ASSERT_EQ(DynamicField().Name(), kDynamicField);
+    ASSERT_TRUE(DynamicField().RecordAtForTest(std::chrono::steady_clock::time_point(std::chrono::seconds(300))));
 }
 
 }  // namespace
