@@ -66,8 +66,8 @@ struct OpContext {
         return trace_context->AsTraceContext();
     }
 
-    // Stable trace parent propagated across Milvus/Knowhere/Cardinal boundaries.
-    std::shared_ptr<tracer::trace::Span> trace_parent_span = nullptr;
+    // Current trace span propagated across Milvus/Knowhere/Cardinal boundaries.
+    std::shared_ptr<tracer::trace::Span> trace_span = nullptr;
 
     OpContext() = default;
     OpContext(const folly::CancellationToken& cancellation_token) : cancellation_token(cancellation_token) {
