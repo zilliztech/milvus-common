@@ -135,7 +135,8 @@ GetTraceSpan(const OpContext* op_context) {
 }
 
 inline ScopedTraceSpan
-SetTraceSpan(OpContext* op_context, const SpanPtr& current) {
+SetTemporaryOpContextTraceSpan(OpContext* op_context, const SpanPtr& current) {
+    // Temporarily set OpContext::trace_span and restore the previous span when the returned guard is destroyed.
     return ScopedTraceSpan(op_context, current);
 }
 

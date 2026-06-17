@@ -532,7 +532,7 @@ TEST(Tracer, OpContextTraceSpanAccessors) {
 
     auto parent = StartSpan("parent");
     {
-        auto trace_span = SetTraceSpan(&op_context, parent);
+        auto trace_span = SetTemporaryOpContextTraceSpan(&op_context, parent);
         ASSERT_EQ(GetTraceSpan(&op_context), parent);
 
         auto child = StartScopedSpan("child", GetTraceSpan(&op_context));
@@ -555,7 +555,7 @@ TEST(Tracer, ScopedTraceSpanRestoresPreviousSpan) {
     op_context.trace_span = first;
 
     {
-        auto trace_span = SetTraceSpan(&op_context, second);
+        auto trace_span = SetTemporaryOpContextTraceSpan(&op_context, second);
         ASSERT_EQ(GetTraceSpan(&op_context), second);
     }
     ASSERT_EQ(GetTraceSpan(&op_context), first);
