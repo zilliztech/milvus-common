@@ -4,6 +4,7 @@
 
 #include "common/EasyAssert.h"
 #include "common/OpContext.h"
+#include "common/Trace.h"
 #include "common/Tracer.h"
 #include "opentelemetry/trace/tracer.h"
 
@@ -516,4 +517,53 @@ TEST(Tracer, NoopSpanMethodsAreSafe) {
     ASSERT_FALSE(ctx.IsValid());
 
     span->End();
+}
+
+TEST(Tracer, OpContextTraceSpanAccessors) {
+    ASSERT_EQ(GetTraceSpan(nullptr), nullptr);
+
+    OpContext op_context;
+    ASSERT_EQ(GetTraceSpan(&op_context), nullptr);
+
+    auto config = std::make_shared<TraceConfig>();
+    config->exporter = "stdout";
+    config->nodeID = 1;
+    initTelemetry(*config);
+
+    auto parent = StartSpan("parent");
+    {
+        auto trace_span = SetTraceSpan(&op_context, parent);
+        ASSERT_EQ(GetTraceSpan(&op_context), parent);
+
+        auto child = StartScopedSpan("child", GetTraceSpan(&op_context));
+        ASSERT_NE(child.Get(), nullptr);
+        ASSERT_TRUE(child.Get()->IsRecording());
+        ASSERT_EQ(child.Get()->GetContext().trace_id(), parent->GetContext().trace_id());
+    }
+    ASSERT_EQ(GetTraceSpan(&op_context), nullptr);
+}
+
+TEST(Tracer, ScopedTraceSpanRestoresPreviousSpan) {
+    auto config = std::make_shared<TraceConfig>();
+    config->exporter = "stdout";
+    config->nodeID = 1;
+    initTelemetry(*config);
+
+    OpContext op_context;
+    auto first = StartSpan("first");
+    auto second = StartSpan("second");
+    op_context.trace_span = first;
+
+    {
+        auto trace_span = SetTraceSpan(&op_context, second);
+        ASSERT_EQ(GetTraceSpan(&op_context), second);
+    }
+    ASSERT_EQ(GetTraceSpan(&op_context), first);
+
+    SpanPtr local_span = first;
+    {
+        auto trace_span = ScopedTraceSpan(local_span, second);
+        ASSERT_EQ(local_span, second);
+    }
+    ASSERT_EQ(local_span, first);
 }
