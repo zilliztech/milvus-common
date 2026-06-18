@@ -4,7 +4,6 @@
 
 #include "common/EasyAssert.h"
 #include "common/OpContext.h"
-#include "common/Trace.h"
 #include "common/Tracer.h"
 #include "opentelemetry/trace/tracer.h"
 
@@ -526,7 +525,7 @@ TEST(Tracer, OpContextTraceSpanAccessors) {
 
     auto parent = StartSpan("parent");
     {
-        auto trace_span = NestedSpanGuard(&op_context, parent);
+        auto trace_span = NestedSpanGuard(op_context.trace_span, parent);
         ASSERT_EQ(op_context.GetTraceSpan(), parent);
 
         auto child = ScopedSpan("child", op_context.GetTraceSpan());
@@ -549,7 +548,7 @@ TEST(Tracer, NestedSpanGuardRestoresPreviousSpan) {
     op_context.trace_span = first;
 
     {
-        auto trace_span = NestedSpanGuard(&op_context, second);
+        auto trace_span = NestedSpanGuard(op_context.trace_span, second);
         ASSERT_EQ(op_context.GetTraceSpan(), second);
     }
     ASSERT_EQ(op_context.GetTraceSpan(), first);
