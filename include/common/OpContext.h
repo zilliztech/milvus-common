@@ -69,6 +69,16 @@ struct OpContext {
     // Current trace span propagated across Milvus/Knowhere/Cardinal boundaries.
     std::shared_ptr<tracer::trace::Span> trace_span = nullptr;
 
+    [[nodiscard]] std::shared_ptr<tracer::trace::Span>
+    GetTraceSpan() const {
+        return trace_span;
+    }
+
+    [[nodiscard]] static std::shared_ptr<tracer::trace::Span>
+    GetTraceSpan(const OpContext* op_context) {
+        return op_context != nullptr ? op_context->GetTraceSpan() : nullptr;
+    }
+
     OpContext() = default;
     OpContext(const folly::CancellationToken& cancellation_token) : cancellation_token(cancellation_token) {
     }
