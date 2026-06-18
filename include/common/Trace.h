@@ -22,6 +22,8 @@ namespace milvus::tracer {
 
 using SpanPtr = std::shared_ptr<trace::Span>;
 
+// Starts a child span from a parent span and ends that child span when the guard leaves scope.
+// If the parent is empty or tracing is disabled, the guard stays empty and has no effect.
 class ScopedSpan {
  public:
     ScopedSpan() = default;
@@ -74,31 +76,33 @@ class ScopedSpan {
     SpanPtr span_;
 };
 
-class ScopedTraceSpan {
+// Temporarily replaces a span slot with a nested/current span, then restores the previous span on destruction.
+// This guard does not start or end spans; use ScopedSpan for span lifetime ownership.
+class NestedSpanGuard {
  public:
-    ScopedTraceSpan() = default;
+    NestedSpanGuard() = default;
 
-    ScopedTraceSpan(SpanPtr* span_slot, const SpanPtr& current)
+    NestedSpanGuard(SpanPtr* span_slot, const SpanPtr& current)
         : span_slot_(span_slot), previous_(span_slot != nullptr ? *span_slot : SpanPtr{}) {
         if (span_slot_ != nullptr) {
             *span_slot_ = current;
         }
     }
 
-    ScopedTraceSpan(SpanPtr& span_slot, const SpanPtr& current) : ScopedTraceSpan(&span_slot, current) {
+    NestedSpanGuard(SpanPtr& span_slot, const SpanPtr& current) : NestedSpanGuard(&span_slot, current) {
     }
 
-    ScopedTraceSpan(OpContext* op_context, const SpanPtr& current)
-        : ScopedTraceSpan(op_context != nullptr ? &op_context->trace_span : nullptr, current) {
+    NestedSpanGuard(OpContext* op_context, const SpanPtr& current)
+        : NestedSpanGuard(op_context != nullptr ? &op_context->trace_span : nullptr, current) {
     }
 
-    ScopedTraceSpan(ScopedTraceSpan&& other) noexcept
+    NestedSpanGuard(NestedSpanGuard&& other) noexcept
         : span_slot_(other.span_slot_), previous_(std::move(other.previous_)) {
         other.span_slot_ = nullptr;
     }
 
-    ScopedTraceSpan&
-    operator=(ScopedTraceSpan&& other) noexcept {
+    NestedSpanGuard&
+    operator=(NestedSpanGuard&& other) noexcept {
         if (this != &other) {
             Restore();
             span_slot_ = other.span_slot_;
@@ -108,11 +112,11 @@ class ScopedTraceSpan {
         return *this;
     }
 
-    ScopedTraceSpan(const ScopedTraceSpan&) = delete;
-    ScopedTraceSpan&
-    operator=(const ScopedTraceSpan&) = delete;
+    NestedSpanGuard(const NestedSpanGuard&) = delete;
+    NestedSpanGuard&
+    operator=(const NestedSpanGuard&) = delete;
 
-    ~ScopedTraceSpan() {
+    ~NestedSpanGuard() {
         Restore();
     }
 
@@ -128,21 +132,5 @@ class ScopedTraceSpan {
     SpanPtr* span_slot_ = nullptr;
     SpanPtr previous_;
 };
-
-inline SpanPtr
-GetTraceSpan(const OpContext* op_context) {
-    return op_context != nullptr ? op_context->trace_span : SpanPtr{};
-}
-
-inline ScopedTraceSpan
-SetTemporaryOpContextTraceSpan(OpContext* op_context, const SpanPtr& current) {
-    // Temporarily set OpContext::trace_span and restore the previous span when the returned guard is destroyed.
-    return ScopedTraceSpan(op_context, current);
-}
-
-inline ScopedSpan
-StartScopedSpan(const std::string& name, const SpanPtr& parent) {
-    return ScopedSpan(name, parent);
-}
 
 }  // namespace milvus::tracer
