@@ -268,6 +268,30 @@ TEST_F(CacheSlotTest, Initialization) {
     ASSERT_EQ(cache_slot_->num_cells(), NUM_UNIQUE_CIDS);
 }
 
+TEST_F(CacheSlotTest, IsCachedReflectsLoadedAndCachedStates) {
+    cl_uid_t target_uid = 30;
+    cid_t expected_cid = 2;
+
+    for (cid_t cid = 0; cid < static_cast<cid_t>(NUM_UNIQUE_CIDS); ++cid) {
+        EXPECT_FALSE(cache_slot_->IsCached(cid));
+    }
+
+    auto op_ctx = std::make_unique<milvus::OpContext>();
+    auto accessor = cache_slot_->PinCellsDirect(op_ctx.get(), {target_uid});
+    ASSERT_NE(accessor, nullptr);
+
+    EXPECT_TRUE(cache_slot_->IsCached(expected_cid));
+    EXPECT_FALSE(cache_slot_->IsCached(0));
+
+    accessor.reset();
+    EXPECT_TRUE(cache_slot_->IsCached(expected_cid));
+
+    EXPECT_TRUE(cache_slot_->ManualEvict(expected_cid));
+    EXPECT_FALSE(cache_slot_->IsCached(expected_cid));
+    EXPECT_THROW(static_cast<void>(cache_slot_->IsCached(-1)), milvus::SegcoreError);
+    EXPECT_THROW(static_cast<void>(cache_slot_->IsCached(static_cast<cid_t>(NUM_UNIQUE_CIDS))), milvus::SegcoreError);
+}
+
 TEST_F(CacheSlotTest, PinSingleCellSuccess) {
     cl_uid_t target_uid = 30;
     cid_t expected_cid = 2;

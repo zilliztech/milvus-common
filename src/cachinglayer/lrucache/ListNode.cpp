@@ -96,6 +96,12 @@ ListNode::loaded_size() const {
     return loaded_size_;
 }
 
+bool
+ListNode::is_loaded_or_cached() const {
+    std::shared_lock<std::shared_mutex> lock(mtx_);
+    return state_ == State::LOADED || state_ == State::CACHED;
+}
+
 std::pair<bool, std::variant<ListNode::NodePin, folly::SemiFuture<ListNode::NodePin>>>
 ListNode::pin() {
     // must be called with lock acquired, and state must not be NOT_LOADED.
