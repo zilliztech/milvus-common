@@ -28,6 +28,14 @@ struct LoadingOverheadConfig {
     std::string group;
 };
 
+struct MetricAttribution {
+    // Optional stable shard/channel label for attributed cache-slot disk usage metrics.
+    // Keep this value bounded in cardinality, such as loaded shards/channels, not request/user IDs.
+    // The CacheSlot-owned metric handle removes the time series when the last slot for this label is gone.
+    // Empty means this translator is unattributed and no shard metric is emitted.
+    std::string shard;
+};
+
 struct Meta {
     // This storage type is currently used only by metrics to distinguish the slot type.
     // In actual resource reservation, we use the actual size of the cell to determine the type.
@@ -44,19 +52,18 @@ struct Meta {
     // loads happen. The real resource usage is bounded by loading_pool_size * cell_size.
     // If not set, no capping is applied (existing behavior).
     std::optional<LoadingOverheadConfig> loading_overhead;
-    // Optional shard identifier for per-shard cache disk usage metrics.
-    // Empty means this translator is not attributed to any shard.
-    std::string shard;
+    std::optional<MetricAttribution> metric_attribution;
     explicit Meta(StorageType storage_type, CellIdMappingMode cell_id_mapping_mode, CellDataType cell_data_type,
                   CacheWarmupPolicy cache_warmup_policy, bool support_eviction,
-                  std::optional<LoadingOverheadConfig> loading_overhead = std::nullopt, std::string shard = "")
+                  std::optional<LoadingOverheadConfig> loading_overhead = std::nullopt,
+                  std::optional<MetricAttribution> metric_attribution = std::nullopt)
         : storage_type(storage_type),
           cell_id_mapping_mode(cell_id_mapping_mode),
           cell_data_type(cell_data_type),
           cache_warmup_policy(cache_warmup_policy),
           support_eviction(support_eviction),
           loading_overhead(std::move(loading_overhead)),
-          shard(std::move(shard)) {
+          metric_attribution(std::move(metric_attribution)) {
     }
 };
 

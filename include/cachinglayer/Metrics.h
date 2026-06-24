@@ -1,5 +1,7 @@
 #pragma once
 
+#include <memory>
+#include <optional>
 #include <string>
 
 #include "cachinglayer/Utils.h"
@@ -268,8 +270,45 @@ DEFINE_METRIC_HELPER_WITH_DATA_TYPE_AND_LOCATION(prometheus::Gauge, cache_cell_l
 DEFINE_METRIC_HELPER_WITH_DATA_TYPE_AND_LOCATION(prometheus::Gauge, cache_loaded_bytes);
 DEFINE_METRIC_HELPER_WITH_DATA_TYPE_AND_LOCATION(prometheus::Gauge, cache_cell_loaded_count);
 
-prometheus::Gauge&
-cache_shard_disk_usage_bytes(CellDataType t, const std::string& shard);
+// RAII handle for one {data_type, shard} cache-slot disk usage series.
+// Destroying the last handle removes the dynamic Prometheus time series.
+class CacheShardDiskUsageMetricHandle {
+ public:
+    ~CacheShardDiskUsageMetricHandle();
+
+    CacheShardDiskUsageMetricHandle(const CacheShardDiskUsageMetricHandle&) = delete;
+    CacheShardDiskUsageMetricHandle&
+    operator=(const CacheShardDiskUsageMetricHandle&) = delete;
+    CacheShardDiskUsageMetricHandle(CacheShardDiskUsageMetricHandle&&) = delete;
+    CacheShardDiskUsageMetricHandle&
+    operator=(CacheShardDiskUsageMetricHandle&&) = delete;
+
+    void
+    Increment(double value);
+
+    void
+    Decrement(double value);
+
+    [[nodiscard]] double
+    Value() const;
+
+ private:
+    friend std::unique_ptr<CacheShardDiskUsageMetricHandle>
+    create_cache_shard_disk_usage_metric_handle(CellDataType type, const std::string& shard);
+
+    CacheShardDiskUsageMetricHandle(std::string data_type_label, std::string shard);
+
+    std::string data_type_label_;
+    std::string shard_;
+};
+
+// Returns nullptr for an empty shard, leaving the slot unattributed.
+std::unique_ptr<CacheShardDiskUsageMetricHandle>
+create_cache_shard_disk_usage_metric_handle(CellDataType type, const std::string& shard);
+
+// Returns nullopt without creating a series.
+std::optional<double>
+cache_shard_disk_usage_bytes_value(CellDataType type, const std::string& shard);
 
 DEFINE_METRIC_HELPER_WITH_DATA_TYPE_AND_LOCATION(prometheus::Counter, cache_access_event_total);
 // ignore cache_access_cells_total since we can parse it from the sum of cache_access_hit/miss_bytes_total

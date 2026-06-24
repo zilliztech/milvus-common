@@ -1,6 +1,10 @@
 #include "cachinglayer/Metrics.h"
 
+#include <map>
+#include <mutex>
+#include <optional>
 #include <string>
+#include <utility>
 
 namespace milvus::cachinglayer::monitor {
 
@@ -36,7 +40,8 @@ DEFINE_PROMETHEUS_GAUGE_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_cell_l
                                                            "[cpp]cache cell loading count");
 DEFINE_PROMETHEUS_GAUGE_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_cell_loaded_count,
                                                            "[cpp]cache cell loaded count");
-DEFINE_PROMETHEUS_GAUGE_FAMILY(internal_cache_shard_disk_usage_bytes, "[cpp]cache loaded disk usage bytes by shard");
+DEFINE_PROMETHEUS_GAUGE_FAMILY(internal_cache_shard_disk_usage_bytes,
+                               "[cpp]attributed cache-slot loaded disk usage bytes by shard");
 
 /* Metrics for Cache Cell Access */
 DEFINE_PROMETHEUS_COUNTER_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_access_event_total,
@@ -62,6 +67,16 @@ DEFINE_PROMETHEUS_HISTOGRAM_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_ce
 
 namespace {
 
+using ShardDiskUsageMetricKey = std::pair<std::string, std::string>;
+
+struct ShardDiskUsageMetricEntry {
+    prometheus::Gauge* gauge{nullptr};
+    size_t ref_count{0};
+};
+
+std::mutex shard_disk_usage_mutex;
+std::map<ShardDiskUsageMetricKey, ShardDiskUsageMetricEntry> shard_disk_usage_metrics;
+
 const char*
 CellDataTypeLabel(CellDataType type) {
     switch (type) {
@@ -76,14 +91,104 @@ CellDataTypeLabel(CellDataType type) {
         case CellDataType::OTHER:
             return "other";
     }
-    return "unknown";
+    ThrowInfo(ErrorCode::UnexpectedError, "Unknown CellDataType");
+}
+
+ShardDiskUsageMetricKey
+MakeShardDiskUsageMetricKey(CellDataType type, const std::string& shard) {
+    return {CellDataTypeLabel(type), shard};
+}
+
+std::map<std::string, std::string>
+MakeShardDiskUsageLabels(const ShardDiskUsageMetricKey& key) {
+    return {{"data_type", key.first}, {"shard", key.second}};
+}
+
+void
+ReleaseShardDiskUsageMetricHandle(const ShardDiskUsageMetricKey& key) {
+    std::lock_guard<std::mutex> lock(shard_disk_usage_mutex);
+    auto it = shard_disk_usage_metrics.find(key);
+    if (it == shard_disk_usage_metrics.end()) {
+        return;
+    }
+    if (--it->second.ref_count > 0) {
+        return;
+    }
+    internal_cache_shard_disk_usage_bytes_family.Remove(it->second.gauge);
+    shard_disk_usage_metrics.erase(it);
 }
 
 }  // namespace
 
-prometheus::Gauge&
-cache_shard_disk_usage_bytes(CellDataType type, const std::string& shard) {
-    return internal_cache_shard_disk_usage_bytes_family.Add({{"data_type", CellDataTypeLabel(type)}, {"shard", shard}});
+CacheShardDiskUsageMetricHandle::CacheShardDiskUsageMetricHandle(std::string data_type_label, std::string shard)
+    : data_type_label_(std::move(data_type_label)), shard_(std::move(shard)) {
+}
+
+CacheShardDiskUsageMetricHandle::~CacheShardDiskUsageMetricHandle() {
+    ReleaseShardDiskUsageMetricHandle({data_type_label_, shard_});
+}
+
+void
+CacheShardDiskUsageMetricHandle::Increment(double value) {
+    std::lock_guard<std::mutex> lock(shard_disk_usage_mutex);
+    auto it = shard_disk_usage_metrics.find({data_type_label_, shard_});
+    if (it != shard_disk_usage_metrics.end()) {
+        it->second.gauge->Increment(value);
+    }
+}
+
+void
+CacheShardDiskUsageMetricHandle::Decrement(double value) {
+    std::lock_guard<std::mutex> lock(shard_disk_usage_mutex);
+    auto it = shard_disk_usage_metrics.find({data_type_label_, shard_});
+    if (it != shard_disk_usage_metrics.end()) {
+        it->second.gauge->Decrement(value);
+    }
+}
+
+double
+CacheShardDiskUsageMetricHandle::Value() const {
+    std::lock_guard<std::mutex> lock(shard_disk_usage_mutex);
+    auto it = shard_disk_usage_metrics.find({data_type_label_, shard_});
+    if (it == shard_disk_usage_metrics.end()) {
+        return 0;
+    }
+    return it->second.gauge->Value();
+}
+
+std::unique_ptr<CacheShardDiskUsageMetricHandle>
+create_cache_shard_disk_usage_metric_handle(CellDataType type, const std::string& shard) {
+    auto key = MakeShardDiskUsageMetricKey(type, shard);
+    if (key.second.empty()) {
+        return nullptr;
+    }
+    auto handle =
+        std::unique_ptr<CacheShardDiskUsageMetricHandle>(new CacheShardDiskUsageMetricHandle(key.first, key.second));
+
+    std::lock_guard<std::mutex> lock(shard_disk_usage_mutex);
+    auto it = shard_disk_usage_metrics.find(key);
+    if (it != shard_disk_usage_metrics.end()) {
+        ++it->second.ref_count;
+        return handle;
+    }
+
+    auto& gauge = internal_cache_shard_disk_usage_bytes_family.Add(MakeShardDiskUsageLabels(key));
+    shard_disk_usage_metrics.emplace(std::move(key), ShardDiskUsageMetricEntry{&gauge, 1});
+    return handle;
+}
+
+std::optional<double>
+cache_shard_disk_usage_bytes_value(CellDataType type, const std::string& shard) {
+    auto key = MakeShardDiskUsageMetricKey(type, shard);
+    if (key.second.empty()) {
+        return std::nullopt;
+    }
+    std::lock_guard<std::mutex> lock(shard_disk_usage_mutex);
+    auto it = shard_disk_usage_metrics.find(key);
+    if (it == shard_disk_usage_metrics.end()) {
+        return std::nullopt;
+    }
+    return it->second.gauge->Value();
 }
 
 }  // namespace milvus::cachinglayer::monitor
