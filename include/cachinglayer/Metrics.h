@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string>
+
 #include "cachinglayer/Utils.h"
 #include "common/PrometheusClient.h"
 
@@ -240,6 +242,7 @@ DECLARE_PROMETHEUS_GAUGE_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_loade
 DECLARE_PROMETHEUS_GAUGE_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_loading_bytes);
 DECLARE_PROMETHEUS_GAUGE_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_cell_loading_count);
 DECLARE_PROMETHEUS_GAUGE_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_cell_loaded_count);
+DECLARE_PROMETHEUS_GAUGE_FAMILY(internal_cache_shard_disk_usage_bytes);
 
 /* Metrics for Cache Cell Access */
 DECLARE_PROMETHEUS_COUNTER_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_access_event_total);
@@ -264,6 +267,9 @@ DEFINE_METRIC_HELPER_WITH_DATA_TYPE_AND_LOCATION(prometheus::Gauge, cache_loadin
 DEFINE_METRIC_HELPER_WITH_DATA_TYPE_AND_LOCATION(prometheus::Gauge, cache_cell_loading_count);
 DEFINE_METRIC_HELPER_WITH_DATA_TYPE_AND_LOCATION(prometheus::Gauge, cache_loaded_bytes);
 DEFINE_METRIC_HELPER_WITH_DATA_TYPE_AND_LOCATION(prometheus::Gauge, cache_cell_loaded_count);
+
+prometheus::Gauge&
+cache_shard_disk_usage_bytes(CellDataType t, const std::string& shard);
 
 DEFINE_METRIC_HELPER_WITH_DATA_TYPE_AND_LOCATION(prometheus::Counter, cache_access_event_total);
 // ignore cache_access_cells_total since we can parse it from the sum of cache_access_hit/miss_bytes_total

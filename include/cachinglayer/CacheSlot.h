@@ -26,6 +26,7 @@
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <string>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -62,12 +63,16 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
           cell_id_mapping_mode_(translator_->meta()->cell_id_mapping_mode),
           cell_data_type_(translator_->meta()->cell_data_type),
           storage_type_(translator_->meta()->storage_type),
+          shard_(translator_->meta()->shard),
           dlist_(dlist),
           evictable_(evictable),
           self_reserve_(self_reserve),
           storage_usage_tracking_enabled_(storage_usage_tracking_enabled),
           loading_timeout_(loading_timeout),
           warmup_loading_timeout_(warmup_loading_timeout) {
+        if (!shard_.empty()) {
+            shard_disk_usage_gauge_ = &monitor::cache_shard_disk_usage_bytes(cell_data_type_, shard_);
+        }
         cells_.reserve(translator_->num_cells());
         for (cid_t i = 0; i < static_cast<cid_t>(translator_->num_cells()); ++i) {
             cells_.push_back(std::make_unique<CacheCell>(this, i));
@@ -636,6 +641,9 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                         .Increment(loaded_size_.memory_bytes);
                     monitor::cache_loaded_bytes(slot_->cell_data_type_, StorageType::DISK)
                         .Increment(loaded_size_.file_bytes);
+                    if (slot_->shard_disk_usage_gauge_ != nullptr && loaded_size_.file_bytes > 0) {
+                        slot_->shard_disk_usage_gauge_->Increment(loaded_size_.file_bytes);
+                    }
                     monitor::cache_cell_loaded_count(slot_->cell_data_type_, slot_->storage_type_).Increment();
                 },
                 requesting_thread);
@@ -672,6 +680,9 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                     .Decrement(loaded_size_.memory_bytes);
                 monitor::cache_loaded_bytes(slot_->cell_data_type_, StorageType::DISK)
                     .Decrement(loaded_size_.file_bytes);
+                if (slot_->shard_disk_usage_gauge_ != nullptr && loaded_size_.file_bytes > 0) {
+                    slot_->shard_disk_usage_gauge_->Decrement(loaded_size_.file_bytes);
+                }
                 LOG_TRACE("[MCL] CacheSlot Cell unloaded: key={}, size={}", key(), loaded_size_.ToString());
                 loaded_size_ = {0, 0};  // reset loaded_size_ to 0,0 to avoid double refund from dlist_
             }
@@ -699,6 +710,8 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     CellIdMappingMode cell_id_mapping_mode_;
     CellDataType cell_data_type_;
     StorageType storage_type_;
+    std::string shard_;
+    prometheus::Gauge* shard_disk_usage_gauge_{nullptr};
     internal::DList* dlist_;
     const bool evictable_;
     const bool self_reserve_;

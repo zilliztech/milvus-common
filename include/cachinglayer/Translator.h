@@ -13,6 +13,7 @@
 
 #include <memory>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -43,15 +44,19 @@ struct Meta {
     // loads happen. The real resource usage is bounded by loading_pool_size * cell_size.
     // If not set, no capping is applied (existing behavior).
     std::optional<LoadingOverheadConfig> loading_overhead;
+    // Optional shard identifier for per-shard cache disk usage metrics.
+    // Empty means this translator is not attributed to any shard.
+    std::string shard;
     explicit Meta(StorageType storage_type, CellIdMappingMode cell_id_mapping_mode, CellDataType cell_data_type,
                   CacheWarmupPolicy cache_warmup_policy, bool support_eviction,
-                  std::optional<LoadingOverheadConfig> loading_overhead = std::nullopt)
+                  std::optional<LoadingOverheadConfig> loading_overhead = std::nullopt, std::string shard = "")
         : storage_type(storage_type),
           cell_id_mapping_mode(cell_id_mapping_mode),
           cell_data_type(cell_data_type),
           cache_warmup_policy(cache_warmup_policy),
           support_eviction(support_eviction),
-          loading_overhead(std::move(loading_overhead)) {
+          loading_overhead(std::move(loading_overhead)),
+          shard(std::move(shard)) {
     }
 };
 
