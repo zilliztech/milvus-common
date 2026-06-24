@@ -312,6 +312,17 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         return evicted;
     }
 
+    // Returns true if the cell is already loaded in this slot.
+    // This is a read-only state check and does not trigger loading or update LRU order.
+    [[nodiscard]] bool
+    IsCached(cid_t cid) const {
+        if (cid < 0 || cid >= static_cast<cid_t>(cells_.size())) {
+            ThrowInfo(ErrorCode::OutOfRange, "cid {} out of range, slot has {} cells. key={}", cid, cells_.size(),
+                      translator_->key());
+        }
+        return cells_[cid]->is_loaded_or_cached();
+    }
+
     [[nodiscard]] size_t
     num_cells() const {
         return translator_->num_cells();

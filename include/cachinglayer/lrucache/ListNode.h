@@ -75,6 +75,9 @@ class ListNode {
     const ResourceUsage&
     loaded_size() const;
 
+    [[nodiscard]] bool
+    is_loaded_or_cached() const;
+
     // Manually evicts the cell if it is not pinned.
     // Returns true if the cell ends up in a state other than LOADED.
     bool
