@@ -292,7 +292,13 @@ namespace {
 
 std::optional<double>
 ScalarFieldShardDiskUsage(const std::string& shard) {
-    return monitor::cache_shard_disk_usage_bytes_value(CellDataType::SCALAR_FIELD, shard);
+    const auto stats = monitor::collect_cache_shard_disk_usage_stats();
+    for (const auto& stat : stats) {
+        if (stat.cell_data_type == CellDataType::SCALAR_FIELD && stat.shard == shard) {
+            return stat.disk_bytes;
+        }
+    }
+    return std::nullopt;
 }
 
 }  // namespace

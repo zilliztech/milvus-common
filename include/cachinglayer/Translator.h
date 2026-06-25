@@ -31,7 +31,7 @@ struct LoadingOverheadConfig {
 struct MetricAttribution {
     // Optional stable shard/channel label for attributed cache-slot disk usage metrics.
     // Keep this value bounded in cardinality, such as loaded shards/channels, not request/user IDs.
-    // The CacheSlot-owned metric handle removes the time series when the last slot for this label is gone.
+    // The shard disk usage collector removes the time series after the last slot for this label is gone.
     // Empty means this translator is unattributed and no shard metric is emitted.
     std::string shard;
 };
