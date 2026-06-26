@@ -26,6 +26,7 @@
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <string>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -68,6 +69,11 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
           storage_usage_tracking_enabled_(storage_usage_tracking_enabled),
           loading_timeout_(loading_timeout),
           warmup_loading_timeout_(warmup_loading_timeout) {
+        if (const auto& metric_attribution = translator_->meta()->metric_attribution;
+            metric_attribution && !metric_attribution->shard.empty()) {
+            shard_disk_usage_metric_ =
+                monitor::create_cache_shard_disk_usage_metric_handle(cell_data_type_, metric_attribution->shard);
+        }
         cells_.reserve(translator_->num_cells());
         for (cid_t i = 0; i < static_cast<cid_t>(translator_->num_cells()); ++i) {
             cells_.push_back(std::make_unique<CacheCell>(this, i));
@@ -636,6 +642,9 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                         .Increment(loaded_size_.memory_bytes);
                     monitor::cache_loaded_bytes(slot_->cell_data_type_, StorageType::DISK)
                         .Increment(loaded_size_.file_bytes);
+                    if (slot_->shard_disk_usage_metric_ != nullptr && loaded_size_.file_bytes > 0) {
+                        slot_->shard_disk_usage_metric_->Increment(loaded_size_.file_bytes);
+                    }
                     monitor::cache_cell_loaded_count(slot_->cell_data_type_, slot_->storage_type_).Increment();
                 },
                 requesting_thread);
@@ -672,6 +681,9 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                     .Decrement(loaded_size_.memory_bytes);
                 monitor::cache_loaded_bytes(slot_->cell_data_type_, StorageType::DISK)
                     .Decrement(loaded_size_.file_bytes);
+                if (slot_->shard_disk_usage_metric_ != nullptr && loaded_size_.file_bytes > 0) {
+                    slot_->shard_disk_usage_metric_->Decrement(loaded_size_.file_bytes);
+                }
                 LOG_TRACE("[MCL] CacheSlot Cell unloaded: key={}, size={}", key(), loaded_size_.ToString());
                 loaded_size_ = {0, 0};  // reset loaded_size_ to 0,0 to avoid double refund from dlist_
             }
@@ -691,6 +703,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     };
 
     const std::unique_ptr<Translator<CellT>> translator_;
+    std::unique_ptr<monitor::CacheShardDiskUsageMetricHandle> shard_disk_usage_metric_;
     folly::CancellationSource warmup_cancel_source_;
     // Each CacheCell's cid_t is its index in vector.
     // Using unique_ptr because CacheCell is non-movable (inherits from ListNode).

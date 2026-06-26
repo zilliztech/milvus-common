@@ -1,5 +1,10 @@
 #pragma once
 
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+
 #include "cachinglayer/Utils.h"
 #include "common/PrometheusClient.h"
 
@@ -240,6 +245,7 @@ DECLARE_PROMETHEUS_GAUGE_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_loade
 DECLARE_PROMETHEUS_GAUGE_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_loading_bytes);
 DECLARE_PROMETHEUS_GAUGE_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_cell_loading_count);
 DECLARE_PROMETHEUS_GAUGE_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_cell_loaded_count);
+DECLARE_PROMETHEUS_GAUGE_FAMILY(internal_cache_shard_disk_usage_bytes);
 
 /* Metrics for Cache Cell Access */
 DECLARE_PROMETHEUS_COUNTER_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_access_event_total);
@@ -264,6 +270,57 @@ DEFINE_METRIC_HELPER_WITH_DATA_TYPE_AND_LOCATION(prometheus::Gauge, cache_loadin
 DEFINE_METRIC_HELPER_WITH_DATA_TYPE_AND_LOCATION(prometheus::Gauge, cache_cell_loading_count);
 DEFINE_METRIC_HELPER_WITH_DATA_TYPE_AND_LOCATION(prometheus::Gauge, cache_loaded_bytes);
 DEFINE_METRIC_HELPER_WITH_DATA_TYPE_AND_LOCATION(prometheus::Gauge, cache_cell_loaded_count);
+
+struct CacheShardDiskUsageStats {
+    CellDataType cell_data_type;
+    std::string shard;
+    double disk_bytes;
+};
+
+class CacheShardDiskUsageMetricEntry;
+
+// RAII handle for one {data_type, shard} cache-slot disk usage series.
+// The collector removes the dynamic Prometheus time series after the last handle is gone.
+class CacheShardDiskUsageMetricHandle {
+ public:
+    ~CacheShardDiskUsageMetricHandle();
+
+    CacheShardDiskUsageMetricHandle(const CacheShardDiskUsageMetricHandle&) = delete;
+    CacheShardDiskUsageMetricHandle&
+    operator=(const CacheShardDiskUsageMetricHandle&) = delete;
+    CacheShardDiskUsageMetricHandle(CacheShardDiskUsageMetricHandle&&) = delete;
+    CacheShardDiskUsageMetricHandle&
+    operator=(CacheShardDiskUsageMetricHandle&&) = delete;
+
+    void
+    Increment(double value);
+
+    void
+    Decrement(double value);
+
+    [[nodiscard]] double
+    Value() const;
+
+ private:
+    friend std::unique_ptr<CacheShardDiskUsageMetricHandle>
+    create_cache_shard_disk_usage_metric_handle(CellDataType type, const std::string& shard);
+
+    explicit CacheShardDiskUsageMetricHandle(std::shared_ptr<CacheShardDiskUsageMetricEntry> entry);
+
+    std::shared_ptr<CacheShardDiskUsageMetricEntry> entry_;
+};
+
+// Returns nullptr for an empty shard, leaving the slot unattributed.
+std::unique_ptr<CacheShardDiskUsageMetricHandle>
+create_cache_shard_disk_usage_metric_handle(CellDataType type, const std::string& shard);
+
+// Returns live shard disk usage stats and lazily removes expired metric series.
+std::vector<CacheShardDiskUsageStats>
+collect_cache_shard_disk_usage_stats();
+
+// Returns nullopt without creating a series.
+std::optional<double>
+cache_shard_disk_usage_bytes_value(CellDataType type, const std::string& shard);
 
 DEFINE_METRIC_HELPER_WITH_DATA_TYPE_AND_LOCATION(prometheus::Counter, cache_access_event_total);
 // ignore cache_access_cells_total since we can parse it from the sum of cache_access_hit/miss_bytes_total

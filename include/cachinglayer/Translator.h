@@ -13,6 +13,7 @@
 
 #include <memory>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -25,6 +26,14 @@ namespace milvus::cachinglayer {
 struct LoadingOverheadConfig {
     ResourceUsage upper_bound;
     std::string group;
+};
+
+struct MetricAttribution {
+    // Optional stable shard/channel label for attributed cache-slot disk usage metrics.
+    // Keep this value bounded in cardinality, such as loaded shards/channels, not request/user IDs.
+    // The shard disk usage collector removes the time series after the last slot for this label is gone.
+    // Empty means this translator is unattributed and no shard metric is emitted.
+    std::string shard;
 };
 
 struct Meta {
@@ -43,15 +52,18 @@ struct Meta {
     // loads happen. The real resource usage is bounded by loading_pool_size * cell_size.
     // If not set, no capping is applied (existing behavior).
     std::optional<LoadingOverheadConfig> loading_overhead;
+    std::optional<MetricAttribution> metric_attribution;
     explicit Meta(StorageType storage_type, CellIdMappingMode cell_id_mapping_mode, CellDataType cell_data_type,
                   CacheWarmupPolicy cache_warmup_policy, bool support_eviction,
-                  std::optional<LoadingOverheadConfig> loading_overhead = std::nullopt)
+                  std::optional<LoadingOverheadConfig> loading_overhead = std::nullopt,
+                  std::optional<MetricAttribution> metric_attribution = std::nullopt)
         : storage_type(storage_type),
           cell_id_mapping_mode(cell_id_mapping_mode),
           cell_data_type(cell_data_type),
           cache_warmup_policy(cache_warmup_policy),
           support_eviction(support_eviction),
-          loading_overhead(std::move(loading_overhead)) {
+          loading_overhead(std::move(loading_overhead)),
+          metric_attribution(std::move(metric_attribution)) {
     }
 };
 

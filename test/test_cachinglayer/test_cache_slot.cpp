@@ -9,6 +9,7 @@
 #include <functional>
 #include <future>
 #include <memory>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <thread>
@@ -18,6 +19,7 @@
 #include <vector>
 
 #include "cachinglayer/CacheSlot.h"
+#include "cachinglayer/Metrics.h"
 #include "cachinglayer/Translator.h"
 #include "cachinglayer/Utils.h"
 #include "cachinglayer/lrucache/DList.h"
@@ -226,6 +228,81 @@ class MockTranslator : public Translator<TestCell> {
     bool for_concurrent_test_ = false;
 };
 
+class DiskShardTranslator : public Translator<TestCell> {
+ public:
+    DiskShardTranslator(std::string key, std::string shard, std::vector<ResourceUsage> cell_sizes)
+        : key_(std::move(key)),
+          cell_sizes_(std::move(cell_sizes)),
+          meta_(StorageType::DISK, CellIdMappingMode::IDENTICAL, CellDataType::SCALAR_FIELD,
+                CacheWarmupPolicy::CacheWarmupPolicy_Disable, true, std::nullopt,
+                MetricAttribution{.shard = std::move(shard)}) {
+    }
+
+    size_t
+    num_cells() const override {
+        return cell_sizes_.size();
+    }
+
+    cid_t
+    cell_id_of(cl_uid_t uid) const override {
+        return uid;
+    }
+
+    std::pair<ResourceUsage, ResourceUsage>
+    estimated_byte_size_of_cell(cid_t cid) const override {
+        return {cell_sizes_.at(cid), {}};
+    }
+
+    int64_t
+    cells_storage_bytes(const std::vector<cid_t>& cids) const override {
+        int64_t total_bytes = 0;
+        for (const auto& cid : cids) {
+            total_bytes += cell_sizes_.at(cid).file_bytes;
+        }
+        return total_bytes;
+    }
+
+    const std::string&
+    key() const override {
+        return key_;
+    }
+
+    Meta*
+    meta() override {
+        return &meta_;
+    }
+
+    std::vector<std::pair<cid_t, std::unique_ptr<TestCell>>>
+    get_cells(milvus::OpContext*, const std::vector<cid_t>& cids) override {
+        std::vector<std::pair<cid_t, std::unique_ptr<TestCell>>> result;
+        result.reserve(cids.size());
+        for (const auto& cid : cids) {
+            result.emplace_back(cid, std::make_unique<TestCell>(static_cast<int>(cid), cid, cell_sizes_.at(cid)));
+        }
+        return result;
+    }
+
+ private:
+    std::string key_;
+    std::vector<ResourceUsage> cell_sizes_;
+    Meta meta_;
+};
+
+namespace {
+
+std::optional<double>
+ScalarFieldShardDiskUsage(const std::string& shard) {
+    const auto stats = monitor::collect_cache_shard_disk_usage_stats();
+    for (const auto& stat : stats) {
+        if (stat.cell_data_type == CellDataType::SCALAR_FIELD && stat.shard == shard) {
+            return stat.disk_bytes;
+        }
+    }
+    return std::nullopt;
+}
+
+}  // namespace
+
 class CacheSlotTest : public ::testing::Test {
  protected:
     std::shared_ptr<DList> dlist_;
@@ -352,6 +429,99 @@ TEST_F(CacheSlotTest, PinMultipleCellsSuccess) {
         EXPECT_EQ(cell->cid, cid);
         EXPECT_EQ(cell->data, cid * 10);
     }
+}
+
+TEST(CacheSlotShardDiskUsageTest, RecordsLoadedDiskBytesByShard) {
+    constexpr auto kShard = "cache-slot-shard-disk-usage-test";
+    auto before = ScalarFieldShardDiskUsage(kShard).value_or(0);
+
+    auto limit = ResourceUsage{0, 1024};
+    auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
+    auto translator = std::make_unique<DiskShardTranslator>("cache_slot_shard_disk_usage", kShard,
+                                                            std::vector<ResourceUsage>{{0, 128}, {0, 256}});
+    auto cache_slot =
+        std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                              std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
+
+    {
+        auto op_ctx = std::make_unique<milvus::OpContext>();
+        auto accessor = cache_slot->PinCellsDirect(op_ctx.get(), {0, 1});
+        ASSERT_NE(accessor, nullptr);
+        ASSERT_NE(accessor->get_ith_cell(0), nullptr);
+        ASSERT_NE(accessor->get_ith_cell(1), nullptr);
+        EXPECT_EQ(ScalarFieldShardDiskUsage(kShard), before + 384);
+    }
+
+    ASSERT_TRUE(cache_slot->ManualEvictAll());
+    EXPECT_EQ(ScalarFieldShardDiskUsage(kShard), before);
+}
+
+TEST(CacheSlotShardDiskUsageTest, RemovingOneOfTwoSlotsKeepsSharedShardUsage) {
+    constexpr auto kShard = "cache-slot-shard-disk-usage-shared-test";
+    EXPECT_EQ(ScalarFieldShardDiskUsage(kShard), std::nullopt);
+
+    auto limit = ResourceUsage{0, 1024};
+    auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
+    auto translator1 = std::make_unique<DiskShardTranslator>("cache_slot_shard_disk_usage_shared_1", kShard,
+                                                             std::vector<ResourceUsage>{{0, 128}});
+    auto translator2 = std::make_unique<DiskShardTranslator>("cache_slot_shard_disk_usage_shared_2", kShard,
+                                                             std::vector<ResourceUsage>{{0, 256}});
+    auto cache_slot1 =
+        std::make_shared<CacheSlot<TestCell>>(std::move(translator1), dlist.get(), true, true, true,
+                                              std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
+    auto cache_slot2 =
+        std::make_shared<CacheSlot<TestCell>>(std::move(translator2), dlist.get(), true, true, true,
+                                              std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
+
+    {
+        auto op_ctx = std::make_unique<milvus::OpContext>();
+        auto accessor1 = cache_slot1->PinCellsDirect(op_ctx.get(), {0});
+        auto accessor2 = cache_slot2->PinCellsDirect(op_ctx.get(), {0});
+        ASSERT_NE(accessor1, nullptr);
+        ASSERT_NE(accessor2, nullptr);
+        ASSERT_NE(accessor1->get_ith_cell(0), nullptr);
+        ASSERT_NE(accessor2->get_ith_cell(0), nullptr);
+        EXPECT_EQ(ScalarFieldShardDiskUsage(kShard), 384);
+    }
+
+    cache_slot1.reset();
+    EXPECT_EQ(ScalarFieldShardDiskUsage(kShard), 256);
+
+    cache_slot2.reset();
+    EXPECT_EQ(ScalarFieldShardDiskUsage(kShard), std::nullopt);
+}
+
+TEST(CacheSlotShardDiskUsageTest, DestroyingLoadedSlotRefundsAndRemovesShardUsage) {
+    constexpr auto kShard = "cache-slot-shard-disk-usage-destroy-test";
+    EXPECT_EQ(ScalarFieldShardDiskUsage(kShard), std::nullopt);
+
+    auto limit = ResourceUsage{0, 1024};
+    auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
+    auto translator = std::make_unique<DiskShardTranslator>("cache_slot_shard_disk_usage_destroy", kShard,
+                                                            std::vector<ResourceUsage>{{0, 512}});
+    auto cache_slot =
+        std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                              std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
+
+    {
+        auto op_ctx = std::make_unique<milvus::OpContext>();
+        auto accessor = cache_slot->PinCellsDirect(op_ctx.get(), {0});
+        ASSERT_NE(accessor, nullptr);
+        ASSERT_NE(accessor->get_ith_cell(0), nullptr);
+        EXPECT_EQ(ScalarFieldShardDiskUsage(kShard), 512);
+    }
+
+    cache_slot.reset();
+    EXPECT_EQ(ScalarFieldShardDiskUsage(kShard), std::nullopt);
+}
+
+TEST(CacheSlotShardDiskUsageTest, RejectsUnknownCellDataType) {
+    EXPECT_THROW(
+        {
+            static_cast<void>(monitor::create_cache_shard_disk_usage_metric_handle(
+                static_cast<CellDataType>(-1), "cache-slot-shard-disk-usage-unknown-type-test"));
+        },
+        milvus::SegcoreError);
 }
 
 TEST_F(CacheSlotTest, PinMultipleUidsMappingToSameCid) {
