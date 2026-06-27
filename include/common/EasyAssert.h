@@ -72,7 +72,10 @@ enum ErrorCode {
     InvalidParameter = 2042,
     InsufficientResource = 2043,
 
-    KnowhereError = 2099
+    KnowhereError = 2099,
+
+    // milvus-storage related error code
+    StorageError = 2200,
 };
 
 namespace impl {
