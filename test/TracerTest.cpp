@@ -511,3 +511,52 @@ TEST(Tracer, NoopSpanMethodsAreSafe) {
 
     span->End();
 }
+
+TEST(Tracer, OpContextTraceSpanAccessors) {
+    ASSERT_EQ(OpContext::GetTraceSpan(nullptr), nullptr);
+
+    OpContext op_context;
+    ASSERT_EQ(op_context.GetTraceSpan(), nullptr);
+
+    auto config = std::make_shared<TraceConfig>();
+    config->exporter = "stdout";
+    config->nodeID = 1;
+    initTelemetry(*config);
+
+    auto parent = StartSpan("parent");
+    {
+        auto trace_span = NestedSpanGuard(op_context.trace_span, parent);
+        ASSERT_EQ(op_context.GetTraceSpan(), parent);
+
+        auto child = ScopedSpan("child", op_context.GetTraceSpan());
+        ASSERT_NE(child.Get(), nullptr);
+        ASSERT_TRUE(child.Get()->IsRecording());
+        ASSERT_EQ(child.Get()->GetContext().trace_id(), parent->GetContext().trace_id());
+    }
+    ASSERT_EQ(op_context.GetTraceSpan(), nullptr);
+}
+
+TEST(Tracer, NestedSpanGuardRestoresPreviousSpan) {
+    auto config = std::make_shared<TraceConfig>();
+    config->exporter = "stdout";
+    config->nodeID = 1;
+    initTelemetry(*config);
+
+    OpContext op_context;
+    auto first = StartSpan("first");
+    auto second = StartSpan("second");
+    op_context.trace_span = first;
+
+    {
+        auto trace_span = NestedSpanGuard(op_context.trace_span, second);
+        ASSERT_EQ(op_context.GetTraceSpan(), second);
+    }
+    ASSERT_EQ(op_context.GetTraceSpan(), first);
+
+    SpanPtr local_span = first;
+    {
+        auto trace_span = NestedSpanGuard(local_span, second);
+        ASSERT_EQ(local_span, second);
+    }
+    ASSERT_EQ(local_span, first);
+}

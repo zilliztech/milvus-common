@@ -14,6 +14,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <optional>
 
 #include "common/Tracer.h"
@@ -63,6 +64,19 @@ struct OpContext {
             return std::nullopt;
         }
         return trace_context->AsTraceContext();
+    }
+
+    // Current trace span propagated across Milvus/Knowhere/Cardinal boundaries.
+    std::shared_ptr<tracer::trace::Span> trace_span = nullptr;
+
+    [[nodiscard]] std::shared_ptr<tracer::trace::Span>
+    GetTraceSpan() const {
+        return trace_span;
+    }
+
+    [[nodiscard]] static std::shared_ptr<tracer::trace::Span>
+    GetTraceSpan(const OpContext* op_context) {
+        return op_context != nullptr ? op_context->GetTraceSpan() : nullptr;
     }
 
     OpContext() = default;
