@@ -219,21 +219,9 @@ class NestedSpanGuard {
     NestedSpanGuard(SpanPtr& span_slot, const SpanPtr& current) : NestedSpanGuard(&span_slot, current) {
     }
 
-    NestedSpanGuard(NestedSpanGuard&& other) noexcept
-        : span_slot_(other.span_slot_), previous_(std::move(other.previous_)) {
-        other.span_slot_ = nullptr;
-    }
-
+    NestedSpanGuard(NestedSpanGuard&&) = delete;
     NestedSpanGuard&
-    operator=(NestedSpanGuard&& other) noexcept {
-        if (this != &other) {
-            Restore();
-            span_slot_ = other.span_slot_;
-            previous_ = std::move(other.previous_);
-            other.span_slot_ = nullptr;
-        }
-        return *this;
-    }
+    operator=(NestedSpanGuard&&) = delete;
 
     NestedSpanGuard(const NestedSpanGuard&) = delete;
     NestedSpanGuard&
