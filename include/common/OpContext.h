@@ -66,7 +66,9 @@ struct OpContext {
         return trace_context->AsTraceContext();
     }
 
-    // Current trace span propagated across Milvus/Knowhere/Cardinal boundaries.
+    // Trace parent propagated across Milvus/Knowhere/Cardinal boundaries.
+    // This slot is a single-threaded parent handoff point, not a concurrent current-span stack.
+    // Code that enters parallel work must copy the parent into per-worker state before nesting spans.
     std::shared_ptr<tracer::trace::Span> trace_span = nullptr;
 
     [[nodiscard]] std::shared_ptr<tracer::trace::Span>
