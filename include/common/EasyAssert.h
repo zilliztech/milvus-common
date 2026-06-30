@@ -71,8 +71,16 @@ enum ErrorCode {
     TextIndexNotFound = 2041,
     InvalidParameter = 2042,
     InsufficientResource = 2043,
-    // milvus-storage related error code
+    // milvus-storage related error codes. These two are a *pair* of generic
+    // storage fallbacks, each carrying exactly one retry verdict, and must never
+    // be conflated:
+    //   StorageError          (2044) -> permanent / non-retriable fallback.
+    //   StorageTransientError (2045) -> retriable storage transient fallback
+    //       (object-storage IO / throttling / timeout etc). A transient storage
+    //       failure must map here, NOT to StorageError, otherwise a retriable
+    //       IO error becomes non-retriable and regresses availability.
     StorageError = 2044,
+    StorageTransientError = 2045,
 
     KnowhereError = 2099,
 };
