@@ -71,8 +71,10 @@ enum ErrorCode {
     TextIndexNotFound = 2041,
     InvalidParameter = 2042,
     InsufficientResource = 2043,
+    // milvus-storage related error code
+    StorageError = 2044,
 
-    KnowhereError = 2099
+    KnowhereError = 2099,
 };
 
 namespace impl {
