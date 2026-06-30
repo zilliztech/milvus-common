@@ -21,10 +21,12 @@
 #include "opentelemetry/trace/span_id.h"
 #include "opentelemetry/trace/trace_id.h"
 
-namespace opentelemetry::trace {
+OPENTELEMETRY_BEGIN_NAMESPACE
+namespace trace {
 class Span;
 class Tracer;
-}  // namespace opentelemetry::trace
+}  // namespace trace
+OPENTELEMETRY_END_NAMESPACE
 
 #define TRACE_SERVICE_SEGCORE "segcore"
 

@@ -57,6 +57,12 @@ TEST(Tracer, Span) {
     delete[] ctx->spanID;
 }
 
+TEST(Tracer, AutoSpanParentConstructorUsesHeaderDeclaredSpanType) {
+    std::shared_ptr<milvus::tracer::trace::Span> parent;
+    AutoSpan span("header_abi_parent", parent, false);
+    ASSERT_NE(span.GetSpan(), nullptr);
+}
+
 TEST(Tracer, OwnedTraceSnapshotCopiesBytes) {
     uint8_t trace_id[16]{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
                          0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10};
