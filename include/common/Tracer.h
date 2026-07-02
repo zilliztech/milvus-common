@@ -114,7 +114,13 @@ std::shared_ptr<trace::Span>
 StartSpan(const std::string& name, TraceContext* ctx = nullptr);
 
 std::shared_ptr<trace::Span>
+StartSpan(const char* name, TraceContext* ctx = nullptr);
+
+std::shared_ptr<trace::Span>
 StartSpan(const std::string& name, const std::shared_ptr<trace::Span>& span);
+
+std::shared_ptr<trace::Span>
+StartSpan(const char* name, const std::shared_ptr<trace::Span>& span);
 
 void
 SetRootSpan(std::shared_ptr<trace::Span> span);
@@ -163,6 +169,12 @@ class ScopedSpan {
         }
     }
 
+    ScopedSpan(const char* name, const SpanPtr& parent) {
+        if (parent != nullptr && IsTraceEnabled()) {
+            span_ = StartSpan(name, parent);
+        }
+    }
+
     ScopedSpan(const ScopedSpan&) = delete;
     ScopedSpan&
     operator=(const ScopedSpan&) = delete;
@@ -190,6 +202,11 @@ class ScopedSpan {
 
     ScopedSpan
     StartChild(const std::string& name) const {
+        return ScopedSpan(name, span_);
+    }
+
+    ScopedSpan
+    StartChild(const char* name) const {
         return ScopedSpan(name, span_);
     }
 
