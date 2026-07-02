@@ -167,6 +167,23 @@ StartSpan(const std::string& name, TraceContext* parentCtx) {
 }
 
 std::shared_ptr<trace::Span>
+StartSpan(const char* name, TraceContext* parentCtx) {
+    if (!IsTraceEnabled()) {
+        return noop_span;
+    }
+    trace::StartSpanOptions opts;
+    if (parentCtx != nullptr && parentCtx->traceID != nullptr && parentCtx->spanID != nullptr) {
+        if (EmptyTraceID(parentCtx) || EmptySpanID(parentCtx)) {
+            return noop_trace_provider->GetTracer("noop")->StartSpan("noop");
+        }
+        opts.parent = trace::SpanContext(trace::TraceId({parentCtx->traceID, trace::TraceId::kSize}),
+                                         trace::SpanId({parentCtx->spanID, trace::SpanId::kSize}),
+                                         trace::TraceFlags(parentCtx->traceFlags), true);
+    }
+    return GetTracer()->StartSpan(nostd::string_view{name}, opts);
+}
+
+std::shared_ptr<trace::Span>
 StartSpan(const std::string& name, const std::shared_ptr<trace::Span>& span) {
     if (!IsTraceEnabled()) {
         return noop_span;
@@ -176,6 +193,18 @@ StartSpan(const std::string& name, const std::shared_ptr<trace::Span>& span) {
         opts.parent = span->GetContext();
     }
     return GetTracer()->StartSpan(name, opts);
+}
+
+std::shared_ptr<trace::Span>
+StartSpan(const char* name, const std::shared_ptr<trace::Span>& span) {
+    if (!IsTraceEnabled()) {
+        return noop_span;
+    }
+    trace::StartSpanOptions opts;
+    if (span != nullptr) {
+        opts.parent = span->GetContext();
+    }
+    return GetTracer()->StartSpan(nostd::string_view{name}, opts);
 }
 
 thread_local std::shared_ptr<trace::Span> local_span;
