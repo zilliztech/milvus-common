@@ -50,6 +50,16 @@ struct OpContext {
     // independent of segcore's FieldId type.
     std::vector<int64_t> coload_fields;
 
+    // Pinned read snapshot for the segment this operation runs on. Set once by
+    // the segment at operation entry (see milvus segcore: sealed-segment
+    // per-operation snapshot pinning); readers cast it back via
+    // std::static_pointer_cast. Type-erased so common/ stays independent of
+    // segcore types. `pinned_state_owner` identifies the segment that set the
+    // pin: a reader must ignore the pin unless the owner matches itself, which
+    // guards against an OpContext being reused across segments.
+    std::shared_ptr<const void> pinned_segment_state;
+    const void* pinned_state_owner = nullptr;
+
     std::optional<tracer::OwnedTraceContext> trace_context;
 
     void
