@@ -30,7 +30,8 @@ namespace milvus::cachinglayer {
 //
 // The total loading overhead reserved from DList for each configured dimension is capped:
 //   DList dimension reservation = min(sum_of_overhead, dimension_UB)
-// An unconfigured dimension passes through unchanged.
+// An unconfigured dimension passes through unchanged. INT64_MAX is an explicit
+// unlimited upper bound; re-registering a group can only increase its upper bound.
 //
 // Each Reserve/Release call returns the incremental delta to apply to DList.
 // The tracker directly tracks `overhead_reserved` (actual amount of overhead currently
@@ -157,11 +158,7 @@ class LoadingOverheadTracker {
         if (it != name_to_handle.end()) {
             auto& state = dimension_group_state_[it->second];
             state.ref_count++;
-            if (state.upper_bound == std::numeric_limits<int64_t>::max()) {
-                state.upper_bound = config.upper_bound;
-                LOG_INFO("[MCL] LoadingOverheadTracker set {} UB for group '{}' (handle {}, refs={}): {}", dimension,
-                         config.group, it->second, state.ref_count, config.upper_bound);
-            } else if (state.upper_bound < config.upper_bound) {
+            if (state.upper_bound < config.upper_bound) {
                 LOG_WARN(
                     "[MCL] LoadingOverheadTracker {} UB mismatch for group '{}' (handle {}): existing={}, new={}. "
                     "Taking max.",
