@@ -14,6 +14,9 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <utility>
+
+#include "cachinglayer/Utils.h"
 
 namespace milvus::cachinglayer {
 
@@ -25,6 +28,19 @@ struct LoadingOverheadDimensionConfig {
 // A missing dimension is not group-capped. Its loading overhead passes through
 // unchanged and is still checked against the DList resource limit.
 struct LoadingOverheadConfig {
+    LoadingOverheadConfig() = default;
+
+    LoadingOverheadConfig(std::optional<LoadingOverheadDimensionConfig> memory,
+                          std::optional<LoadingOverheadDimensionConfig> file)
+        : memory(std::move(memory)), file(std::move(file)) {
+    }
+
+    // Compatibility entry point for callers using the original shared-group config.
+    LoadingOverheadConfig(const ResourceUsage& upper_bound, std::string group)
+        : memory(LoadingOverheadDimensionConfig{upper_bound.memory_bytes, group}),
+          file(LoadingOverheadDimensionConfig{upper_bound.file_bytes, std::move(group)}) {
+    }
+
     std::optional<LoadingOverheadDimensionConfig> memory;
     std::optional<LoadingOverheadDimensionConfig> file;
 };

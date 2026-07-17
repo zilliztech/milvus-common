@@ -306,6 +306,21 @@ TEST_F(LoadingOverheadTrackerTest, GetUpperBound) {
     EXPECT_EQ(ub.file_bytes, 100);
 }
 
+TEST_F(LoadingOverheadTrackerTest, LegacyConfigConstructorConfiguresBothDimensions) {
+    ResourceUsage upper_bound{200, 50};
+    LoadingOverheadConfig config(upper_bound, "legacy_group");
+
+    ASSERT_TRUE(config.memory.has_value());
+    EXPECT_EQ(config.memory->upper_bound, 200);
+    EXPECT_EQ(config.memory->group, "legacy_group");
+    ASSERT_TRUE(config.file.has_value());
+    EXPECT_EQ(config.file->upper_bound, 50);
+    EXPECT_EQ(config.file->group, "legacy_group");
+
+    auto handle = tracker_.Register(config);
+    EXPECT_EQ(tracker_.GetUpperBound(handle), upper_bound);
+}
+
 TEST_F(LoadingOverheadTrackerTest, DimensionsShareMemoryWhileScalarFilePassesThrough) {
     auto scalar_handle =
         tracker_.Register(LoadingOverheadConfig{LoadingOverheadDimensionConfig{200, "load_transient"}, std::nullopt});
