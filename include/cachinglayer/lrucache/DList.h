@@ -76,6 +76,14 @@ class DList : public std::enable_shared_from_this<DList> {
     }
 
     uint64_t
+    RegisterLoadingOverhead(const LoadingOverheadConfig& config) {
+        if (loading_overhead_tracker_) {
+            return loading_overhead_tracker_->Register(config);
+        }
+        return LoadingOverheadTracker::kInvalidHandle;
+    }
+
+    uint64_t
     RegisterLoadingOverhead(const std::string& group, const ResourceUsage& upper_bound) {
         if (loading_overhead_tracker_) {
             return loading_overhead_tracker_->Register(group, upper_bound);

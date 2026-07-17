@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "cachinglayer/CacheSlot.h"
+#include "cachinglayer/LoadingOverhead.h"
 #include "cachinglayer/Metrics.h"
 #include "cachinglayer/Translator.h"
 #include "cachinglayer/Utils.h"
@@ -88,9 +89,9 @@ class MockTranslator : public Translator<TestCell> {
     estimated_byte_size_of_cell(cid_t cid) const override {
         auto it = cell_sizes_.find(cid);
         if (it != cell_sizes_.end()) {
-            return {{it->second, 0}, {loading_overhead_bytes_, 0}};
+            return {{it->second, 0}, loading_overhead_};
         }
-        return {{1, 0}, {loading_overhead_bytes_, 0}};
+        return {{1, 0}, loading_overhead_};
     }
 
     int64_t
@@ -184,12 +185,17 @@ class MockTranslator : public Translator<TestCell> {
         extra_cids_ = extra_cids;
     }
     void
-    SetLoadingOverheadBytes(int64_t bytes) {
-        loading_overhead_bytes_ = bytes;
+    SetLoadingOverhead(ResourceUsage loading_overhead) {
+        loading_overhead_ = loading_overhead;
     }
     void
     SetLoadingOverheadConfig(const std::string& group, const ResourceUsage& upper_bound) {
-        meta_.loading_overhead = LoadingOverheadConfig{upper_bound, group};
+        meta_.loading_overhead = LoadingOverheadConfig{LoadingOverheadDimensionConfig{upper_bound.memory_bytes, group},
+                                                       LoadingOverheadDimensionConfig{upper_bound.file_bytes, group}};
+    }
+    void
+    SetLoadingOverheadConfig(LoadingOverheadConfig config) {
+        meta_.loading_overhead = std::move(config);
     }
     int
     GetCellsCallCount() const {
@@ -222,7 +228,7 @@ class MockTranslator : public Translator<TestCell> {
     std::unordered_map<cid_t, std::vector<cid_t>> extra_cids_;
     std::atomic<int> get_cells_call_count_ = 0;
     std::vector<std::vector<cid_t>> requested_cids_;
-    int64_t loading_overhead_bytes_ = 0;
+    ResourceUsage loading_overhead_{};
 
     // this class is not concurrent safe, so if for concurrent test, do not track usage
     bool for_concurrent_test_ = false;
@@ -2157,7 +2163,7 @@ TEST(CacheSlotTrackerTest, LoadingOverheadTrackerIntegration) {
     auto translator = std::make_unique<MockTranslator>(
         std::vector<std::pair<cid_t, int64_t>>{{0, cell_loaded_size}, {1, cell_loaded_size}},
         std::unordered_map<cl_uid_t, cid_t>{{0, 0}, {1, 1}}, "test_tracker_integration", StorageType::MEMORY);
-    translator->SetLoadingOverheadBytes(cell_loading_overhead);
+    translator->SetLoadingOverhead({cell_loading_overhead, 0});
     translator->SetLoadingOverheadConfig("test_group", {500, 0});
     auto* translator_ptr = translator.get();
 
@@ -2180,6 +2186,46 @@ TEST(CacheSlotTrackerTest, LoadingOverheadTrackerIntegration) {
     EXPECT_EQ(translator_ptr->GetCellsCallCount(), 2);
 }
 
+TEST(CacheSlotTrackerTest, PassthroughFileOverheadParticipatesInAdmission) {
+    ResourceUsage limit{110, 200};
+    auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
+    dlist->SetLoadingOverheadTracker(std::make_shared<LoadingOverheadTracker>());
+
+    auto translator = std::make_unique<MockTranslator>(std::vector<std::pair<cid_t, int64_t>>{{0, 10}},
+                                                       std::unordered_map<cl_uid_t, cid_t>{{0, 0}},
+                                                       "test_dimension_admission", StorageType::MEMORY);
+    translator->SetLoadingOverhead({200, 200});
+    translator->SetLoadingOverheadConfig(
+        LoadingOverheadConfig{LoadingOverheadDimensionConfig{100, "load_transient"}, std::nullopt});
+
+    auto cache_slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, false,
+                                                            std::chrono::milliseconds(0), std::chrono::milliseconds(0));
+    auto op_ctx = std::make_unique<milvus::OpContext>();
+
+    EXPECT_NO_THROW(cache_slot->PinCellsDirect(op_ctx.get(), {0}));
+}
+
+TEST(CacheSlotTrackerTest, InsufficientDiskRejectsPassthroughFileOverhead) {
+    ResourceUsage limit{1000, 199};
+    auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
+    dlist->SetLoadingOverheadTracker(std::make_shared<LoadingOverheadTracker>());
+
+    auto translator = std::make_unique<MockTranslator>(std::vector<std::pair<cid_t, int64_t>>{{0, 10}},
+                                                       std::unordered_map<cl_uid_t, cid_t>{{0, 0}},
+                                                       "test_dimension_disk_reject", StorageType::MEMORY);
+    translator->SetLoadingOverhead({200, 200});
+    translator->SetLoadingOverheadConfig(
+        LoadingOverheadConfig{LoadingOverheadDimensionConfig{100, "load_transient"}, std::nullopt});
+    auto* translator_ptr = translator.get();
+
+    auto cache_slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, false,
+                                                            std::chrono::milliseconds(0), std::chrono::milliseconds(0));
+    auto op_ctx = std::make_unique<milvus::OpContext>();
+
+    EXPECT_ANY_THROW(cache_slot->PinCellsDirect(op_ctx.get(), {0}));
+    EXPECT_EQ(translator_ptr->GetCellsCallCount(), 0);
+}
+
 // Test that tracker state is properly cleaned up when load throws an exception.
 TEST(CacheSlotTrackerTest, LoadingOverheadTrackerCleanupOnException) {
     ResourceUsage limit{10000, 0};
@@ -2194,7 +2240,7 @@ TEST(CacheSlotTrackerTest, LoadingOverheadTrackerCleanupOnException) {
     auto translator = std::make_unique<MockTranslator>(std::vector<std::pair<cid_t, int64_t>>{{0, cell_loaded_size}},
                                                        std::unordered_map<cl_uid_t, cid_t>{{0, 0}},
                                                        "test_tracker_exception", StorageType::MEMORY);
-    translator->SetLoadingOverheadBytes(cell_loading_overhead);
+    translator->SetLoadingOverhead({cell_loading_overhead, 0});
     translator->SetLoadingOverheadConfig("test_group", {500, 0});
     translator->SetShouldThrow(true);
 
@@ -2238,7 +2284,7 @@ TEST(CacheSlotTrackerTest, BonusCellsRetryWithTracker) {
     auto translator = std::make_unique<MockTranslator>(
         std::vector<std::pair<cid_t, int64_t>>{{0, cell_loaded_size}, {1, cell_loaded_size}, {2, cell_loaded_size}},
         std::unordered_map<cl_uid_t, cid_t>{{0, 0}, {1, 1}, {2, 2}}, "test_bonus_retry", StorageType::MEMORY);
-    translator->SetLoadingOverheadBytes(cell_loading_overhead);
+    translator->SetLoadingOverhead({cell_loading_overhead, 0});
     translator->SetLoadingOverheadConfig("test_bonus_retry", {100, 0});
     translator->SetExtraReturnCids({{0, {1, 2}}});
 

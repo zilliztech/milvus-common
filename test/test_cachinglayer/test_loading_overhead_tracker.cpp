@@ -3,6 +3,7 @@
 #include <thread>
 #include <vector>
 
+#include "cachinglayer/LoadingOverhead.h"
 #include "cachinglayer/LoadingOverheadTracker.h"
 #include "cachinglayer/Utils.h"
 
@@ -155,10 +156,11 @@ TEST_F(LoadingOverheadTrackerTest, RegisterUpperBoundTakesMax) {
 }
 
 TEST_F(LoadingOverheadTrackerTest, HasFiniteUpperBound) {
-    auto handle = tracker_.Register("vector_index", LoadingOverheadTracker::kUnlimited);
-    EXPECT_FALSE(tracker_.HasFiniteUpperBound(handle));
-    handle = tracker_.Register("vector_index", {200, 0});
-    EXPECT_TRUE(tracker_.HasFiniteUpperBound(handle));
+    auto unlimited_handle = tracker_.Register("vector_index", LoadingOverheadTracker::kUnlimited);
+    EXPECT_FALSE(tracker_.HasFiniteUpperBound(unlimited_handle));
+
+    auto finite_handle = tracker_.Register("finite_vector_index", {200, 0});
+    EXPECT_TRUE(tracker_.HasFiniteUpperBound(finite_handle));
 
     auto scalar_handle = tracker_.Register("scalar_field", LoadingOverheadTracker::kUnlimited);
     EXPECT_FALSE(tracker_.HasFiniteUpperBound(scalar_handle));
@@ -214,16 +216,17 @@ TEST_F(LoadingOverheadTrackerTest, DefaultUnlimitedUBFallback) {
     EXPECT_EQ(r2.memory_bytes, 2000000000);
 }
 
-TEST_F(LoadingOverheadTrackerTest, RegisterUnlimitedThenFiniteUB) {
+TEST_F(LoadingOverheadTrackerTest, RegisterUnlimitedThenFiniteKeepsUnlimited) {
     auto handle = tracker_.Register("vector_index", LoadingOverheadTracker::kUnlimited);
     EXPECT_FALSE(tracker_.HasFiniteUpperBound(handle));
 
     handle = tracker_.Register("vector_index", {200, 0});
-    EXPECT_TRUE(tracker_.HasFiniteUpperBound(handle));
+    EXPECT_FALSE(tracker_.HasFiniteUpperBound(handle));
 
-    // Now capping should apply.
+    // INT64_MAX is an explicit unlimited upper bound. Use a missing dimension
+    // when loading overhead should pass through without joining a capped group.
     auto d1 = tracker_.Reserve(handle, {300, 0});
-    EXPECT_EQ(d1.memory_bytes, 200);
+    EXPECT_EQ(d1.memory_bytes, 300);
 }
 
 TEST_F(LoadingOverheadTrackerTest, UnregisteredTypeAutoCreatesUnlimited) {
@@ -267,40 +270,111 @@ TEST_F(LoadingOverheadTrackerTest, UBChangesMidFlight) {
     EXPECT_EQ(total_reserved, total_released);
 }
 
-TEST_F(LoadingOverheadTrackerTest, UBDecreasesFromUnlimitedMidFlight) {
+TEST_F(LoadingOverheadTrackerTest, UnlimitedUBDoesNotDecreaseMidFlight) {
     auto handle = tracker_.Register("vector_index", LoadingOverheadTracker::kUnlimited);
     auto d1 = tracker_.Reserve(handle, {1000, 0});
     EXPECT_EQ(d1.memory_bytes, 1000);
     auto d2 = tracker_.Reserve(handle, {1000, 0});
     EXPECT_EQ(d2.memory_bytes, 1000);
 
-    // Now register finite UB=200
+    // A later finite registration must not lower an explicit unlimited upper bound.
     handle = tracker_.Register("vector_index", {200, 0});
 
-    // Further reserves should be capped
     auto d3 = tracker_.Reserve(handle, {100, 0});
-    EXPECT_EQ(d3.memory_bytes, 0);
+    EXPECT_EQ(d3.memory_bytes, 100);
 
-    // Release all 3: should release exactly 2000
     auto r1 = tracker_.Release(handle, {1000, 0});
-    EXPECT_EQ(r1.memory_bytes, 1800);
+    EXPECT_EQ(r1.memory_bytes, 1000);
     auto r2 = tracker_.Release(handle, {1000, 0});
-    EXPECT_EQ(r2.memory_bytes, 100);
+    EXPECT_EQ(r2.memory_bytes, 1000);
     auto r3 = tracker_.Release(handle, {100, 0});
     EXPECT_EQ(r3.memory_bytes, 100);
 
     int64_t total_reserved = d1.memory_bytes + d2.memory_bytes + d3.memory_bytes;
     int64_t total_released = r1.memory_bytes + r2.memory_bytes + r3.memory_bytes;
-    EXPECT_EQ(total_reserved, 2000);
-    EXPECT_EQ(total_released, 2000);
+    EXPECT_EQ(total_reserved, 2100);
+    EXPECT_EQ(total_released, 2100);
 }
 
 TEST_F(LoadingOverheadTrackerTest, GetUpperBound) {
-    auto handle = tracker_.Register("vector_index", LoadingOverheadTracker::kUnlimited);
-    EXPECT_EQ(tracker_.GetUpperBound(handle), LoadingOverheadTracker::kUnlimited);
+    auto unlimited_handle = tracker_.Register("vector_index", LoadingOverheadTracker::kUnlimited);
+    EXPECT_EQ(tracker_.GetUpperBound(unlimited_handle), LoadingOverheadTracker::kUnlimited);
 
-    handle = tracker_.Register("vector_index", {200, 100});
-    auto ub = tracker_.GetUpperBound(handle);
+    auto finite_handle = tracker_.Register("finite_vector_index", {200, 100});
+    auto ub = tracker_.GetUpperBound(finite_handle);
     EXPECT_EQ(ub.memory_bytes, 200);
     EXPECT_EQ(ub.file_bytes, 100);
+}
+
+TEST_F(LoadingOverheadTrackerTest, PartialUnlimitedRemainsUnlimitedRegardlessOfRegistrationOrder) {
+    constexpr auto kMax = std::numeric_limits<int64_t>::max();
+
+    auto max_first = tracker_.Register("max_first", {kMax, 0});
+    tracker_.Register("max_first", {200, 0});
+    EXPECT_EQ(tracker_.GetUpperBound(max_first), (ResourceUsage{kMax, 0}));
+
+    auto finite_first = tracker_.Register("finite_first", {200, 0});
+    tracker_.Register("finite_first", {kMax, 0});
+    EXPECT_EQ(tracker_.GetUpperBound(finite_first), (ResourceUsage{kMax, 0}));
+}
+
+TEST_F(LoadingOverheadTrackerTest, LegacyConfigConstructorConfiguresBothDimensions) {
+    ResourceUsage upper_bound{200, 50};
+    LoadingOverheadConfig config(upper_bound, "legacy_group");
+
+    ASSERT_TRUE(config.memory.has_value());
+    EXPECT_EQ(config.memory->upper_bound, 200);
+    EXPECT_EQ(config.memory->group, "legacy_group");
+    ASSERT_TRUE(config.file.has_value());
+    EXPECT_EQ(config.file->upper_bound, 50);
+    EXPECT_EQ(config.file->group, "legacy_group");
+
+    auto handle = tracker_.Register(config);
+    EXPECT_EQ(tracker_.GetUpperBound(handle), upper_bound);
+}
+
+TEST_F(LoadingOverheadTrackerTest, DimensionsShareMemoryWhileScalarFilePassesThrough) {
+    auto scalar_handle =
+        tracker_.Register(LoadingOverheadConfig{LoadingOverheadDimensionConfig{200, "load_transient"}, std::nullopt});
+    auto field_handle = tracker_.Register(LoadingOverheadConfig{LoadingOverheadDimensionConfig{200, "load_transient"},
+                                                                LoadingOverheadDimensionConfig{50, "load_transient"}});
+
+    auto scalar_first = tracker_.Reserve(scalar_handle, {150, 100});
+    EXPECT_EQ(scalar_first, (ResourceUsage{150, 100}));
+
+    auto field_first = tracker_.Reserve(field_handle, {100, 40});
+    EXPECT_EQ(field_first, (ResourceUsage{50, 40}));
+
+    auto scalar_second = tracker_.Reserve(scalar_handle, {100, 200});
+    EXPECT_EQ(scalar_second, (ResourceUsage{0, 200}));
+
+    auto field_second = tracker_.Reserve(field_handle, {0, 20});
+    EXPECT_EQ(field_second, (ResourceUsage{0, 10}));
+
+    auto scalar_first_release = tracker_.Release(scalar_handle, {150, 100});
+    EXPECT_EQ(scalar_first_release, (ResourceUsage{0, 100}));
+
+    auto field_first_release = tracker_.Release(field_handle, {100, 40});
+    EXPECT_EQ(field_first_release, (ResourceUsage{100, 30}));
+
+    auto scalar_second_release = tracker_.Release(scalar_handle, {100, 200});
+    EXPECT_EQ(scalar_second_release, (ResourceUsage{100, 200}));
+
+    auto field_second_release = tracker_.Release(field_handle, {0, 20});
+    EXPECT_EQ(field_second_release, (ResourceUsage{0, 20}));
+}
+
+TEST_F(LoadingOverheadTrackerTest, PassthroughRegistrationDoesNotPolluteFiniteFileGroup) {
+    auto field_handle = tracker_.Register(LoadingOverheadConfig{LoadingOverheadDimensionConfig{200, "load_transient"},
+                                                                LoadingOverheadDimensionConfig{50, "load_transient"}});
+    auto scalar_handle =
+        tracker_.Register(LoadingOverheadConfig{LoadingOverheadDimensionConfig{200, "load_transient"}, std::nullopt});
+
+    EXPECT_EQ(tracker_.GetUpperBound(field_handle), (ResourceUsage{200, 50}));
+    EXPECT_EQ(tracker_.GetUpperBound(scalar_handle), (ResourceUsage{200, std::numeric_limits<int64_t>::max()}));
+
+    auto scalar = tracker_.Reserve(scalar_handle, {0, 100});
+    auto field = tracker_.Reserve(field_handle, {0, 100});
+    EXPECT_EQ(scalar.file_bytes, 100);
+    EXPECT_EQ(field.file_bytes, 50);
 }

@@ -83,7 +83,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         // Register after all potentially-throwing operations, so that if the constructor
         // fails, we don't leak a ref_count (destructor won't run for incomplete objects).
         if (auto& lo = translator_->meta()->loading_overhead) {
-            overhead_handle_ = dlist_->RegisterLoadingOverhead(lo->group, lo->upper_bound);
+            overhead_handle_ = dlist_->RegisterLoadingOverhead(*lo);
         }
     }
 
@@ -436,9 +436,9 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     void
     RunLoad(OpContext* ctx, std::unordered_set<cid_t>&& cids, std::chrono::milliseconds timeout) {
         // loaded_resource: the estimated final resource usage (from .first), reserved unconditionally.
-        // loading_overhead: the estimated temporary overhead during loading (from .second),
-        //   capped at per-type UB via LoadingOverheadTracker. The tracker returns the incremental
-        //   delta to reserve from DList, so total loading in DList = min(sum, UB) per type.
+        // loading_overhead: the estimated temporary overhead during loading (from .second).
+        //   Configured dimensions are group-capped by LoadingOverheadTracker; omitted dimensions
+        //   pass through unchanged. The tracker returns the combined incremental DList delta.
         std::vector<cid_t> loading_cids;
         try {
             auto start = std::chrono::steady_clock::now();
@@ -484,7 +484,8 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             }
 
             // loaded_resource is reserved unconditionally from DList (no capping).
-            // loading_overhead goes through the tracker: returns delta = change in min(sum, UB).
+            // loading_overhead goes through the tracker: configured dimensions return the change
+            // in min(sum, UB), while omitted dimensions return their full overhead.
             auto loaded_resource = essential_loaded_resource + bonus_loaded_resource;
             auto loading_overhead = essential_loading_overhead + bonus_loading_overhead;
 
