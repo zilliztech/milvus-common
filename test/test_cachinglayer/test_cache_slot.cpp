@@ -185,10 +185,6 @@ class MockTranslator : public Translator<TestCell> {
         extra_cids_ = extra_cids;
     }
     void
-    SetLoadingOverheadBytes(int64_t bytes) {
-        loading_overhead_ = {bytes, 0};
-    }
-    void
     SetLoadingOverhead(ResourceUsage loading_overhead) {
         loading_overhead_ = loading_overhead;
     }
@@ -2167,7 +2163,7 @@ TEST(CacheSlotTrackerTest, LoadingOverheadTrackerIntegration) {
     auto translator = std::make_unique<MockTranslator>(
         std::vector<std::pair<cid_t, int64_t>>{{0, cell_loaded_size}, {1, cell_loaded_size}},
         std::unordered_map<cl_uid_t, cid_t>{{0, 0}, {1, 1}}, "test_tracker_integration", StorageType::MEMORY);
-    translator->SetLoadingOverheadBytes(cell_loading_overhead);
+    translator->SetLoadingOverhead({cell_loading_overhead, 0});
     translator->SetLoadingOverheadConfig("test_group", {500, 0});
     auto* translator_ptr = translator.get();
 
@@ -2244,7 +2240,7 @@ TEST(CacheSlotTrackerTest, LoadingOverheadTrackerCleanupOnException) {
     auto translator = std::make_unique<MockTranslator>(std::vector<std::pair<cid_t, int64_t>>{{0, cell_loaded_size}},
                                                        std::unordered_map<cl_uid_t, cid_t>{{0, 0}},
                                                        "test_tracker_exception", StorageType::MEMORY);
-    translator->SetLoadingOverheadBytes(cell_loading_overhead);
+    translator->SetLoadingOverhead({cell_loading_overhead, 0});
     translator->SetLoadingOverheadConfig("test_group", {500, 0});
     translator->SetShouldThrow(true);
 
@@ -2288,7 +2284,7 @@ TEST(CacheSlotTrackerTest, BonusCellsRetryWithTracker) {
     auto translator = std::make_unique<MockTranslator>(
         std::vector<std::pair<cid_t, int64_t>>{{0, cell_loaded_size}, {1, cell_loaded_size}, {2, cell_loaded_size}},
         std::unordered_map<cl_uid_t, cid_t>{{0, 0}, {1, 1}, {2, 2}}, "test_bonus_retry", StorageType::MEMORY);
-    translator->SetLoadingOverheadBytes(cell_loading_overhead);
+    translator->SetLoadingOverhead({cell_loading_overhead, 0});
     translator->SetLoadingOverheadConfig("test_bonus_retry", {100, 0});
     translator->SetExtraReturnCids({{0, {1, 2}}});
 
