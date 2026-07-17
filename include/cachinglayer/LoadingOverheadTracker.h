@@ -12,28 +12,32 @@
 #pragma once
 
 #include <algorithm>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <unordered_map>
 
+#include "cachinglayer/LoadingOverhead.h"
 #include "cachinglayer/Utils.h"
 #include "log/Log.h"
 
 namespace milvus::cachinglayer {
 
-// Manages per-group loading overhead reservation with an overhead upper bound (UB).
+// Manages per-dimension, per-group loading overhead reservation with an upper bound (UB).
 //
-// Groups are identified by string keys at registration time. Registration returns
-// a uint64_t handle for O(1) lookup on the hot path (Reserve/Release).
+// Memory and file groups are independent even when they use the same string key.
+// Registration returns a composite uint64_t handle for O(1) lookup on the hot path.
 //
-// The total loading overhead reserved from DList for a given group is capped at UB:
-//   DList loading overhead reservation = min(sum_of_overhead, UB)
+// The total loading overhead reserved from DList for each configured dimension is capped:
+//   DList dimension reservation = min(sum_of_overhead, dimension_UB)
+// An unconfigured dimension passes through unchanged.
 //
 // Each Reserve/Release call returns the incremental delta to apply to DList.
 // The tracker directly tracks `overhead_reserved` (actual amount of overhead currently
 // reserved in DList) to ensure correctness.
 //
-// By default, groups are registered with kUnlimited UB, preserving original behavior.
+// The compatibility Register overload configures both dimensions. A missing
+// dimension in LoadingOverheadConfig preserves pass-through behavior.
 class LoadingOverheadTracker {
  public:
     static inline const ResourceUsage kUnlimited{std::numeric_limits<int64_t>::max(),
@@ -41,58 +45,46 @@ class LoadingOverheadTracker {
 
     static constexpr uint64_t kInvalidHandle = 0;
 
-    // Register a group with an upper bound. Returns a handle for hot-path use.
-    // If the group already exists with a finite UB, takes the larger of the two per dimension.
-    // If previously registered with kUnlimited, replaces with the given UB.
-    // Each Register increments a ref count; call Unregister to decrement.
+    uint64_t
+    Register(const LoadingOverheadConfig& config) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        RegistrationState registration;
+        if (config.memory.has_value()) {
+            registration.memory_group_handle =
+                registerDimensionGroup(memory_name_to_group_handle_, config.memory.value(), "memory");
+        }
+        if (config.file.has_value()) {
+            registration.file_group_handle =
+                registerDimensionGroup(file_name_to_group_handle_, config.file.value(), "file");
+        }
+
+        auto handle = next_registration_handle_++;
+        registration_state_[handle] = registration;
+        return handle;
+    }
+
+    // Compatibility entry point. The two dimensions use independent group state.
     uint64_t
     Register(const std::string& group, const ResourceUsage& upper_bound) {
-        std::lock_guard<std::mutex> lock(mtx_);
-        auto it = name_to_handle_.find(group);
-        if (it != name_to_handle_.end()) {
-            auto& state = handle_state_[it->second];
-            state.ref_count++;
-            if (state.upper_bound == kUnlimited) {
-                state.upper_bound = upper_bound;
-                LOG_INFO("[MCL] LoadingOverheadTracker set UB for group '{}' (handle {}, refs={}): {}", group,
-                         it->second, state.ref_count, upper_bound.ToString());
-            } else if (state.upper_bound.memory_bytes < upper_bound.memory_bytes ||
-                       state.upper_bound.file_bytes < upper_bound.file_bytes) {
-                LOG_WARN(
-                    "[MCL] LoadingOverheadTracker UB mismatch for group '{}' (handle {}): existing={}, new={}. "
-                    "Taking max per dimension.",
-                    group, it->second, state.upper_bound.ToString(), upper_bound.ToString());
-                state.upper_bound.memory_bytes = std::max(state.upper_bound.memory_bytes, upper_bound.memory_bytes);
-                state.upper_bound.file_bytes = std::max(state.upper_bound.file_bytes, upper_bound.file_bytes);
-            } else {
-                LOG_DEBUG("[MCL] LoadingOverheadTracker re-registered group '{}' (handle {}, refs={}), UB unchanged",
-                          group, it->second, state.ref_count);
-            }
-            return it->second;
-        }
-        auto handle = next_handle_++;
-        name_to_handle_[group] = handle;
-        handle_state_[handle] = GroupState{upper_bound, {}, {}, 1, group};
-        LOG_INFO("[MCL] LoadingOverheadTracker registered group '{}' (handle {}, refs=1): UB={}", group, handle,
-                 upper_bound.ToString());
-        return handle;
+        return Register(LoadingOverheadConfig{LoadingOverheadDimensionConfig{upper_bound.memory_bytes, group},
+                                              LoadingOverheadDimensionConfig{upper_bound.file_bytes, group}});
     }
 
     // Called before loading. Returns the delta to reserve from DList for loading overhead.
     ResourceUsage
     Reserve(uint64_t handle, const ResourceUsage& loading_overhead) {
         std::lock_guard<std::mutex> lock(mtx_);
-        auto it = handle_state_.find(handle);
-        if (it == handle_state_.end()) {
+        auto it = registration_state_.find(handle);
+        if (it == registration_state_.end()) {
             return loading_overhead;
         }
-        auto& state = it->second;
-        state.sum_of_overhead += loading_overhead;
-        auto target = cappedAmount(state.sum_of_overhead, state.upper_bound);
-        auto delta = target - state.overhead_reserved;
-        delta.memory_bytes = std::max(delta.memory_bytes, int64_t{0});
-        delta.file_bytes = std::max(delta.file_bytes, int64_t{0});
-        state.overhead_reserved += delta;
+        auto delta = loading_overhead;
+        if (it->second.memory_group_handle != kInvalidHandle) {
+            delta.memory_bytes = reserveDimension(it->second.memory_group_handle, loading_overhead.memory_bytes);
+        }
+        if (it->second.file_group_handle != kInvalidHandle) {
+            delta.file_bytes = reserveDimension(it->second.file_group_handle, loading_overhead.file_bytes);
+        }
         return delta;
     }
 
@@ -101,43 +93,30 @@ class LoadingOverheadTracker {
     ResourceUsage
     Release(uint64_t handle, const ResourceUsage& loading_overhead) {
         std::lock_guard<std::mutex> lock(mtx_);
-        auto it = handle_state_.find(handle);
-        if (it == handle_state_.end()) {
+        auto it = registration_state_.find(handle);
+        if (it == registration_state_.end()) {
             return loading_overhead;
         }
-        auto& state = it->second;
-        state.sum_of_overhead -= loading_overhead;
-        if (state.sum_of_overhead.memory_bytes < 0) {
-            LOG_ERROR("[MCL] LoadingOverheadTracker Release handle {}: sum_of_overhead.memory_bytes < 0", handle);
-            state.sum_of_overhead.memory_bytes = 0;
+        auto delta = loading_overhead;
+        if (it->second.memory_group_handle != kInvalidHandle) {
+            delta.memory_bytes = releaseDimension(it->second.memory_group_handle, loading_overhead.memory_bytes);
         }
-        if (state.sum_of_overhead.file_bytes < 0) {
-            LOG_ERROR("[MCL] LoadingOverheadTracker Release handle {}: sum_of_overhead.file_bytes < 0", handle);
-            state.sum_of_overhead.file_bytes = 0;
+        if (it->second.file_group_handle != kInvalidHandle) {
+            delta.file_bytes = releaseDimension(it->second.file_group_handle, loading_overhead.file_bytes);
         }
-        auto target = cappedAmount(state.sum_of_overhead, state.upper_bound);
-        auto delta = state.overhead_reserved - target;
-        delta.memory_bytes = std::max(delta.memory_bytes, int64_t{0});
-        delta.file_bytes = std::max(delta.file_bytes, int64_t{0});
-        state.overhead_reserved -= delta;
         return delta;
     }
 
     bool
     HasFiniteUpperBound(uint64_t handle) const {
         std::lock_guard<std::mutex> lock(mtx_);
-        auto it = handle_state_.find(handle);
-        return it != handle_state_.end() && !(it->second.upper_bound == kUnlimited);
+        return !(getUpperBoundLocked(handle) == kUnlimited);
     }
 
     ResourceUsage
     GetUpperBound(uint64_t handle) const {
         std::lock_guard<std::mutex> lock(mtx_);
-        auto it = handle_state_.find(handle);
-        if (it == handle_state_.end()) {
-            return kUnlimited;
-        }
-        return it->second.upper_bound;
+        return getUpperBoundLocked(handle);
     }
 
     // Decrement ref count for a group. When ref count reaches 0, the group is
@@ -148,8 +127,109 @@ class LoadingOverheadTracker {
             return;
         }
         std::lock_guard<std::mutex> lock(mtx_);
-        auto it = handle_state_.find(handle);
-        if (it == handle_state_.end()) {
+        auto it = registration_state_.find(handle);
+        if (it == registration_state_.end()) {
+            return;
+        }
+        unregisterDimensionGroup(memory_name_to_group_handle_, it->second.memory_group_handle, "memory");
+        unregisterDimensionGroup(file_name_to_group_handle_, it->second.file_group_handle, "file");
+        registration_state_.erase(it);
+    }
+
+ private:
+    struct DimensionGroupState {
+        int64_t upper_bound{0};
+        int64_t sum_of_overhead{0};
+        int64_t overhead_reserved{0};
+        uint64_t ref_count{0};
+        std::string group_name;
+    };
+
+    struct RegistrationState {
+        uint64_t memory_group_handle{kInvalidHandle};
+        uint64_t file_group_handle{kInvalidHandle};
+    };
+
+    uint64_t
+    registerDimensionGroup(std::unordered_map<std::string, uint64_t>& name_to_handle,
+                           const LoadingOverheadDimensionConfig& config, const char* dimension) {
+        auto it = name_to_handle.find(config.group);
+        if (it != name_to_handle.end()) {
+            auto& state = dimension_group_state_[it->second];
+            state.ref_count++;
+            if (state.upper_bound == std::numeric_limits<int64_t>::max()) {
+                state.upper_bound = config.upper_bound;
+                LOG_INFO("[MCL] LoadingOverheadTracker set {} UB for group '{}' (handle {}, refs={}): {}", dimension,
+                         config.group, it->second, state.ref_count, config.upper_bound);
+            } else if (state.upper_bound < config.upper_bound) {
+                LOG_WARN(
+                    "[MCL] LoadingOverheadTracker {} UB mismatch for group '{}' (handle {}): existing={}, new={}. "
+                    "Taking max.",
+                    dimension, config.group, it->second, state.upper_bound, config.upper_bound);
+                state.upper_bound = config.upper_bound;
+            } else {
+                LOG_DEBUG("[MCL] LoadingOverheadTracker re-registered {} group '{}' (handle {}, refs={}), UB unchanged",
+                          dimension, config.group, it->second, state.ref_count);
+            }
+            return it->second;
+        }
+
+        auto handle = next_group_handle_++;
+        name_to_handle[config.group] = handle;
+        dimension_group_state_[handle] = DimensionGroupState{config.upper_bound, 0, 0, 1, config.group};
+        LOG_INFO("[MCL] LoadingOverheadTracker registered {} group '{}' (handle {}, refs=1): UB={}", dimension,
+                 config.group, handle, config.upper_bound);
+        return handle;
+    }
+
+    int64_t
+    reserveDimension(uint64_t group_handle, int64_t overhead) {
+        auto& state = dimension_group_state_.at(group_handle);
+        state.sum_of_overhead += overhead;
+        auto target = std::min(std::max(state.sum_of_overhead, int64_t{0}), state.upper_bound);
+        auto delta = std::max(target - state.overhead_reserved, int64_t{0});
+        state.overhead_reserved += delta;
+        return delta;
+    }
+
+    int64_t
+    releaseDimension(uint64_t group_handle, int64_t overhead) {
+        auto& state = dimension_group_state_.at(group_handle);
+        state.sum_of_overhead -= overhead;
+        if (state.sum_of_overhead < 0) {
+            LOG_ERROR("[MCL] LoadingOverheadTracker Release group handle {}: sum_of_overhead < 0", group_handle);
+            state.sum_of_overhead = 0;
+        }
+        auto target = std::min(state.sum_of_overhead, state.upper_bound);
+        auto delta = std::max(state.overhead_reserved - target, int64_t{0});
+        state.overhead_reserved -= delta;
+        return delta;
+    }
+
+    ResourceUsage
+    getUpperBoundLocked(uint64_t registration_handle) const {
+        auto it = registration_state_.find(registration_handle);
+        if (it == registration_state_.end()) {
+            return kUnlimited;
+        }
+        ResourceUsage result = kUnlimited;
+        if (it->second.memory_group_handle != kInvalidHandle) {
+            result.memory_bytes = dimension_group_state_.at(it->second.memory_group_handle).upper_bound;
+        }
+        if (it->second.file_group_handle != kInvalidHandle) {
+            result.file_bytes = dimension_group_state_.at(it->second.file_group_handle).upper_bound;
+        }
+        return result;
+    }
+
+    void
+    unregisterDimensionGroup(std::unordered_map<std::string, uint64_t>& name_to_handle, uint64_t group_handle,
+                             const char* dimension) {
+        if (group_handle == kInvalidHandle) {
+            return;
+        }
+        auto it = dimension_group_state_.find(group_handle);
+        if (it == dimension_group_state_.end()) {
             return;
         }
         auto& state = it->second;
@@ -157,41 +237,29 @@ class LoadingOverheadTracker {
             state.ref_count--;
         }
         if (state.ref_count > 0) {
-            LOG_DEBUG("[MCL] LoadingOverheadTracker handle {} ref_count decremented to {}", handle, state.ref_count);
+            LOG_DEBUG("[MCL] LoadingOverheadTracker {} group handle {} ref_count decremented to {}", dimension,
+                      group_handle, state.ref_count);
             return;
         }
-        // ref_count == 0, unconditionally clean up.
-        // Log error if there are residual reservations — indicates a Reserve/Release pairing bug.
-        if (state.sum_of_overhead.AnyGTZero() || state.overhead_reserved.AnyGTZero()) {
+        if (state.sum_of_overhead > 0 || state.overhead_reserved > 0) {
             LOG_ERROR(
-                "[MCL] LoadingOverheadTracker handle {} ref_count=0 with residual reservations: "
+                "[MCL] LoadingOverheadTracker {} group handle {} ref_count=0 with residual reservations: "
                 "sum_of_overhead={}, overhead_reserved={}. Cleaning up anyway to avoid leak.",
-                handle, state.sum_of_overhead.ToString(), state.overhead_reserved.ToString());
+                dimension, group_handle, state.sum_of_overhead, state.overhead_reserved);
         }
-        LOG_INFO("[MCL] LoadingOverheadTracker unregistered group '{}' (handle {})", state.group_name, handle);
-        name_to_handle_.erase(state.group_name);
-        handle_state_.erase(it);
-    }
-
- private:
-    struct GroupState {
-        ResourceUsage upper_bound;
-        ResourceUsage sum_of_overhead;
-        ResourceUsage overhead_reserved;
-        uint64_t ref_count{0};
-        std::string group_name;
-    };
-
-    static ResourceUsage
-    cappedAmount(const ResourceUsage& sum, const ResourceUsage& ub) {
-        return {std::min(std::max(sum.memory_bytes, int64_t{0}), ub.memory_bytes),
-                std::min(std::max(sum.file_bytes, int64_t{0}), ub.file_bytes)};
+        LOG_INFO("[MCL] LoadingOverheadTracker unregistered {} group '{}' (handle {})", dimension, state.group_name,
+                 group_handle);
+        name_to_handle.erase(state.group_name);
+        dimension_group_state_.erase(it);
     }
 
     mutable std::mutex mtx_;
-    std::unordered_map<std::string, uint64_t> name_to_handle_;
-    std::unordered_map<uint64_t, GroupState> handle_state_;
-    uint64_t next_handle_{1};
+    std::unordered_map<std::string, uint64_t> memory_name_to_group_handle_;
+    std::unordered_map<std::string, uint64_t> file_name_to_group_handle_;
+    std::unordered_map<uint64_t, DimensionGroupState> dimension_group_state_;
+    std::unordered_map<uint64_t, RegistrationState> registration_state_;
+    uint64_t next_group_handle_{1};
+    uint64_t next_registration_handle_{1};
 };
 
 }  // namespace milvus::cachinglayer

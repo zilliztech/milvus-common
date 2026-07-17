@@ -17,16 +17,12 @@
 #include <utility>
 #include <vector>
 
+#include "cachinglayer/LoadingOverhead.h"
 #include "cachinglayer/Utils.h"
 #include "common/OpContext.h"
 #include "common/common_type_c.h"
 
 namespace milvus::cachinglayer {
-
-struct LoadingOverheadConfig {
-    ResourceUsage upper_bound;
-    std::string group;
-};
 
 struct MetricAttribution {
     // Optional stable shard/channel label for attributed cache-slot disk usage metrics.
@@ -47,10 +43,9 @@ struct Meta {
     // Does not affect manual eviction.
     bool support_eviction;
     // Loading overhead configuration for this translator.
-    // When set, the total loading overhead across all CacheSlots sharing the same group
-    // is capped at upper_bound, preventing over-reservation when many concurrent
-    // loads happen. The real resource usage is bounded by loading_pool_size * cell_size.
-    // If not set, no capping is applied (existing behavior).
+    // Each configured resource dimension is capped across CacheSlots sharing its group.
+    // An omitted dimension passes through unchanged and remains subject to DList admission.
+    // If the whole config is not set, no capping is applied (existing behavior).
     std::optional<LoadingOverheadConfig> loading_overhead;
     std::optional<MetricAttribution> metric_attribution;
     explicit Meta(StorageType storage_type, CellIdMappingMode cell_id_mapping_mode, CellDataType cell_data_type,
@@ -81,9 +76,8 @@ class Translator {
     //   - loaded_usage (first): the final resource usage after the cell is fully loaded and in cache.
     //   - loading_overhead (second): the *temporary* resource usage during loading (e.g., preprocessing buffers),
     //     excluding the final loaded usage. This is the extra overhead that only exists during the loading phase.
-    // When loading_overhead_upper_bound is set in Meta, the total loading reservation across all CacheSlots
-    // of the same CellDataType is capped at that upper bound, since actual concurrent resource usage is
-    // bounded by loading_pool_size * cell_size.
+    // When a loading_overhead dimension is configured in Meta, the total reservation across all CacheSlots
+    // sharing that dimension's group is capped at its upper bound. Omitted dimensions pass through unchanged.
     // If a cell is about to be pinned and loaded, and there are not enough resource for it, EvictionManager
     // will try to evict some other cells to make space. Thus this estimation should generally be greater
     // than or equal to the actual size. If the estimation is smaller than the actual size, with insufficient

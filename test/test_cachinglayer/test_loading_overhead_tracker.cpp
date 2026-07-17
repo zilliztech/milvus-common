@@ -3,6 +3,7 @@
 #include <thread>
 #include <vector>
 
+#include "cachinglayer/LoadingOverhead.h"
 #include "cachinglayer/LoadingOverheadTracker.h"
 #include "cachinglayer/Utils.h"
 
@@ -303,4 +304,50 @@ TEST_F(LoadingOverheadTrackerTest, GetUpperBound) {
     auto ub = tracker_.GetUpperBound(handle);
     EXPECT_EQ(ub.memory_bytes, 200);
     EXPECT_EQ(ub.file_bytes, 100);
+}
+
+TEST_F(LoadingOverheadTrackerTest, DimensionsShareMemoryWhileScalarFilePassesThrough) {
+    auto scalar_handle =
+        tracker_.Register(LoadingOverheadConfig{LoadingOverheadDimensionConfig{200, "load_transient"}, std::nullopt});
+    auto field_handle = tracker_.Register(LoadingOverheadConfig{LoadingOverheadDimensionConfig{200, "load_transient"},
+                                                                LoadingOverheadDimensionConfig{50, "load_transient"}});
+
+    auto scalar_first = tracker_.Reserve(scalar_handle, {150, 100});
+    EXPECT_EQ(scalar_first, (ResourceUsage{150, 100}));
+
+    auto field_first = tracker_.Reserve(field_handle, {100, 40});
+    EXPECT_EQ(field_first, (ResourceUsage{50, 40}));
+
+    auto scalar_second = tracker_.Reserve(scalar_handle, {100, 200});
+    EXPECT_EQ(scalar_second, (ResourceUsage{0, 200}));
+
+    auto field_second = tracker_.Reserve(field_handle, {0, 20});
+    EXPECT_EQ(field_second, (ResourceUsage{0, 10}));
+
+    auto scalar_first_release = tracker_.Release(scalar_handle, {150, 100});
+    EXPECT_EQ(scalar_first_release, (ResourceUsage{0, 100}));
+
+    auto field_first_release = tracker_.Release(field_handle, {100, 40});
+    EXPECT_EQ(field_first_release, (ResourceUsage{100, 30}));
+
+    auto scalar_second_release = tracker_.Release(scalar_handle, {100, 200});
+    EXPECT_EQ(scalar_second_release, (ResourceUsage{100, 200}));
+
+    auto field_second_release = tracker_.Release(field_handle, {0, 20});
+    EXPECT_EQ(field_second_release, (ResourceUsage{0, 20}));
+}
+
+TEST_F(LoadingOverheadTrackerTest, PassthroughRegistrationDoesNotPolluteFiniteFileGroup) {
+    auto field_handle = tracker_.Register(LoadingOverheadConfig{LoadingOverheadDimensionConfig{200, "load_transient"},
+                                                                LoadingOverheadDimensionConfig{50, "load_transient"}});
+    auto scalar_handle =
+        tracker_.Register(LoadingOverheadConfig{LoadingOverheadDimensionConfig{200, "load_transient"}, std::nullopt});
+
+    EXPECT_EQ(tracker_.GetUpperBound(field_handle), (ResourceUsage{200, 50}));
+    EXPECT_EQ(tracker_.GetUpperBound(scalar_handle), (ResourceUsage{200, std::numeric_limits<int64_t>::max()}));
+
+    auto scalar = tracker_.Reserve(scalar_handle, {0, 100});
+    auto field = tracker_.Reserve(field_handle, {0, 100});
+    EXPECT_EQ(scalar.file_bytes, 100);
+    EXPECT_EQ(field.file_bytes, 50);
 }
