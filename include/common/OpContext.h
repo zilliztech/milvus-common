@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <vector>
 
 #include "common/Tracer.h"
 
@@ -40,6 +41,14 @@ struct OpContext {
     // Runtime load priority that overrides the translator's cached priority.
     // Maps to proto::common::LoadPriority (milvus-proto): HIGH = 0, LOW = 1.
     std::optional<int32_t> runtime_load_priority;
+
+    // Coalesced-read hint: the field ids (FieldId::get() values) this operation
+    // will read. Set once by the caller at operation entry. A per-field cache
+    // reader may use it to co-load the sibling hinted fields of the same
+    // column group in one IO instead of a separate read per field. Empty = no
+    // hint (each field loaded independently). Raw int64 keeps common/
+    // independent of segcore's FieldId type.
+    std::vector<int64_t> coload_fields;
 
     std::optional<tracer::OwnedTraceContext> trace_context;
 
