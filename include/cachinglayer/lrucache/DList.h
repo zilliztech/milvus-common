@@ -86,8 +86,6 @@ class DList : public std::enable_shared_from_this<DList> {
     void
     RefreshLoadingOverheadUpperBound(uint64_t overhead_handle, const LoadingOverheadConfig& config) {
         if (loading_overhead_tracker_) {
-            // Keep refresh ordered with tracker reserve/release and their DList accounting.
-            std::lock_guard<std::mutex> lock(list_mtx_);
             loading_overhead_tracker_->RefreshUpperBound(overhead_handle, config);
         }
     }

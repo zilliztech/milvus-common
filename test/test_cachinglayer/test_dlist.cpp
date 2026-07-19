@@ -2,6 +2,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <future>
 #include <map>
 #include <memory>
 #include <thread>
@@ -158,6 +159,28 @@ TEST_F(DListTest, FailedReserveAfterOverheadRefreshRollsBackExactTrackerDelta) {
     auto released = dlist->ReleaseLoadingResource({}, {200, 0}, handle);
     EXPECT_EQ(released, (ResourceUsage{100, 0}));
     EXPECT_EQ(get_loading_memory(), ResourceUsage{});
+}
+
+TEST_F(DListTest, RefreshLoadingOverheadDoesNotWaitForListLock) {
+    dlist->SetLoadingOverheadTracker(std::make_shared<LoadingOverheadTracker>());
+    auto handle = dlist->RegisterLoadingOverhead("load_transient", {100, 0});
+    auto config = LoadingOverheadConfig{LoadingOverheadDimensionConfig{200, "load_transient"},
+                                        LoadingOverheadDimensionConfig{0, "load_transient"}};
+
+    auto list_lock = DLF::lock_list(*dlist);
+    std::promise<void> started;
+    auto started_future = started.get_future();
+    auto refresh_future = std::async(std::launch::async, [&]() {
+        started.set_value();
+        dlist->RefreshLoadingOverheadUpperBound(handle, config);
+    });
+
+    started_future.wait();
+    auto status = refresh_future.wait_for(std::chrono::milliseconds(200));
+    list_lock.unlock();
+    refresh_future.get();
+
+    EXPECT_EQ(status, std::future_status::ready);
 }
 
 TEST_F(DListTest, UpdateMaxLimitIncrease) {

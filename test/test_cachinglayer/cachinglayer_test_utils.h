@@ -13,6 +13,7 @@
 
 #include <gtest/gtest.h>
 
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -27,6 +28,11 @@ using namespace cachinglayer;
 namespace cachinglayer::internal {
 class DListTestFriend {
  public:
+    static std::unique_lock<std::mutex>
+    lock_list(DList& dlist) {
+        return std::unique_lock<std::mutex>(dlist.list_mtx_);
+    }
+
     static ResourceUsage
     get_using_memory(const DList& dlist) {
         return dlist.total_loaded_size_.load() + dlist.total_loading_size_.load();
