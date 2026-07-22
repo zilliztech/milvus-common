@@ -2,6 +2,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <future>
 #include <map>
 #include <memory>
 #include <thread>
@@ -15,6 +16,12 @@
 
 using milvus::cachinglayer::cid_t;
 using milvus::cachinglayer::EvictionConfig;
+using milvus::cachinglayer::LoadingOverheadConfig;
+using milvus::cachinglayer::LoadingOverheadDimension;
+using milvus::cachinglayer::LoadingOverheadGroupBinding;
+using milvus::cachinglayer::LoadingOverheadGroupHandle;
+using milvus::cachinglayer::LoadingOverheadPolicy;
+using milvus::cachinglayer::LoadingOverheadUpdateResult;
 using milvus::cachinglayer::ResourceUsage;
 using milvus::cachinglayer::internal::DList;
 using milvus::cachinglayer::internal::DListTestFriend;
@@ -69,6 +76,11 @@ class DListTest : public ::testing::Test {
     void
     releaseLoadingMemory(const ResourceUsage& size) {
         dlist->ReleaseLoadingResource(size);
+    }
+
+    LoadingOverheadGroupHandle
+    CreateMemoryGroup(LoadingOverheadPolicy policy) {
+        return dlist->CreateLoadingOverheadGroup(LoadingOverheadDimension::kMemory, std::move(policy));
     }
 
     // Helper to create a mock node, simulate loading it, and add it to the list.
@@ -134,6 +146,230 @@ TEST_F(DListTest, Initialization) {
     EXPECT_EQ(DLF::get_tail(*dlist), nullptr);
 }
 
+TEST_F(DListTest, LoadingOverheadGroupNeedsNoSeparateTracker) {
+    auto group = CreateMemoryGroup(LoadingOverheadPolicy::Executor(1));
+    ASSERT_NE(group, nullptr);
+
+    LoadingOverheadConfig config{
+        LoadingOverheadGroupBinding{group, 10},
+        std::nullopt,
+    };
+    EXPECT_NO_THROW(dlist->BindLoadingOverheadGroups(config));
+    dlist->UnbindLoadingOverheadGroups(config);
+}
+
+TEST_F(DListTest, PolicyTighteningDrainsExistingReservationWithInflightWork) {
+    auto group = CreateMemoryGroup(LoadingOverheadPolicy::Passthrough());
+    ASSERT_NE(group, nullptr);
+
+    LoadingOverheadConfig binding{
+        LoadingOverheadGroupBinding{group, 50},
+        std::nullopt,
+    };
+    dlist->BindLoadingOverheadGroups(binding);
+    auto reservation = std::move(dlist->ReserveLoadingResourceWithTimeout(
+                                     /*loaded=*/{}, /*overhead=*/{100, 0}, &binding, std::chrono::milliseconds(0)))
+                           .get();
+    ASSERT_TRUE(reservation.success);
+    EXPECT_EQ(reservation.reserved, (ResourceUsage{100, 0}));
+
+    auto waiter = dlist->ReserveLoadingResourceWithTimeout({50, 0}, std::chrono::seconds(1));
+    EXPECT_FALSE(waiter.isReady());
+
+    EXPECT_EQ(dlist->UpdateLoadingOverheadGroup(group, LoadingOverheadPolicy::Executor(1)),
+              LoadingOverheadUpdateResult::kApplied);
+    EXPECT_EQ(get_loading_memory(), (ResourceUsage{100, 0}));
+    EXPECT_FALSE(waiter.isReady());
+
+    EXPECT_EQ(dlist->ReleaseLoadingResource(/*loaded=*/{}, /*overhead=*/{100, 0}, &binding), (ResourceUsage{100, 0}));
+    EXPECT_TRUE(std::move(waiter).get());
+    EXPECT_EQ(get_loading_memory(), (ResourceUsage{50, 0}));
+    dlist->ReleaseLoadingResource({50, 0});
+    EXPECT_EQ(get_loading_memory(), ResourceUsage{});
+}
+
+TEST_F(DListTest, PolicyExpansionReconcilesOnNextReserveAndRollsBackFailure) {
+    auto group = CreateMemoryGroup(LoadingOverheadPolicy::Executor(1));
+    ASSERT_NE(group, nullptr);
+
+    LoadingOverheadConfig binding{
+        LoadingOverheadGroupBinding{group, 50},
+        std::nullopt,
+    };
+    dlist->BindLoadingOverheadGroups(binding);
+    auto reservation = std::move(dlist->ReserveLoadingResourceWithTimeout(
+                                     /*loaded=*/{}, /*overhead=*/{500, 0}, &binding, std::chrono::milliseconds(0)))
+                           .get();
+    ASSERT_TRUE(reservation.success);
+    EXPECT_EQ(reservation.reserved, (ResourceUsage{50, 0}));
+
+    EXPECT_EQ(dlist->UpdateLoadingOverheadGroup(group, LoadingOverheadPolicy::Executor(3)),
+              LoadingOverheadUpdateResult::kApplied);
+    EXPECT_EQ(get_loading_memory(), (ResourceUsage{50, 0}));
+
+    auto failed = std::move(dlist->ReserveLoadingResourceWithTimeout(
+                                /*loaded=*/{}, /*overhead=*/{1, 0}, &binding, std::chrono::milliseconds(0)))
+                      .get();
+    EXPECT_FALSE(failed.success);
+    EXPECT_EQ(get_loading_memory(), (ResourceUsage{50, 0}));
+
+    EXPECT_EQ(dlist->ReleaseLoadingResource(/*loaded=*/{}, /*overhead=*/{500, 0}, &binding), (ResourceUsage{50, 0}));
+}
+
+TEST_F(DListTest, FailedReserveRollsBackActiveDemand) {
+    auto group = CreateMemoryGroup(LoadingOverheadPolicy::Executor(1));
+    ASSERT_NE(group, nullptr);
+
+    ASSERT_TRUE(std::move(dlist->ReserveLoadingResourceWithTimeout({50, 0}, std::chrono::milliseconds(0))).get());
+    LoadingOverheadConfig failed_binding{
+        LoadingOverheadGroupBinding{group, 80},
+        std::nullopt,
+    };
+    dlist->BindLoadingOverheadGroups(failed_binding);
+    auto failed = std::move(dlist->ReserveLoadingResourceWithTimeout(
+                                /*loaded=*/{}, /*overhead=*/{500, 0}, &failed_binding, std::chrono::milliseconds(0)))
+                      .get();
+    EXPECT_FALSE(failed.success);
+    dlist->ReleaseLoadingResource({50, 0});
+
+    LoadingOverheadConfig admitted_binding{
+        LoadingOverheadGroupBinding{group, 10},
+        std::nullopt,
+    };
+    dlist->BindLoadingOverheadGroups(admitted_binding);
+    auto admitted =
+        std::move(dlist->ReserveLoadingResourceWithTimeout(
+                      /*loaded=*/{}, /*overhead=*/{500, 0}, &admitted_binding, std::chrono::milliseconds(0)))
+            .get();
+    ASSERT_TRUE(admitted.success);
+    // Runtime-unit bounds follow attached bindings, so the failed binding's
+    // 80-byte bound remains while its CacheSlot is bound.
+    EXPECT_EQ(admitted.reserved, (ResourceUsage{80, 0}));
+    EXPECT_EQ(dlist->ReleaseLoadingResource(/*loaded=*/{}, /*overhead=*/{500, 0}, &admitted_binding),
+              (ResourceUsage{80, 0}));
+}
+
+TEST_F(DListTest, GroupsAreDimensionIndependent) {
+    auto memory_group = CreateMemoryGroup(LoadingOverheadPolicy::Passthrough());
+    auto file_group =
+        dlist->CreateLoadingOverheadGroup(LoadingOverheadDimension::kFile, LoadingOverheadPolicy::Executor(1));
+    ASSERT_NE(memory_group, nullptr);
+    ASSERT_NE(file_group, nullptr);
+
+    LoadingOverheadConfig binding{
+        LoadingOverheadGroupBinding{memory_group, 50},
+        LoadingOverheadGroupBinding{file_group, 10},
+    };
+    dlist->BindLoadingOverheadGroups(binding);
+    auto reservation = std::move(dlist->ReserveLoadingResourceWithTimeout(
+                                     /*loaded=*/{}, /*overhead=*/{100, 50}, &binding, std::chrono::milliseconds(0)))
+                           .get();
+    ASSERT_TRUE(reservation.success);
+    EXPECT_EQ(reservation.reserved, (ResourceUsage{100, 10}));
+
+    EXPECT_EQ(dlist->UpdateLoadingOverheadGroup(memory_group, LoadingOverheadPolicy::Executor(1)),
+              LoadingOverheadUpdateResult::kApplied);
+    EXPECT_EQ(dlist->UpdateLoadingOverheadGroup(file_group, LoadingOverheadPolicy::Passthrough()),
+              LoadingOverheadUpdateResult::kApplied);
+    EXPECT_EQ(get_loading_memory(), (ResourceUsage{100, 10}));
+
+    EXPECT_EQ(dlist->ReleaseLoadingResource(/*loaded=*/{}, /*overhead=*/{100, 50}, &binding), (ResourceUsage{100, 10}));
+    EXPECT_EQ(get_loading_memory(), ResourceUsage{});
+}
+
+TEST_F(DListTest, FractionalLoadingFactorScalesGroupDelta) {
+    auto scaled_config = eviction_config_;
+    scaled_config.loading_resource_factor = 1.5F;
+    auto scaled_dlist = std::make_shared<DList>(true, initial_limit, low_watermark, high_watermark, scaled_config);
+
+    auto group =
+        scaled_dlist->CreateLoadingOverheadGroup(LoadingOverheadDimension::kMemory, LoadingOverheadPolicy::Executor(1));
+    ASSERT_NE(group, nullptr);
+
+    LoadingOverheadConfig binding{
+        LoadingOverheadGroupBinding{group, 1},
+        std::nullopt,
+    };
+    scaled_dlist->BindLoadingOverheadGroups(binding);
+    auto reservation = std::move(scaled_dlist->ReserveLoadingResourceWithTimeout(
+                                     /*loaded=*/{}, /*overhead=*/{2, 0}, &binding, std::chrono::milliseconds(0)))
+                           .get();
+    ASSERT_TRUE(reservation.success);
+    EXPECT_EQ(reservation.reserved, (ResourceUsage{1, 0}));
+    EXPECT_EQ(DLF::get_loading_memory(*scaled_dlist), (ResourceUsage{2, 0}));
+
+    ASSERT_EQ(scaled_dlist->UpdateLoadingOverheadGroup(group, LoadingOverheadPolicy::Passthrough()),
+              LoadingOverheadUpdateResult::kApplied);
+    EXPECT_EQ(DLF::get_loading_memory(*scaled_dlist), (ResourceUsage{2, 0}));
+
+    ASSERT_EQ(scaled_dlist->UpdateLoadingOverheadGroup(group, LoadingOverheadPolicy::Executor(0)),
+              LoadingOverheadUpdateResult::kApplied);
+    EXPECT_EQ(DLF::get_loading_memory(*scaled_dlist), (ResourceUsage{2, 0}));
+
+    EXPECT_EQ(scaled_dlist->ReleaseLoadingResource(/*loaded=*/{}, /*overhead=*/{2, 0}, &binding),
+              (ResourceUsage{1, 0}));
+    EXPECT_EQ(DLF::get_loading_memory(*scaled_dlist), ResourceUsage{});
+}
+
+TEST_F(DListTest, BindingChangesSerializeWithAdmissionTransactions) {
+    auto group = CreateMemoryGroup(LoadingOverheadPolicy::Executor(1));
+    ASSERT_NE(group, nullptr);
+
+    LoadingOverheadConfig binding{
+        LoadingOverheadGroupBinding{group, 10},
+        std::nullopt,
+    };
+    dlist->BindLoadingOverheadGroups(binding);
+
+    auto expect_serialized = [&](auto&& operation) {
+        auto list_lock = DLF::test_lock_list(dlist.get());
+        std::promise<void> operation_started;
+        auto operation_started_future = operation_started.get_future();
+        auto operation_future = std::async(std::launch::async, [&]() {
+            operation_started.set_value();
+            operation();
+        });
+        operation_started_future.wait();
+        EXPECT_EQ(operation_future.wait_for(std::chrono::milliseconds(50)), std::future_status::timeout);
+
+        list_lock.unlock();
+        operation_future.get();
+    };
+
+    expect_serialized([&]() { dlist->UnbindLoadingOverheadGroups(binding); });
+
+    expect_serialized([&]() { dlist->BindLoadingOverheadGroups(binding); });
+    dlist->UnbindLoadingOverheadGroups(binding);
+}
+
+TEST_F(DListTest, GroupReconfigurationReprocessesWaitersWithNewBound) {
+    auto group = CreateMemoryGroup(LoadingOverheadPolicy::Passthrough());
+    ASSERT_NE(group, nullptr);
+    LoadingOverheadConfig binding{
+        LoadingOverheadGroupBinding{group},
+        std::nullopt,
+    };
+    dlist->BindLoadingOverheadGroups(binding);
+
+    auto active = std::move(dlist->ReserveLoadingResourceWithTimeout(
+                                /*loaded=*/{}, /*overhead=*/{80, 0}, &binding, std::chrono::milliseconds(0)))
+                      .get();
+    ASSERT_TRUE(active.success);
+    auto waiter = dlist->ReserveLoadingResourceWithTimeout(
+        /*loaded=*/{}, /*overhead=*/{30, 0}, &binding, std::chrono::milliseconds(-1));
+    ASSERT_FALSE(waiter.isReady());
+
+    EXPECT_EQ(dlist->UpdateLoadingOverheadGroup(group, LoadingOverheadPolicy::Fixed(80)),
+              LoadingOverheadUpdateResult::kApplied);
+    EXPECT_TRUE(waiter.isReady());
+    const auto waiter_result = std::move(waiter).get();
+    EXPECT_TRUE(waiter_result.success);
+    EXPECT_EQ(waiter_result.reserved, ResourceUsage{});
+
+    EXPECT_EQ(dlist->ReleaseLoadingResource(/*loaded=*/{}, /*overhead=*/{30, 0}, &binding), ResourceUsage{});
+    EXPECT_EQ(dlist->ReleaseLoadingResource(/*loaded=*/{}, /*overhead=*/{80, 0}, &binding), (ResourceUsage{80, 0}));
+}
+
 TEST_F(DListTest, UpdateMaxLimitIncrease) {
     MockListNode* node1 = add_and_load_node({10, 5});
     EXPECT_EQ(get_used_memory(), node1->loaded_size());
@@ -144,6 +380,20 @@ TEST_F(DListTest, UpdateMaxLimitIncrease) {
     EXPECT_EQ(get_used_memory(), node1->loaded_size());
     DLF::verify_list(dlist.get(), {node1});
     EXPECT_EQ(get_loading_memory(), ResourceUsage{});
+}
+
+TEST_F(DListTest, UpdateMaxLimitIncreaseReprocessesWaiters) {
+    ASSERT_TRUE(reserveLoadingMemorySync({80, 0}));
+
+    auto waiter = dlist->ReserveLoadingResourceWithTimeout({50, 0}, std::chrono::milliseconds(-1));
+    ASSERT_FALSE(waiter.isReady());
+
+    ASSERT_TRUE(dlist->UpdateMaxLimit({150, 50}));
+    ASSERT_TRUE(waiter.isReady());
+    EXPECT_TRUE(std::move(waiter).get());
+    EXPECT_EQ(get_loading_memory(), (ResourceUsage{130, 0}));
+    dlist->ReleaseLoadingResource({50, 0});
+    dlist->ReleaseLoadingResource({80, 0});
 }
 
 TEST_F(DListTest, UpdateMaxLimitDecreaseNoEviction) {
@@ -812,6 +1062,55 @@ TEST_F(DListTest, ReserveWithCancellationTokenCancelledWhileWaiting) {
     // The future should return false due to cancellation
     EXPECT_FALSE(std::move(future).get());
     EXPECT_EQ(get_loading_memory(), ResourceUsage{});
+}
+
+TEST_F(DListTest, TimeoutOfHeadWaiterReprocessesFollowingRequest) {
+    auto config = eviction_config_;
+    config.eviction_interval = std::chrono::milliseconds(60000);
+    dlist = std::make_shared<DList>(true, initial_limit, low_watermark, high_watermark, config);
+
+    ASSERT_TRUE(reserveLoadingMemorySync({70, 0}));
+    ASSERT_TRUE(reserveLoadingMemorySync({30, 0}));
+
+    auto head = dlist->ReserveLoadingResourceWithTimeout({80, 0}, std::chrono::milliseconds(50));
+    auto following = dlist->ReserveLoadingResourceWithTimeout({20, 0}, std::chrono::milliseconds(-1));
+    dlist->ReleaseLoadingResource({30, 0});
+    ASSERT_FALSE(following.isReady());
+
+    EXPECT_FALSE(std::move(head).get());
+    for (int i = 0; i < 50 && !following.isReady(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_TRUE(following.isReady());
+    EXPECT_TRUE(std::move(following).get());
+    dlist->ReleaseLoadingResource({20, 0});
+    dlist->ReleaseLoadingResource({70, 0});
+}
+
+TEST_F(DListTest, CancellationOfHeadWaiterReprocessesFollowingRequest) {
+    auto config = eviction_config_;
+    config.eviction_interval = std::chrono::milliseconds(60000);
+    dlist = std::make_shared<DList>(true, initial_limit, low_watermark, high_watermark, config);
+
+    ASSERT_TRUE(reserveLoadingMemorySync({70, 0}));
+    ASSERT_TRUE(reserveLoadingMemorySync({30, 0}));
+
+    folly::CancellationSource cancel_source;
+    auto op_ctx = std::make_unique<milvus::OpContext>(cancel_source.getToken());
+    auto head = dlist->ReserveLoadingResourceWithTimeout({80, 0}, std::chrono::seconds(5), op_ctx.get());
+    auto following = dlist->ReserveLoadingResourceWithTimeout({20, 0}, std::chrono::milliseconds(-1));
+    dlist->ReleaseLoadingResource({30, 0});
+    ASSERT_FALSE(following.isReady());
+
+    cancel_source.requestCancellation();
+    EXPECT_FALSE(std::move(head).get());
+    for (int i = 0; i < 50 && !following.isReady(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_TRUE(following.isReady());
+    EXPECT_TRUE(std::move(following).get());
+    dlist->ReleaseLoadingResource({20, 0});
+    dlist->ReleaseLoadingResource({70, 0});
 }
 
 TEST_F(DListTest, ReserveWithCancellationTokenSucceedsBeforeCancel) {
