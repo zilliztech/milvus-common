@@ -2263,6 +2263,29 @@ TEST(CacheSlotLoadingOverheadTest, InvalidGroupBindingDoesNotLeakSlotMetrics) {
     cell_count.Decrement(cell_count.Value() - cell_baseline);
 }
 
+TEST(CacheSlotLoadingOverheadTest, ConstructorFailureDoesNotLeakGroupBinding) {
+    ResourceUsage limit{100, 0};
+    auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
+    auto group =
+        dlist->CreateLoadingOverheadGroup(LoadingOverheadDimension::kMemory, LoadingOverheadPolicy::Passthrough());
+    ASSERT_NE(group, nullptr);
+
+    auto translator = std::make_unique<MockTranslator>(std::vector<std::pair<cid_t, int64_t>>{{0, 1}},
+                                                       std::unordered_map<cl_uid_t, cid_t>{{0, 0}},
+                                                       "test_constructor_binding_rollback", StorageType::MEMORY);
+    translator->SetLoadingOverheadConfig(LoadingOverheadConfig{
+        LoadingOverheadGroupBinding{group},
+        std::nullopt,
+    });
+    translator->meta()->cell_data_type = static_cast<CellDataType>(-1);
+
+    EXPECT_ANY_THROW(std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, false,
+                                                           std::chrono::milliseconds(5000),
+                                                           std::chrono::milliseconds(0)));
+    EXPECT_EQ(dlist->UpdateLoadingOverheadGroup(group, LoadingOverheadPolicy::Executor(1)),
+              LoadingOverheadUpdateResult::kApplied);
+}
+
 TEST(CacheSlotLoadingOverheadTest, CacheSlotUnbindUsesOriginalConfigMetadata) {
     ResourceUsage limit{1000, 0};
     auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});

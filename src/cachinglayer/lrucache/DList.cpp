@@ -49,11 +49,20 @@ DList::BindLoadingOverheadGroups(const LoadingOverheadConfig& config) {
     std::lock_guard<std::mutex> lock(list_mtx_);
     validateLoadingOverheadBinding(config.memory, LoadingOverheadDimension::kMemory);
     validateLoadingOverheadBinding(config.file, LoadingOverheadDimension::kFile);
-    if (config.memory.has_value()) {
-        config.memory->group->bind(config.memory->max_runtime_unit);
-    }
-    if (config.file.has_value()) {
-        config.file->group->bind(config.file->max_runtime_unit);
+    bool memory_bound = false;
+    try {
+        if (config.memory.has_value()) {
+            config.memory->group->bind(config.memory->max_runtime_unit);
+            memory_bound = true;
+        }
+        if (config.file.has_value()) {
+            config.file->group->bind(config.file->max_runtime_unit);
+        }
+    } catch (...) {
+        if (memory_bound) {
+            config.memory->group->unbind(LoadingOverheadDimension::kMemory, config.memory->max_runtime_unit);
+        }
+        throw;
     }
 }
 
@@ -984,6 +993,13 @@ DList::handleWaitingRequests() {
         } else {
             const auto required_size =
                 request_ptr_ref->use_resource_promise ? attempted_requirement : request_ptr_ref->required_size;
+            if (request_ptr_ref->use_resource_promise && required_size != request_ptr_ref->required_size) {
+                auto request = std::move(request_ptr_ref);
+                waiting_queue_.pop();
+                request->required_size = required_size;
+                waiting_queue_.push(std::move(request));
+                continue;
+            }
             if (!max_resource_limit_.load().CanHold(required_size)) {
                 auto request = std::move(request_ptr_ref);
                 if (waiting_requests_map_.erase(request->request_id) > 0) {
