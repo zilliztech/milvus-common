@@ -345,6 +345,71 @@ TEST_F(DListTest, FractionalLoadingFactorScalesGroupDelta) {
     EXPECT_EQ(DLF::get_loading_memory(*scaled_dlist), ResourceUsage{});
 }
 
+TEST_F(DListTest, FractionalLoadingFactorKeepsGroupAggregateAdditive) {
+    auto scaled_config = eviction_config_;
+    scaled_config.loading_resource_factor = 1.5F;
+    auto scaled_dlist = std::make_shared<DList>(true, initial_limit, low_watermark, high_watermark, scaled_config);
+
+    auto group =
+        scaled_dlist->CreateLoadingOverheadGroup(LoadingOverheadDimension::kMemory, LoadingOverheadPolicy::Fixed(2));
+    ASSERT_NE(group, nullptr);
+    LoadingOverheadConfig binding{
+        LoadingOverheadGroupBinding{group},
+        std::nullopt,
+    };
+    scaled_dlist->BindLoadingOverheadGroups(binding);
+
+    auto first = std::move(scaled_dlist->ReserveLoadingResourceWithTimeout(
+                               /*loaded=*/{}, /*overhead=*/{1, 0}, &binding, std::chrono::milliseconds(0)))
+                     .get();
+    auto second = std::move(scaled_dlist->ReserveLoadingResourceWithTimeout(
+                                /*loaded=*/{}, /*overhead=*/{2, 0}, &binding, std::chrono::milliseconds(0)))
+                      .get();
+    ASSERT_TRUE(first.success);
+    ASSERT_TRUE(second.success);
+    EXPECT_EQ(DLF::get_loading_memory(*scaled_dlist), (ResourceUsage{3, 0}));
+
+    EXPECT_EQ(scaled_dlist->ReleaseLoadingResource(/*loaded=*/{}, /*overhead=*/{1, 0}, &binding), ResourceUsage{});
+    EXPECT_EQ(DLF::get_loading_memory(*scaled_dlist), (ResourceUsage{3, 0}));
+    EXPECT_EQ(scaled_dlist->ReleaseLoadingResource(/*loaded=*/{}, /*overhead=*/{2, 0}, &binding),
+              (ResourceUsage{2, 0}));
+    EXPECT_EQ(DLF::get_loading_memory(*scaled_dlist), ResourceUsage{});
+    scaled_dlist->UnbindLoadingOverheadGroups(binding);
+}
+
+TEST_F(DListTest, FractionalLoadingFactorScalesRequestLocalAndGroupSeparately) {
+    auto scaled_config = eviction_config_;
+    scaled_config.loading_resource_factor = 1.5F;
+    auto scaled_dlist = std::make_shared<DList>(true, initial_limit, low_watermark, high_watermark, scaled_config);
+
+    auto group =
+        scaled_dlist->CreateLoadingOverheadGroup(LoadingOverheadDimension::kMemory, LoadingOverheadPolicy::Fixed(1));
+    ASSERT_NE(group, nullptr);
+    LoadingOverheadConfig binding{
+        LoadingOverheadGroupBinding{group},
+        std::nullopt,
+    };
+    scaled_dlist->BindLoadingOverheadGroups(binding);
+
+    auto first = std::move(scaled_dlist->ReserveLoadingResourceWithTimeout(
+                               /*loaded=*/{1, 0}, /*overhead=*/{1, 0}, &binding, std::chrono::milliseconds(0)))
+                     .get();
+    auto second = std::move(scaled_dlist->ReserveLoadingResourceWithTimeout(
+                                /*loaded=*/{}, /*overhead=*/{1, 0}, &binding, std::chrono::milliseconds(0)))
+                      .get();
+    ASSERT_TRUE(first.success);
+    ASSERT_TRUE(second.success);
+    EXPECT_EQ(DLF::get_loading_memory(*scaled_dlist), (ResourceUsage{4, 0}));
+
+    EXPECT_EQ(scaled_dlist->ReleaseLoadingResource(/*loaded=*/{1, 0}, /*overhead=*/{1, 0}, &binding),
+              (ResourceUsage{1, 0}));
+    EXPECT_EQ(DLF::get_loading_memory(*scaled_dlist), (ResourceUsage{2, 0}));
+    EXPECT_EQ(scaled_dlist->ReleaseLoadingResource(/*loaded=*/{}, /*overhead=*/{1, 0}, &binding),
+              (ResourceUsage{1, 0}));
+    EXPECT_EQ(DLF::get_loading_memory(*scaled_dlist), ResourceUsage{});
+    scaled_dlist->UnbindLoadingOverheadGroups(binding);
+}
+
 TEST_F(DListTest, BindingChangesSerializeWithAdmissionTransactions) {
     auto group = CreateMemoryGroup(LoadingOverheadPolicy::Executor(1));
     ASSERT_NE(group, nullptr);
