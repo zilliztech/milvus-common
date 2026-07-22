@@ -36,6 +36,22 @@ ClampNonNegative(std::atomic<ResourceUsage>& counter, LogFn&& log_fn) {
     }
 }
 
+namespace {
+
+ResourceUsage
+RequestLocalLoading(const ResourceUsage& loaded, const ResourceUsage& overhead, const LoadingOverheadConfig* config) {
+    auto local = loaded;
+    if (config == nullptr || !config->memory.has_value()) {
+        local.memory_bytes += overhead.memory_bytes;
+    }
+    if (config == nullptr || !config->file.has_value()) {
+        local.file_bytes += overhead.file_bytes;
+    }
+    return local;
+}
+
+}  // namespace
+
 LoadingOverheadGroupHandle
 DList::CreateLoadingOverheadGroup(LoadingOverheadDimension dimension, LoadingOverheadPolicy policy) {
     if (dimension != LoadingOverheadDimension::kMemory && dimension != LoadingOverheadDimension::kFile) {
@@ -292,7 +308,7 @@ DList::validateLoadingOverheadBinding(const std::optional<LoadingOverheadGroupBi
     binding->group->validateBinding(dimension, binding->max_runtime_unit);
 }
 
-ResourceUsage
+DList::LoadingOverheadDelta
 DList::reserveLoadingOverhead(const LoadingOverheadConfig& config, const ResourceUsage& overhead) {
     if (!overhead.AllGEZero()) {
         throw std::invalid_argument("loading overhead must be non-negative");
@@ -301,13 +317,21 @@ DList::reserveLoadingOverhead(const LoadingOverheadConfig& config, const Resourc
     validateLoadingOverheadBinding(config.memory, LoadingOverheadDimension::kMemory);
     validateLoadingOverheadBinding(config.file, LoadingOverheadDimension::kFile);
 
-    auto delta = overhead;
+    LoadingOverheadDelta delta{.unscaled_delta = overhead};
+    ResourceUsage previous;
+    ResourceUsage current;
     if (config.memory.has_value()) {
-        delta.memory_bytes = config.memory->group->reserve(overhead.memory_bytes);
+        previous.memory_bytes = config.memory->group->overhead_reserved_;
+        delta.unscaled_delta.memory_bytes = config.memory->group->reserve(overhead.memory_bytes);
+        current.memory_bytes = config.memory->group->overhead_reserved_;
     }
     if (config.file.has_value()) {
-        delta.file_bytes = config.file->group->reserve(overhead.file_bytes);
+        previous.file_bytes = config.file->group->overhead_reserved_;
+        delta.unscaled_delta.file_bytes = config.file->group->reserve(overhead.file_bytes);
+        current.file_bytes = config.file->group->overhead_reserved_;
     }
+    delta.scaled_group_delta =
+        current * eviction_config_.loading_resource_factor - previous * eviction_config_.loading_resource_factor;
     return delta;
 }
 
@@ -322,37 +346,44 @@ DList::rollbackLoadingOverhead(const LoadingOverheadConfig& config, const Resour
     }
 }
 
-ResourceUsage
+DList::LoadingOverheadDelta
 DList::releaseLoadingOverhead(const LoadingOverheadConfig& config, const ResourceUsage& overhead) {
     validateLoadingOverheadBinding(config.memory, LoadingOverheadDimension::kMemory);
     validateLoadingOverheadBinding(config.file, LoadingOverheadDimension::kFile);
 
-    auto delta = overhead;
+    LoadingOverheadDelta delta{.unscaled_delta = overhead};
+    ResourceUsage previous;
+    ResourceUsage current;
     if (config.memory.has_value()) {
-        delta.memory_bytes = config.memory->group->release(overhead.memory_bytes);
+        previous.memory_bytes = config.memory->group->overhead_reserved_;
+        delta.unscaled_delta.memory_bytes = config.memory->group->release(overhead.memory_bytes);
+        current.memory_bytes = config.memory->group->overhead_reserved_;
     }
     if (config.file.has_value()) {
-        delta.file_bytes = config.file->group->release(overhead.file_bytes);
+        previous.file_bytes = config.file->group->overhead_reserved_;
+        delta.unscaled_delta.file_bytes = config.file->group->release(overhead.file_bytes);
+        current.file_bytes = config.file->group->overhead_reserved_;
     }
+    delta.scaled_group_delta =
+        previous * eviction_config_.loading_resource_factor - current * eviction_config_.loading_resource_factor;
     return delta;
 }
 
 DList::LoadingResourceReservationAttempt
 DList::reserveResourceInternalWithOverhead(const ResourceUsage& loaded, const ResourceUsage& overhead,
                                            const LoadingOverheadConfig* config) {
-    const auto delta = config != nullptr ? reserveLoadingOverhead(*config, overhead) : overhead;
+    const auto delta = config != nullptr ? reserveLoadingOverhead(*config, overhead)
+                                         : LoadingOverheadDelta{.unscaled_delta = overhead};
 
     auto rollback = [this, config, overhead, delta]() {
         if (config != nullptr) {
-            rollbackLoadingOverhead(*config, overhead, delta);
+            rollbackLoadingOverhead(*config, overhead, delta.unscaled_delta);
         }
     };
 
-    const auto unscaled = loaded + delta;
-    // FIXME: Fractional scaling is not additive. When Group Reserve and Release
-    // partition the same logical delta differently (for example after a policy
-    // update), per-transition rounding can make total_loading_size_ drift.
-    const auto scaled = unscaled * eviction_config_.loading_resource_factor;
+    const auto unscaled = loaded + delta.unscaled_delta;
+    const auto scaled = RequestLocalLoading(loaded, overhead, config) * eviction_config_.loading_resource_factor +
+                        delta.scaled_group_delta;
 
     if (!max_resource_limit_.load().CanHold(scaled)) {
         rollback();
@@ -367,7 +398,7 @@ DList::reserveResourceInternalWithOverhead(const ResourceUsage& loaded, const Re
     LOG_TRACE(
         "[MCL] reserve with loading-overhead Groups: loaded={}, overhead={}, delta={}, unscaled={}, scaled={}, "
         "total_loading={}",
-        loaded.ToString(), overhead.ToString(), delta.ToString(), unscaled.ToString(), scaled.ToString(),
+        loaded.ToString(), overhead.ToString(), delta.unscaled_delta.ToString(), unscaled.ToString(), scaled.ToString(),
         total_loading_size_.load().ToString());
     return {.result = LoadingResourceReservationResult{.success = true, .reserved = unscaled}, .required_size = scaled};
 }
@@ -751,15 +782,17 @@ ResourceUsage
 DList::ReleaseLoadingResource(const ResourceUsage& loaded, const ResourceUsage& overhead,
                               const LoadingOverheadConfig* config) {
     std::vector<std::unique_ptr<WaitingRequest>> to_destroy;
-    auto delta = overhead;
+    LoadingOverheadDelta delta{.unscaled_delta = overhead};
     ResourceUsage unscaled;
     {
         std::unique_lock<std::mutex> lock(list_mtx_);
         if (config != nullptr) {
             delta = releaseLoadingOverhead(*config, overhead);
         }
-        unscaled = loaded + delta;
-        total_loading_size_ -= unscaled * eviction_config_.loading_resource_factor;
+        unscaled = loaded + delta.unscaled_delta;
+        const auto scaled = RequestLocalLoading(loaded, overhead, config) * eviction_config_.loading_resource_factor +
+                            delta.scaled_group_delta;
+        total_loading_size_ -= scaled;
         ClampNonNegative(total_loading_size_, [&](const ResourceUsage& curr) {
             LOG_ERROR("[MCL] total_loading_size_ negative after Group release: loaded={}, overhead={}, current={}",
                       loaded.ToString(), overhead.ToString(), curr.ToString());
@@ -979,11 +1012,15 @@ DList::handleWaitingRequests() {
                 // Request was already handled by timeout/cancel, rollback.
                 LOG_WARN("[MCL] Request {} was already handled by timeout/cancel, rolling back.", request->request_id);
                 if (request->use_resource_promise) {
-                    auto delta = request->overhead;
-                    if (const auto* config = request->loadingOverheadConfig(); config != nullptr) {
+                    const auto* config = request->loadingOverheadConfig();
+                    auto delta = LoadingOverheadDelta{.unscaled_delta = request->overhead};
+                    if (config != nullptr) {
                         delta = releaseLoadingOverhead(*config, request->overhead);
                     }
-                    total_loading_size_ -= (request->loaded + delta) * eviction_config_.loading_resource_factor;
+                    const auto scaled = RequestLocalLoading(request->loaded, request->overhead, config) *
+                                            eviction_config_.loading_resource_factor +
+                                        delta.scaled_group_delta;
+                    total_loading_size_ -= scaled;
                 } else {
                     total_loading_size_ -= actual;
                 }

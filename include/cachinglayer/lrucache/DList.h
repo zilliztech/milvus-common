@@ -270,6 +270,11 @@ class DList : public std::enable_shared_from_this<DList> {
         ResourceUsage required_size;
     };
 
+    struct LoadingOverheadDelta {
+        ResourceUsage unscaled_delta;
+        ResourceUsage scaled_group_delta;
+    };
+
     // Comparator for priority queue (smaller size and earlier deadline have higher priority)
     struct WaitingRequestComparator {
         bool
@@ -300,14 +305,14 @@ class DList : public std::enable_shared_from_this<DList> {
     validateLoadingOverheadBinding(const std::optional<LoadingOverheadGroupBinding>& binding,
                                    LoadingOverheadDimension dimension) const;
 
-    ResourceUsage
+    LoadingOverheadDelta
     reserveLoadingOverhead(const LoadingOverheadConfig& config, const ResourceUsage& overhead);
 
     void
     rollbackLoadingOverhead(const LoadingOverheadConfig& config, const ResourceUsage& overhead,
                             const ResourceUsage& reserved) noexcept;
 
-    ResourceUsage
+    LoadingOverheadDelta
     releaseLoadingOverhead(const LoadingOverheadConfig& config, const ResourceUsage& overhead);
 
     // Reserve with Groups under lock using the factor-adjusted target transition.
