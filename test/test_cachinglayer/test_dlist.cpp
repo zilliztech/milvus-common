@@ -216,6 +216,40 @@ TEST_F(DListTest, PolicyExpansionReconcilesOnNextReserveAndRollsBackFailure) {
     EXPECT_EQ(dlist->ReleaseLoadingResource(/*loaded=*/{}, /*overhead=*/{500, 0}, &binding), (ResourceUsage{50, 0}));
 }
 
+TEST_F(DListTest, PolicyGrowthReheapsIndefiniteWaiters) {
+    ASSERT_TRUE(std::move(dlist->ReserveLoadingResourceWithTimeout({100, 0}, std::chrono::milliseconds(0))).get());
+
+    auto group = CreateMemoryGroup(LoadingOverheadPolicy::Fixed(5));
+    ASSERT_NE(group, nullptr);
+    LoadingOverheadConfig binding{
+        LoadingOverheadGroupBinding{group},
+        std::nullopt,
+    };
+    dlist->BindLoadingOverheadGroups(binding);
+
+    auto growing = dlist->ReserveLoadingResourceWithTimeout(
+        /*loaded=*/{}, /*overhead=*/{20, 0}, &binding, std::chrono::milliseconds(-1));
+    auto smaller = dlist->ReserveLoadingResourceWithTimeout({8, 0}, std::chrono::milliseconds(-1));
+    ASSERT_FALSE(growing.isReady());
+    ASSERT_FALSE(smaller.isReady());
+
+    ASSERT_EQ(dlist->UpdateLoadingOverheadGroup(group, LoadingOverheadPolicy::Fixed(20)),
+              LoadingOverheadUpdateResult::kApplied);
+    dlist->ReleaseLoadingResource({10, 0});
+
+    EXPECT_TRUE(smaller.isReady());
+    EXPECT_FALSE(growing.isReady());
+
+    dlist->ReleaseLoadingResource({90, 0});
+    EXPECT_TRUE(std::move(smaller).get());
+    auto growing_result = std::move(growing).get();
+    ASSERT_TRUE(growing_result.success);
+    dlist->ReleaseLoadingResource({8, 0});
+    EXPECT_EQ(dlist->ReleaseLoadingResource(/*loaded=*/{}, /*overhead=*/{20, 0}, &binding), (ResourceUsage{20, 0}));
+    dlist->UnbindLoadingOverheadGroups(binding);
+    EXPECT_EQ(get_loading_memory(), ResourceUsage{});
+}
+
 TEST_F(DListTest, FailedReserveRollsBackActiveDemand) {
     auto group = CreateMemoryGroup(LoadingOverheadPolicy::Executor(1));
     ASSERT_NE(group, nullptr);

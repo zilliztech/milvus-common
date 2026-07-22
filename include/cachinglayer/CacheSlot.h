@@ -82,8 +82,14 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         if (loading_overhead_config_) {
             dlist_->BindLoadingOverheadGroups(*loading_overhead_config_);
         }
+        auto unbind_on_failure = folly::makeGuard([this]() {
+            if (loading_overhead_config_) {
+                dlist_->UnbindLoadingOverheadGroups(*loading_overhead_config_);
+            }
+        });
         monitor::cache_slot_count(cell_data_type_, storage_type_).Increment();
         monitor::cache_cell_count(cell_data_type_, storage_type_).Increment(translator_->num_cells());
+        unbind_on_failure.dismiss();
     }
 
     CacheSlot(const CacheSlot&) = delete;
