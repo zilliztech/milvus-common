@@ -98,6 +98,11 @@ class DListTestFriend {
         }
     }
 
+    static std::unique_lock<std::mutex>
+    test_lock_list(DList* dlist) {
+        return std::unique_lock<std::mutex>(dlist->list_mtx_);
+    }
+
     // nodes are from tail to head
     static void
     verify_list(DList* dlist, std::vector<ListNode*> nodes) {
