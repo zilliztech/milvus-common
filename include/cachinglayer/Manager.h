@@ -58,7 +58,7 @@ class Manager {
         AssertInfo(dlist_ != nullptr,
                    "dlist_ must be initialized by ConfigureTieredStorage before any CacheSlot is created");
         if (ctx && ctx->cancellation_token.isCancellationRequested()) {
-            throw std::runtime_error("Operation cancelled, stop creating cache slot");
+            ThrowInfo(ErrorCode::FollyCancel, "Operation cancelled, stop creating cache slot");
         }
         auto config = TieredStorageConfig::GetInstance().GetSnapshot();
         auto evictable = translator->meta()->support_eviction && eviction_enabled_;
