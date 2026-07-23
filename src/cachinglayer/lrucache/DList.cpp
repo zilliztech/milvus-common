@@ -948,8 +948,13 @@ std::vector<std::unique_ptr<DList::WaitingRequest>>
 DList::handleWaitingRequests() {
     // Collect requests to destroy outside the lock to avoid deadlock with cancel callbacks.
     std::vector<std::unique_ptr<WaitingRequest>> requests_to_destroy;
+    std::vector<std::unique_ptr<WaitingRequest>> deferred_requests;
+    std::optional<std::chrono::steady_clock::time_point> blocked_deadline;
 
     while (!waiting_queue_.empty()) {
+        if (blocked_deadline.has_value() && waiting_queue_.top()->deadline != blocked_deadline.value()) {
+            break;
+        }
         auto& request_ptr_ref = const_cast<std::unique_ptr<WaitingRequest>&>(waiting_queue_.top());
 
         // Check if request was already handled by timeout/cancel (not in map anymore)
@@ -1030,13 +1035,6 @@ DList::handleWaitingRequests() {
         } else {
             const auto required_size =
                 request_ptr_ref->use_resource_promise ? attempted_requirement : request_ptr_ref->required_size;
-            if (request_ptr_ref->use_resource_promise && required_size != request_ptr_ref->required_size) {
-                auto request = std::move(request_ptr_ref);
-                waiting_queue_.pop();
-                request->required_size = required_size;
-                waiting_queue_.push(std::move(request));
-                continue;
-            }
             if (!max_resource_limit_.load().CanHold(required_size)) {
                 auto request = std::move(request_ptr_ref);
                 if (waiting_requests_map_.erase(request->request_id) > 0) {
@@ -1050,12 +1048,19 @@ DList::handleWaitingRequests() {
                 waiting_queue_.pop();
                 continue;
             }
-            LOG_DEBUG("[MCL] Request {} of size {} cannot be satisfied, breaking.", request_ptr_ref->request_id,
-                      required_size.ToString());
-            // Cannot satisfy right now but may succeed later.
-            // The queue is ordered by deadline, so stop here.
-            break;
+            auto request = std::move(request_ptr_ref);
+            waiting_queue_.pop();
+            request->required_size = required_size;
+            if (!blocked_deadline.has_value()) {
+                blocked_deadline = request->deadline;
+            }
+            LOG_DEBUG("[MCL] Request {} of size {} cannot be satisfied, checking peers with the same deadline.",
+                      request->request_id, required_size.ToString());
+            deferred_requests.push_back(std::move(request));
         }
+    }
+    for (auto& request : deferred_requests) {
+        waiting_queue_.push(std::move(request));
     }
     waiting_queue_empty_ = waiting_queue_.empty();
     return requests_to_destroy;

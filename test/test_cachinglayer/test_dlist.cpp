@@ -250,6 +250,52 @@ TEST_F(DListTest, PolicyGrowthReheapsIndefiniteWaiters) {
     EXPECT_EQ(get_loading_memory(), ResourceUsage{});
 }
 
+TEST_F(DListTest, PolicyShrinkRechecksNonTopIndefiniteWaiter) {
+    ASSERT_TRUE(std::move(dlist->ReserveLoadingResourceWithTimeout({100, 0}, std::chrono::milliseconds(0))).get());
+
+    auto blocking_group = CreateMemoryGroup(LoadingOverheadPolicy::Fixed(10));
+    auto shrinking_group = CreateMemoryGroup(LoadingOverheadPolicy::Fixed(20));
+    ASSERT_NE(blocking_group, nullptr);
+    ASSERT_NE(shrinking_group, nullptr);
+    LoadingOverheadConfig blocking_binding{
+        LoadingOverheadGroupBinding{blocking_group},
+        std::nullopt,
+    };
+    LoadingOverheadConfig shrinking_binding{
+        LoadingOverheadGroupBinding{shrinking_group},
+        std::nullopt,
+    };
+    dlist->BindLoadingOverheadGroups(blocking_binding);
+    dlist->BindLoadingOverheadGroups(shrinking_binding);
+
+    auto blocking = dlist->ReserveLoadingResourceWithTimeout(
+        /*loaded=*/{}, /*overhead=*/{100, 0}, &blocking_binding, std::chrono::milliseconds(-1));
+    auto shrinking = dlist->ReserveLoadingResourceWithTimeout(
+        /*loaded=*/{}, /*overhead=*/{100, 0}, &shrinking_binding, std::chrono::milliseconds(-1));
+    ASSERT_FALSE(blocking.isReady());
+    ASSERT_FALSE(shrinking.isReady());
+
+    ASSERT_EQ(dlist->UpdateLoadingOverheadGroup(shrinking_group, LoadingOverheadPolicy::Fixed(5)),
+              LoadingOverheadUpdateResult::kApplied);
+    dlist->ReleaseLoadingResource({8, 0});
+
+    EXPECT_TRUE(shrinking.isReady());
+    EXPECT_FALSE(blocking.isReady());
+
+    dlist->ReleaseLoadingResource({92, 0});
+    auto shrinking_result = std::move(shrinking).get();
+    auto blocking_result = std::move(blocking).get();
+    ASSERT_TRUE(shrinking_result.success);
+    ASSERT_TRUE(blocking_result.success);
+    EXPECT_EQ(dlist->ReleaseLoadingResource(/*loaded=*/{}, /*overhead=*/{100, 0}, &shrinking_binding),
+              (ResourceUsage{5, 0}));
+    EXPECT_EQ(dlist->ReleaseLoadingResource(/*loaded=*/{}, /*overhead=*/{100, 0}, &blocking_binding),
+              (ResourceUsage{10, 0}));
+    dlist->UnbindLoadingOverheadGroups(shrinking_binding);
+    dlist->UnbindLoadingOverheadGroups(blocking_binding);
+    EXPECT_EQ(get_loading_memory(), ResourceUsage{});
+}
+
 TEST_F(DListTest, FailedReserveRollsBackActiveDemand) {
     auto group = CreateMemoryGroup(LoadingOverheadPolicy::Executor(1));
     ASSERT_NE(group, nullptr);
