@@ -83,6 +83,13 @@ class DList : public std::enable_shared_from_this<DList> {
         return LoadingOverheadTracker::kInvalidHandle;
     }
 
+    void
+    RefreshLoadingOverheadUpperBound(uint64_t overhead_handle, const LoadingOverheadConfig& config) {
+        if (loading_overhead_tracker_) {
+            loading_overhead_tracker_->RefreshUpperBound(overhead_handle, config);
+        }
+    }
+
     uint64_t
     RegisterLoadingOverhead(const std::string& group, const ResourceUsage& upper_bound) {
         if (loading_overhead_tracker_) {

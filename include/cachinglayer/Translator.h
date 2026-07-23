@@ -91,6 +91,17 @@ class Translator {
     virtual Meta*
     meta() = 0;
 
+    // Return the current loading-overhead configuration. Translators whose
+    // upper bound depends on refreshable runtime settings can override this;
+    // CacheSlot re-reads it before every load reservation.
+    // Configured dimensions and group names must remain stable for the lifetime
+    // of a CacheSlot. Use INT64_MAX at construction for a dimension that may
+    // transition from uncapped to capped later.
+    virtual std::optional<LoadingOverheadConfig>
+    loading_overhead_config() {
+        return meta()->loading_overhead;
+    }
+
     // Translator may choose to fetch more than requested cells. The default behavior is to not include extra cells.
     virtual std::vector<cid_t>
     bonus_cells_to_be_loaded(const std::vector<cid_t>& cids) const {

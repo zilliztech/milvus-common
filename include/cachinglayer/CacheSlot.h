@@ -82,8 +82,8 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         monitor::cache_cell_count(cell_data_type_, storage_type_).Increment(translator_->num_cells());
         // Register after all potentially-throwing operations, so that if the constructor
         // fails, we don't leak a ref_count (destructor won't run for incomplete objects).
-        if (auto& lo = translator_->meta()->loading_overhead) {
-            overhead_handle_ = dlist_->RegisterLoadingOverhead(*lo);
+        if (auto loading_overhead = translator_->loading_overhead_config()) {
+            overhead_handle_ = dlist_->RegisterLoadingOverhead(*loading_overhead);
         }
     }
 
@@ -441,6 +441,9 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         //   pass through unchanged. The tracker returns the combined incremental DList delta.
         std::vector<cid_t> loading_cids;
         try {
+            if (auto loading_overhead = translator_->loading_overhead_config()) {
+                dlist_->RefreshLoadingOverheadUpperBound(overhead_handle_, *loading_overhead);
+            }
             auto start = std::chrono::steady_clock::now();
 
             loading_cids = std::vector<cid_t>(cids.begin(), cids.end());
