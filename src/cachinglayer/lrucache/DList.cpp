@@ -325,6 +325,13 @@ DList::reserveLoadingOverhead(const LoadingOverheadConfig& config, const Resourc
     validateLoadingOverheadBinding(config.memory, LoadingOverheadDimension::kMemory);
     validateLoadingOverheadBinding(config.file, LoadingOverheadDimension::kFile);
 
+    if (config.memory.has_value()) {
+        config.memory->group->validateReserve(overhead.memory_bytes);
+    }
+    if (config.file.has_value()) {
+        config.file->group->validateReserve(overhead.file_bytes);
+    }
+
     LoadingOverheadDelta delta{.unscaled_delta = overhead};
     ResourceUsage previous;
     ResourceUsage current;
@@ -1004,11 +1011,23 @@ DList::handleWaitingRequests() {
         ResourceUsage actual{};
         auto attempted_requirement = request_ptr_ref->required_size;
         if (request_ptr_ref->use_resource_promise) {
-            auto attempt = reserveResourceInternalWithOverhead(request_ptr_ref->loaded, request_ptr_ref->overhead,
-                                                               request_ptr_ref->loadingOverheadConfig());
-            fulfilled = attempt.result.success;
-            actual = attempt.result.reserved;
-            attempted_requirement = attempt.required_size;
+            try {
+                auto attempt = reserveResourceInternalWithOverhead(request_ptr_ref->loaded, request_ptr_ref->overhead,
+                                                                   request_ptr_ref->loadingOverheadConfig());
+                fulfilled = attempt.result.success;
+                actual = attempt.result.reserved;
+                attempted_requirement = attempt.required_size;
+            } catch (const std::overflow_error& error) {
+                auto request = std::move(request_ptr_ref);
+                waiting_queue_.pop();
+                if (waiting_requests_map_.erase(request->request_id) > 0) {
+                    LOG_WARN("[MCL] Request {} failed while retrying loading-overhead reservation: {}",
+                             request->request_id, error.what());
+                    request->setValue(false);
+                }
+                requests_to_destroy.push_back(std::move(request));
+                continue;
+            }
         } else {
             if (reserveResourceInternal(request_ptr_ref->required_size)) {
                 fulfilled = true;

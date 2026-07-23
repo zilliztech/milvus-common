@@ -180,6 +180,39 @@ TEST_F(LoadingOverheadGroupTest, ExecutorBoundSaturatesOnOverflow) {
     EXPECT_EQ(Release(config, {500, 0}), (ResourceUsage{500, 0}));
 }
 
+TEST_F(LoadingOverheadGroupTest, AggregateOverflowIsRejectedBeforeEitherDimensionMutates) {
+    auto memory_group = CreateMemoryGroup(LoadingOverheadPolicy::Fixed(10));
+    auto file_group =
+        dlist_->CreateLoadingOverheadGroup(LoadingOverheadDimension::kFile, LoadingOverheadPolicy::Fixed(1));
+    ASSERT_NE(memory_group, nullptr);
+    ASSERT_NE(file_group, nullptr);
+
+    LoadingOverheadConfig file_only{
+        std::nullopt,
+        LoadingOverheadGroupBinding{file_group},
+    };
+    LoadingOverheadConfig both_dimensions{
+        LoadingOverheadGroupBinding{memory_group},
+        LoadingOverheadGroupBinding{file_group},
+    };
+    dlist_->BindLoadingOverheadGroups(file_only);
+    dlist_->BindLoadingOverheadGroups(both_dimensions);
+
+    constexpr auto kMax = std::numeric_limits<int64_t>::max();
+    EXPECT_EQ(Reserve(file_only, {0, kMax}), (ResourceUsage{0, 1}));
+    ASSERT_THROW(
+        {
+            (void)std::move(dlist_->ReserveLoadingResourceWithTimeout(
+                                /*loaded=*/{}, /*overhead=*/{5, 1}, &both_dimensions, std::chrono::milliseconds(0)))
+                .get();
+        },
+        std::overflow_error);
+
+    EXPECT_EQ(Reserve(both_dimensions, {10, 0}), (ResourceUsage{10, 0}));
+    EXPECT_EQ(Release(both_dimensions, {10, 0}), (ResourceUsage{10, 0}));
+    EXPECT_EQ(Release(file_only, {0, kMax}), (ResourceUsage{0, 1}));
+}
+
 TEST_F(LoadingOverheadGroupTest, BoundedGroupRequiresBoundRuntimeUnit) {
     auto executor = CreateMemoryGroup(LoadingOverheadPolicy::Executor(1));
 
