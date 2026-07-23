@@ -90,8 +90,19 @@ LoadingOverheadGroup::updatePolicy(LoadingOverheadPolicy policy) {
     return LoadingOverheadUpdateResult::kApplied;
 }
 
+void
+LoadingOverheadGroup::validateReserve(int64_t overhead) const {
+    if (overhead < 0) {
+        throw std::invalid_argument("loading-overhead Group demand must be non-negative");
+    }
+    if (sum_of_overhead_ > std::numeric_limits<int64_t>::max() - overhead) {
+        throw std::overflow_error("loading-overhead Group aggregate demand exceeds int64_t");
+    }
+}
+
 int64_t
 LoadingOverheadGroup::reserve(int64_t overhead) {
+    validateReserve(overhead);
     sum_of_overhead_ += overhead;
     const auto delta = std::max(computeTarget() - overhead_reserved_, int64_t{0});
     overhead_reserved_ += delta;

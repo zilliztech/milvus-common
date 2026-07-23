@@ -129,6 +129,9 @@ class LoadingOverheadGroup {
     LoadingOverheadUpdateResult
     updatePolicy(LoadingOverheadPolicy policy);
 
+    void
+    validateReserve(int64_t overhead) const;
+
     int64_t
     reserve(int64_t overhead);
 

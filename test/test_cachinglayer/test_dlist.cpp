@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <future>
+#include <limits>
 #include <map>
 #include <memory>
 #include <thread>
@@ -242,6 +243,57 @@ TEST_F(DListTest, QueuedRequirementAboveCapacityWaitsForLaterShrink) {
     dlist->ReleaseLoadingResource({10, 0});
     dlist->UnbindLoadingOverheadGroups(binding);
     EXPECT_EQ(get_loading_memory(), ResourceUsage{});
+}
+
+TEST_F(DListTest, AggregateOverflowDuringWaiterRetryFailsCleanly) {
+    auto no_background_eviction = eviction_config_;
+    no_background_eviction.background_eviction_enabled = false;
+    auto local_dlist =
+        std::make_shared<DList>(true, initial_limit, low_watermark, high_watermark, no_background_eviction);
+
+    ASSERT_TRUE(std::move(local_dlist->ReserveLoadingResourceWithTimeout(
+                              /*size=*/{100, 0}, std::chrono::milliseconds(0)))
+                    .get());
+
+    auto group =
+        local_dlist->CreateLoadingOverheadGroup(LoadingOverheadDimension::kMemory, LoadingOverheadPolicy::Fixed(0));
+    ASSERT_NE(group, nullptr);
+    LoadingOverheadConfig binding{
+        LoadingOverheadGroupBinding{group},
+        std::nullopt,
+    };
+    local_dlist->BindLoadingOverheadGroups(binding);
+
+    auto deferred_peer = local_dlist->ReserveLoadingResourceWithTimeout(
+        /*size=*/{1, 0}, std::chrono::milliseconds(-1));
+    auto overflow_waiter = local_dlist->ReserveLoadingResourceWithTimeout(
+        /*loaded=*/{2, 0}, /*overhead=*/{10, 0}, &binding, std::chrono::milliseconds(-1));
+    ASSERT_FALSE(deferred_peer.isReady());
+    ASSERT_FALSE(overflow_waiter.isReady());
+
+    constexpr auto kLargeOverhead = std::numeric_limits<int64_t>::max() - 5;
+    auto large_reservation =
+        std::move(local_dlist->ReserveLoadingResourceWithTimeout(
+                      /*loaded=*/{}, /*overhead=*/{kLargeOverhead, 0}, &binding, std::chrono::milliseconds(0)))
+            .get();
+    ASSERT_TRUE(large_reservation.success);
+    ASSERT_EQ(large_reservation.reserved, ResourceUsage{});
+
+    ASSERT_NO_THROW(EXPECT_EQ(local_dlist->UpdateLoadingOverheadGroup(group, LoadingOverheadPolicy::Fixed(0)),
+                              LoadingOverheadUpdateResult::kApplied));
+    ASSERT_TRUE(overflow_waiter.isReady());
+    EXPECT_FALSE(std::move(overflow_waiter).get().success);
+    EXPECT_FALSE(deferred_peer.isReady());
+
+    EXPECT_EQ(local_dlist->ReleaseLoadingResource(
+                  /*loaded=*/{}, /*overhead=*/{kLargeOverhead, 0}, &binding),
+              ResourceUsage{});
+    local_dlist->ReleaseLoadingResource({100, 0});
+    ASSERT_TRUE(deferred_peer.isReady());
+    EXPECT_TRUE(std::move(deferred_peer).get());
+    local_dlist->ReleaseLoadingResource({1, 0});
+    local_dlist->UnbindLoadingOverheadGroups(binding);
+    EXPECT_EQ(DLF::get_loading_memory(*local_dlist), ResourceUsage{});
 }
 
 TEST_F(DListTest, UnbindingLargestRuntimeUnitWakesWaiters) {
