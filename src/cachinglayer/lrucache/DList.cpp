@@ -84,19 +84,25 @@ DList::BindLoadingOverheadGroups(const LoadingOverheadConfig& config) {
 
 void
 DList::UnbindLoadingOverheadGroups(const LoadingOverheadConfig& config) {
-    std::lock_guard<std::mutex> lock(list_mtx_);
-    if (config.memory.has_value()) {
-        if (config.memory->group) {
-            config.memory->group->unbind(LoadingOverheadDimension::kMemory, config.memory->max_runtime_unit);
-        } else {
-            LOG_ERROR("[MCL] LoadingOverheadGroup cannot unbind invalid memory Group");
+    std::vector<std::unique_ptr<WaitingRequest>> to_destroy;
+    {
+        std::lock_guard<std::mutex> lock(list_mtx_);
+        if (config.memory.has_value()) {
+            if (config.memory->group) {
+                config.memory->group->unbind(LoadingOverheadDimension::kMemory, config.memory->max_runtime_unit);
+            } else {
+                LOG_ERROR("[MCL] LoadingOverheadGroup cannot unbind invalid memory Group");
+            }
         }
-    }
-    if (config.file.has_value()) {
-        if (config.file->group) {
-            config.file->group->unbind(LoadingOverheadDimension::kFile, config.file->max_runtime_unit);
-        } else {
-            LOG_ERROR("[MCL] LoadingOverheadGroup cannot unbind invalid file Group");
+        if (config.file.has_value()) {
+            if (config.file->group) {
+                config.file->group->unbind(LoadingOverheadDimension::kFile, config.file->max_runtime_unit);
+            } else {
+                LOG_ERROR("[MCL] LoadingOverheadGroup cannot unbind invalid file Group");
+            }
+        }
+        if (!waiting_queue_empty_) {
+            to_destroy = handleWaitingRequests();
         }
     }
 }
@@ -125,11 +131,13 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& loaded, const Reso
         return folly::makeSemiFuture(attempt.result);
     }
 
-    if (!max_resource_limit_.load().CanHold(attempt.required_size)) {
+    const auto minimum_required_size =
+        RequestLocalLoading(loaded, overhead, config) * eviction_config_.loading_resource_factor;
+    if (!max_resource_limit_.load().CanHold(minimum_required_size)) {
         LOG_ERROR(
-            "[MCL] Failed to reserve Group-aware loading resource because the policy-derived requirement={} "
+            "[MCL] Failed to reserve Group-aware loading resource because the minimum requirement={} "
             "exceeds capacity={}",
-            attempt.required_size.ToString(), max_resource_limit_.load().ToString());
+            minimum_required_size.ToString(), max_resource_limit_.load().ToString());
         return folly::makeSemiFuture(LoadingResourceReservationResult{});
     }
 
@@ -1035,13 +1043,19 @@ DList::handleWaitingRequests() {
         } else {
             const auto required_size =
                 request_ptr_ref->use_resource_promise ? attempted_requirement : request_ptr_ref->required_size;
-            if (!max_resource_limit_.load().CanHold(required_size)) {
+            const auto minimum_required_size =
+                request_ptr_ref->use_resource_promise
+                    ? RequestLocalLoading(request_ptr_ref->loaded, request_ptr_ref->overhead,
+                                          request_ptr_ref->loadingOverheadConfig()) *
+                          eviction_config_.loading_resource_factor
+                    : required_size;
+            if (!max_resource_limit_.load().CanHold(minimum_required_size)) {
                 auto request = std::move(request_ptr_ref);
                 if (waiting_requests_map_.erase(request->request_id) > 0) {
                     LOG_WARN(
-                        "[MCL] Request {} is permanently impossible (required_size={} capacity={}), "
+                        "[MCL] Request {} is permanently impossible (minimum_required_size={} capacity={}), "
                         "failing immediately.",
-                        request->request_id, required_size.ToString(), max_resource_limit_.load().ToString());
+                        request->request_id, minimum_required_size.ToString(), max_resource_limit_.load().ToString());
                     request->setValue(false);
                 }
                 requests_to_destroy.push_back(std::move(request));
