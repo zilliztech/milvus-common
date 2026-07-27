@@ -130,11 +130,32 @@ FailureCStatus(int code, const std::string& msg) {
     return CStatus{code, strdup(msg.data())};
 }
 
+// Observability hook for the cgo boundary: fired whenever FailureCStatus
+// receives an exception that is NOT a SegcoreError (so its typed error code is
+// lost and the failure collapses to UnexpectedError). The consumer (milvus)
+// registers an observer that bumps a metric / logs; a shrinking hit rate means
+// explicit error classification coverage is improving. This header stays free
+// of any metrics dependency -- same observer pattern as the Go-side
+// RegisterUnmappedSegcoreCodeObserver.
+using UntypedCgoExceptionObserver = void (*)(const char* what);
+
+void
+RegisterUntypedCgoExceptionObserver(UntypedCgoExceptionObserver observer);
+
+namespace impl {
+// Best-effort, noexcept: runs inside FailureCStatus's conversion path, so a
+// throwing observer must never replace the original failure or escape the
+// cgo boundary.
+void
+NotifyUntypedCgoException(const char* what) noexcept;
+}  // namespace impl
+
 inline CStatus
 FailureCStatus(const std::exception* ex) {
     if (auto segcore_err = dynamic_cast<const SegcoreError*>(ex)) {
         return CStatus{static_cast<int>(segcore_err->get_error_code()), strdup(segcore_err->what())};
     }
+    impl::NotifyUntypedCgoException(ex->what());
     return CStatus{static_cast<int>(UnexpectedError), strdup(ex->what())};
 }
 

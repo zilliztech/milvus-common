@@ -261,8 +261,11 @@ ListNode::mark_unload(std::function<void()> cb) {
                 // NOTE: it should not happen, but if it does, we should not make the program deadlock.
                 auto promise = std::move(load_promise_);
                 lock.unlock();
-                promise->setException(folly::exception_wrapper(
-                    std::runtime_error("ListNode destroyed while loading, this should not happen")));
+                // Wrap a typed SegcoreError (internal invariant, not a
+                // cancellation): a bare runtime_error rethrown from this
+                // promise cannot be recognized at the cgo boundary.
+                promise->setException(folly::exception_wrapper(milvus::SegcoreError(
+                    milvus::ErrorCode::UnexpectedError, "ListNode destroyed while loading, this should not happen")));
             }
             break;
         }
