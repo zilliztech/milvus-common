@@ -143,8 +143,11 @@ void
 RegisterUntypedCgoExceptionObserver(UntypedCgoExceptionObserver observer);
 
 namespace impl {
+// Best-effort, noexcept: runs inside FailureCStatus's conversion path, so a
+// throwing observer must never replace the original failure or escape the
+// cgo boundary.
 void
-NotifyUntypedCgoException(const char* what);
+NotifyUntypedCgoException(const char* what) noexcept;
 }  // namespace impl
 
 inline CStatus

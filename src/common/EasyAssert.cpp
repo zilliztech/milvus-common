@@ -36,9 +36,17 @@ RegisterUntypedCgoExceptionObserver(UntypedCgoExceptionObserver observer) {
 
 namespace impl {
 void
-NotifyUntypedCgoException(const char* what) {
+NotifyUntypedCgoException(const char* what) noexcept {
     if (auto observer = untyped_cgo_exception_observer.load(std::memory_order_acquire)) {
-        observer(what);
+        try {
+            observer(what);
+        } catch (...) {
+            // The observer is metrics/logging only. It runs inside
+            // FailureCStatus's exception-to-CStatus conversion, so a throwing
+            // observer must never replace the original failure or let an
+            // exception escape the cgo boundary (which would terminate the
+            // process). Swallow and carry on with the conversion.
+        }
     }
 }
 }  // namespace impl
