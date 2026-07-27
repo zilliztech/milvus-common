@@ -58,7 +58,6 @@ Manager::ConfigureTieredStorage(CacheWarmupPolicies warmup_policies, CacheLimit 
 
         manager.dlist_ =
             std::make_shared<internal::DList>(eviction_enabled, max, low_watermark, high_watermark, eviction_config);
-        manager.dlist_->SetLoadingOverheadTracker(manager.loading_overhead_tracker_);
 
         LOG_INFO(
             "[MCL] Configured Tiered Storage manager with "
@@ -89,6 +88,24 @@ Manager::UpdateConfig(std::chrono::milliseconds loading_timeout, std::chrono::mi
         "storage_usage_tracking={}, warmup_policies={}",
         loading_timeout.count(), warmup_loading_timeout.count(), storage_usage_tracking_enabled,
         warmup_policies.ToString());
+}
+
+std::shared_ptr<LoadingOverheadGroup>
+Manager::CreateLoadingOverheadGroup(LoadingOverheadDimension dimension, LoadingOverheadPolicy policy) {
+    auto& manager = GetInstance();
+    if (!manager.dlist_) {
+        return nullptr;
+    }
+    return manager.dlist_->CreateLoadingOverheadGroup(dimension, std::move(policy));
+}
+
+LoadingOverheadUpdateResult
+Manager::UpdateLoadingOverheadGroup(const std::shared_ptr<LoadingOverheadGroup>& group, LoadingOverheadPolicy policy) {
+    auto& manager = GetInstance();
+    if (!manager.dlist_) {
+        return LoadingOverheadUpdateResult::kInvalidArgument;
+    }
+    return manager.dlist_->UpdateLoadingOverheadGroup(group, std::move(policy));
 }
 
 size_t

@@ -31,7 +31,7 @@
 #include <utility>
 #include <vector>
 
-#include "cachinglayer/LoadingOverheadTracker.h"
+#include "cachinglayer/LoadingOverhead.h"
 #include "cachinglayer/Metrics.h"
 #include "cachinglayer/Translator.h"
 #include "cachinglayer/Utils.h"
@@ -68,7 +68,8 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
           self_reserve_(self_reserve),
           storage_usage_tracking_enabled_(storage_usage_tracking_enabled),
           loading_timeout_(loading_timeout),
-          warmup_loading_timeout_(warmup_loading_timeout) {
+          warmup_loading_timeout_(warmup_loading_timeout),
+          loading_overhead_config_(translator_->meta()->loading_overhead_config) {
         if (const auto& metric_attribution = translator_->meta()->metric_attribution;
             metric_attribution && !metric_attribution->shard.empty()) {
             shard_disk_usage_metric_ =
@@ -78,13 +79,11 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         for (cid_t i = 0; i < static_cast<cid_t>(translator_->num_cells()); ++i) {
             cells_.push_back(std::make_unique<CacheCell>(this, i));
         }
+        if (loading_overhead_config_) {
+            dlist_->BindLoadingOverheadGroups(*loading_overhead_config_);
+        }
         monitor::cache_slot_count(cell_data_type_, storage_type_).Increment();
         monitor::cache_cell_count(cell_data_type_, storage_type_).Increment(translator_->num_cells());
-        // Register after all potentially-throwing operations, so that if the constructor
-        // fails, we don't leak a ref_count (destructor won't run for incomplete objects).
-        if (auto& lo = translator_->meta()->loading_overhead) {
-            overhead_handle_ = dlist_->RegisterLoadingOverhead(*lo);
-        }
     }
 
     CacheSlot(const CacheSlot&) = delete;
@@ -345,13 +344,20 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     }
 
     ~CacheSlot() {
-        dlist_->UnregisterLoadingOverhead(overhead_handle_);
+        if (loading_overhead_config_) {
+            dlist_->UnbindLoadingOverheadGroups(*loading_overhead_config_);
+        }
         monitor::cache_slot_count(cell_data_type_, storage_type_).Decrement();
         monitor::cache_cell_count(cell_data_type_, storage_type_).Decrement(translator_->num_cells());
     }
 
  private:
     friend class CellAccessor<CellT>;
+
+    [[nodiscard]] const LoadingOverheadConfig*
+    loadingOverheadConfig() const noexcept {
+        return loading_overhead_config_ ? &loading_overhead_config_.value() : nullptr;
+    }
 
     [[nodiscard]] std::vector<cid_t>
     AllCellIds() const {
@@ -437,8 +443,8 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     RunLoad(OpContext* ctx, std::unordered_set<cid_t>&& cids, std::chrono::milliseconds timeout) {
         // loaded_resource: the estimated final resource usage (from .first), reserved unconditionally.
         // loading_overhead: the estimated temporary overhead during loading (from .second).
-        //   Configured dimensions are group-capped by LoadingOverheadTracker; omitted dimensions
-        //   pass through unchanged. The tracker returns the combined incremental DList delta.
+        //   Configured dimensions are capped by their loading-overhead Group; omitted dimensions
+        //   pass through unchanged. DList derives the incremental reservation from the Group target transition.
         std::vector<cid_t> loading_cids;
         try {
             auto start = std::chrono::steady_clock::now();
@@ -484,8 +490,8 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             }
 
             // loaded_resource is reserved unconditionally from DList (no capping).
-            // loading_overhead goes through the tracker: configured dimensions return the change
-            // in min(sum, UB), while omitted dimensions return their full overhead.
+            // loading_overhead goes through its Groups: configured dimensions return the change
+            // in min(sum, bound), while omitted dimensions return their full overhead.
             auto loaded_resource = essential_loaded_resource + bonus_loaded_resource;
             auto loading_overhead = essential_loading_overhead + bonus_loading_overhead;
 
@@ -500,27 +506,28 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             // If that fails, fall back to essential-only with the real timeout.
             // This avoids blocking in the waiting queue for a bonus attempt that could retry immediately.
             auto reserve_timeout = bonus_cids.empty() ? timeout : std::chrono::milliseconds(0);
-            auto actual_dlist_reserve = SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(
-                loaded_resource, loading_overhead, overhead_handle_, reserve_timeout, ctx));
-            bool reservation_success = actual_dlist_reserve.AnyGTZero();
+            auto reservation = SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(
+                loaded_resource, loading_overhead, loadingOverheadConfig(), reserve_timeout, ctx));
+            auto actual_dlist_reserve = reservation.reserved;
+            bool reservation_success = reservation.success;
 
-            // Guard: releases DList + tracker atomically. All by-ref so bonus retry
+            // Guard: releases DList + Groups atomically. All by-ref so bonus retry
             // updates are reflected automatically.
             bool metrics_tracked = false;
             size_t loading_cids_count = 0;
+            ResourceUsage metric_loading_resource{};
             auto defer_release = folly::makeGuard([&]() {
                 if (!reservation_success) {
                     return;
                 }
                 try {
-                    auto released_resource =
-                        dlist_->ReleaseLoadingResource(loaded_resource, loading_overhead, overhead_handle_);
+                    dlist_->ReleaseLoadingResource(loaded_resource, loading_overhead, loadingOverheadConfig());
                     if (metrics_tracked) {
                         monitor::cache_cell_loading_count(cell_data_type_, storage_type_).Decrement(loading_cids_count);
                         monitor::cache_loading_bytes(cell_data_type_, StorageType::MEMORY)
-                            .Decrement(released_resource.memory_bytes);
+                            .Decrement(metric_loading_resource.memory_bytes);
                         monitor::cache_loading_bytes(cell_data_type_, StorageType::DISK)
-                            .Decrement(released_resource.file_bytes);
+                            .Decrement(metric_loading_resource.file_bytes);
                     }
                 } catch (...) {
                     auto ew = folly::exception_wrapper(std::current_exception());
@@ -539,9 +546,10 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                         "essential loading resource");
                     loaded_resource = essential_loaded_resource;
                     loading_overhead = essential_loading_overhead;
-                    actual_dlist_reserve = SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(
-                        loaded_resource, loading_overhead, overhead_handle_, timeout, ctx));
-                    reservation_success = actual_dlist_reserve.AnyGTZero();
+                    reservation = SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(
+                        loaded_resource, loading_overhead, loadingOverheadConfig(), timeout, ctx));
+                    actual_dlist_reserve = reservation.reserved;
+                    reservation_success = reservation.success;
                 } else {
                     loading_cids.insert(loading_cids.end(), bonus_cids.begin(), bonus_cids.end());
                 }
@@ -562,9 +570,14 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                           loading_overhead.ToString(), actual_dlist_reserve.ToString());
             }
 
+            // Track the active request estimate rather than the mutable Group reservation.
+            // Group reconfiguration may change DList bookkeeping while this request is in flight,
+            // but the metric must decrement the same value that it incremented.
+            metric_loading_resource = loaded_resource + loading_overhead;
             monitor::cache_loading_bytes(cell_data_type_, StorageType::MEMORY)
-                .Increment(actual_dlist_reserve.memory_bytes);
-            monitor::cache_loading_bytes(cell_data_type_, StorageType::DISK).Increment(actual_dlist_reserve.file_bytes);
+                .Increment(metric_loading_resource.memory_bytes);
+            monitor::cache_loading_bytes(cell_data_type_, StorageType::DISK)
+                .Increment(metric_loading_resource.file_bytes);
             loading_cids_count = loading_cids.size();
             monitor::cache_cell_loading_count(cell_data_type_, storage_type_).Increment(loading_cids_count);
             metrics_tracked = true;
@@ -719,7 +732,8 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     const bool storage_usage_tracking_enabled_;
     std::chrono::milliseconds loading_timeout_{100000};
     std::chrono::milliseconds warmup_loading_timeout_{0};
-    uint64_t overhead_handle_{0};
+    // Bind and Unbind must use the same runtime-unit metadata even if Meta is later modified.
+    std::optional<LoadingOverheadConfig> loading_overhead_config_;
     std::atomic<bool> warmup_called_{false};
     std::atomic<bool> skip_pin_{false};
 };
