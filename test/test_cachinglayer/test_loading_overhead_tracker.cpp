@@ -306,6 +306,57 @@ TEST_F(LoadingOverheadTrackerTest, GetUpperBound) {
     EXPECT_EQ(ub.file_bytes, 100);
 }
 
+TEST_F(LoadingOverheadTrackerTest, RefreshUpperBoundRecomputesSharedGroupWithoutAddingReference) {
+    auto first = tracker_.Register("vector_index", {100, 50});
+    auto second = tracker_.Register("vector_index", {100, 50});
+
+    tracker_.RefreshUpperBound(first, LoadingOverheadConfig{LoadingOverheadDimensionConfig{300, "vector_index"},
+                                                            LoadingOverheadDimensionConfig{25, "vector_index"}});
+
+    EXPECT_EQ(tracker_.GetUpperBound(first), (ResourceUsage{300, 50}));
+    EXPECT_EQ(tracker_.GetUpperBound(second), (ResourceUsage{300, 50}));
+
+    tracker_.RefreshUpperBound(second, LoadingOverheadConfig{LoadingOverheadDimensionConfig{80, "vector_index"},
+                                                             LoadingOverheadDimensionConfig{25, "vector_index"}});
+    EXPECT_EQ(tracker_.GetUpperBound(first), (ResourceUsage{300, 25}));
+
+    tracker_.RefreshUpperBound(first, LoadingOverheadConfig{LoadingOverheadDimensionConfig{60, "vector_index"},
+                                                            LoadingOverheadDimensionConfig{25, "vector_index"}});
+    EXPECT_EQ(tracker_.GetUpperBound(second), (ResourceUsage{80, 25}));
+
+    tracker_.Unregister(first);
+    tracker_.Unregister(second);
+
+    auto replacement = tracker_.Register("vector_index", {80, 40});
+    EXPECT_EQ(tracker_.GetUpperBound(replacement), (ResourceUsage{80, 40}));
+}
+
+TEST_F(LoadingOverheadTrackerTest, RefreshUnlimitedRegistrationToFinite) {
+    auto handle = tracker_.Register("load_transient", LoadingOverheadTracker::kUnlimited);
+
+    tracker_.RefreshUpperBound(handle, LoadingOverheadConfig{LoadingOverheadDimensionConfig{200, "load_transient"},
+                                                             LoadingOverheadDimensionConfig{0, "load_transient"}});
+
+    EXPECT_EQ(tracker_.GetUpperBound(handle), (ResourceUsage{200, 0}));
+}
+
+TEST_F(LoadingOverheadTrackerTest, RefreshDecreaseMidFlightPreservesReservationBalance) {
+    auto handle = tracker_.Register("load_transient", {300, 0});
+
+    auto first = tracker_.Reserve(handle, {200, 0});
+    EXPECT_EQ(first, (ResourceUsage{200, 0}));
+
+    tracker_.RefreshUpperBound(handle, LoadingOverheadConfig{LoadingOverheadDimensionConfig{100, "load_transient"},
+                                                             LoadingOverheadDimensionConfig{0, "load_transient"}});
+
+    auto second = tracker_.Reserve(handle, {50, 0});
+    EXPECT_EQ(second, ResourceUsage{});
+
+    auto second_release = tracker_.Release(handle, {50, 0});
+    auto first_release = tracker_.Release(handle, {200, 0});
+    EXPECT_EQ(second_release + first_release, first);
+}
+
 TEST_F(LoadingOverheadTrackerTest, PartialUnlimitedRemainsUnlimitedRegardlessOfRegistrationOrder) {
     constexpr auto kMax = std::numeric_limits<int64_t>::max();
 

@@ -235,9 +235,9 @@ DList::reserveResourceInternalWithTracker(const ResourceUsage& loaded, const Res
     }
     auto actual_size = (loaded + delta) * eviction_config_.loading_resource_factor;
 
-    auto rollback = [overhead_handle, overhead, tracker]() {
+    auto rollback = [overhead_handle, overhead, delta, tracker]() {
         if (overhead_handle != LoadingOverheadTracker::kInvalidHandle && tracker != nullptr) {
-            tracker->Release(overhead_handle, overhead);
+            tracker->rollbackReserve(overhead_handle, overhead, delta);
         }
     };
 
@@ -850,7 +850,8 @@ DList::handleWaitingRequests() {
                     request->use_resource_promise ? actual * eviction_config_.loading_resource_factor : actual;
                 total_loading_size_ -= rollback;
                 if (request->overhead_handle != LoadingOverheadTracker::kInvalidHandle && loading_overhead_tracker_) {
-                    loading_overhead_tracker_->Release(request->overhead_handle, request->overhead);
+                    loading_overhead_tracker_->rollbackReserve(request->overhead_handle, request->overhead,
+                                                               actual - request->loaded);
                 }
             }
             requests_to_destroy.push_back(std::move(request));

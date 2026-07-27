@@ -120,6 +120,11 @@ class MockTranslator : public Translator<TestCell> {
         return &meta_;
     }
 
+    std::optional<LoadingOverheadConfig>
+    loading_overhead_config() override {
+        return meta_.loading_overhead;
+    }
+
     std::vector<cid_t>
     bonus_cells_to_be_loaded(const std::vector<cid_t>& cids) const override {
         std::unordered_set<cid_t> total_bonus_cids_set;
@@ -2184,6 +2189,32 @@ TEST(CacheSlotTrackerTest, LoadingOverheadTrackerIntegration) {
     EXPECT_EQ(accessor2->get_cell_of(1)->data, 10);
 
     EXPECT_EQ(translator_ptr->GetCellsCallCount(), 2);
+}
+
+TEST(CacheSlotTrackerTest, RefreshesLoadingOverheadBeforeEachLoad) {
+    ResourceUsage limit{250, 0};
+    auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
+    dlist->SetLoadingOverheadTracker(std::make_shared<LoadingOverheadTracker>());
+
+    auto translator = std::make_unique<MockTranslator>(std::vector<std::pair<cid_t, int64_t>>{{0, 10}, {1, 10}},
+                                                       std::unordered_map<cl_uid_t, cid_t>{{0, 0}, {1, 1}},
+                                                       "test_overhead_refresh", StorageType::MEMORY);
+    translator->SetLoadingOverhead({300, 0});
+    translator->SetLoadingOverheadConfig("load_transient", {100, 0});
+    auto* translator_ptr = translator.get();
+
+    auto cache_slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, false,
+                                                            std::chrono::milliseconds(0), std::chrono::milliseconds(0));
+    auto op_ctx = std::make_unique<milvus::OpContext>();
+
+    auto first = cache_slot->PinCellsDirect(op_ctx.get(), {0});
+    ASSERT_NE(first, nullptr);
+    ASSERT_EQ(translator_ptr->GetCellsCallCount(), 1);
+
+    translator_ptr->SetLoadingOverheadConfig("load_transient", {300, 0});
+
+    EXPECT_ANY_THROW(cache_slot->PinCellsDirect(op_ctx.get(), {1}));
+    EXPECT_EQ(translator_ptr->GetCellsCallCount(), 1);
 }
 
 TEST(CacheSlotTrackerTest, PassthroughFileOverheadParticipatesInAdmission) {

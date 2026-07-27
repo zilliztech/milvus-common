@@ -2,6 +2,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <future>
 #include <map>
 #include <memory>
 #include <thread>
@@ -15,6 +16,9 @@
 
 using milvus::cachinglayer::cid_t;
 using milvus::cachinglayer::EvictionConfig;
+using milvus::cachinglayer::LoadingOverheadConfig;
+using milvus::cachinglayer::LoadingOverheadDimensionConfig;
+using milvus::cachinglayer::LoadingOverheadTracker;
 using milvus::cachinglayer::ResourceUsage;
 using milvus::cachinglayer::internal::DList;
 using milvus::cachinglayer::internal::DListTestFriend;
@@ -132,6 +136,51 @@ TEST_F(DListTest, Initialization) {
     EXPECT_EQ(get_loading_memory(), ResourceUsage{});
     EXPECT_EQ(DLF::get_head(*dlist), nullptr);
     EXPECT_EQ(DLF::get_tail(*dlist), nullptr);
+}
+
+TEST_F(DListTest, FailedReserveAfterOverheadRefreshRollsBackExactTrackerDelta) {
+    dlist->SetLoadingOverheadTracker(std::make_shared<LoadingOverheadTracker>());
+    auto handle = dlist->RegisterLoadingOverhead("load_transient", {100, 0});
+
+    auto first =
+        std::move(dlist->ReserveLoadingResourceWithTimeout({}, {200, 0}, handle, std::chrono::milliseconds(0))).get();
+    ASSERT_EQ(first, (ResourceUsage{100, 0}));
+    ASSERT_EQ(get_loading_memory(), (ResourceUsage{100, 0}));
+
+    dlist->RefreshLoadingOverheadUpperBound(handle,
+                                            LoadingOverheadConfig{LoadingOverheadDimensionConfig{300, "load_transient"},
+                                                                  LoadingOverheadDimensionConfig{0, "load_transient"}});
+
+    auto failed =
+        std::move(dlist->ReserveLoadingResourceWithTimeout({}, {150, 0}, handle, std::chrono::milliseconds(0))).get();
+    EXPECT_EQ(failed, ResourceUsage{});
+    EXPECT_EQ(get_loading_memory(), (ResourceUsage{100, 0}));
+
+    auto released = dlist->ReleaseLoadingResource({}, {200, 0}, handle);
+    EXPECT_EQ(released, (ResourceUsage{100, 0}));
+    EXPECT_EQ(get_loading_memory(), ResourceUsage{});
+}
+
+TEST_F(DListTest, RefreshLoadingOverheadDoesNotWaitForListLock) {
+    dlist->SetLoadingOverheadTracker(std::make_shared<LoadingOverheadTracker>());
+    auto handle = dlist->RegisterLoadingOverhead("load_transient", {100, 0});
+    auto config = LoadingOverheadConfig{LoadingOverheadDimensionConfig{200, "load_transient"},
+                                        LoadingOverheadDimensionConfig{0, "load_transient"}};
+
+    auto list_lock = DLF::lock_list(*dlist);
+    std::promise<void> started;
+    auto started_future = started.get_future();
+    auto refresh_future = std::async(std::launch::async, [&]() {
+        started.set_value();
+        dlist->RefreshLoadingOverheadUpperBound(handle, config);
+    });
+
+    started_future.wait();
+    auto status = refresh_future.wait_for(std::chrono::milliseconds(200));
+    list_lock.unlock();
+    refresh_future.get();
+
+    EXPECT_EQ(status, std::future_status::ready);
 }
 
 TEST_F(DListTest, UpdateMaxLimitIncrease) {
