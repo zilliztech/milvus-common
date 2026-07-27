@@ -265,8 +265,7 @@ ListNode::mark_unload(std::function<void()> cb) {
                 // cancellation): a bare runtime_error rethrown from this
                 // promise cannot be recognized at the cgo boundary.
                 promise->setException(folly::exception_wrapper(milvus::SegcoreError(
-                    milvus::ErrorCode::UnexpectedError,
-                    "ListNode destroyed while loading, this should not happen")));
+                    milvus::ErrorCode::UnexpectedError, "ListNode destroyed while loading, this should not happen")));
             }
             break;
         }
