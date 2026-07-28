@@ -11,6 +11,10 @@
 
 #pragma once
 
+#include <folly/futures/Future.h>
+
+#include <cstddef>
+#include <cstdint>
 #include <string>
 
 namespace milvus {
@@ -73,6 +77,27 @@ class InputStream {
 
     virtual size_t
     ReadAt(void* ptr, size_t offset, size_t size) = 0;
+
+    /**
+     * @brief asynchronously reads bytes into ptr at the given offset
+     *
+     * The default implementation defers the synchronous ReadAt call until the
+     * returned future is driven. Callers can attach an executor with via() to
+     * keep the synchronous fallback off the current thread. Implementations
+     * backed by native asynchronous IO should override this method.
+     *
+     * The stream and ptr must remain valid until the future completes.
+     *
+     * @param ptr
+     * @param offset
+     * @param size
+     * @return a future containing the number of bytes read
+     */
+    virtual folly::SemiFuture<size_t>
+    ReadAtAsync(void* ptr, size_t offset, size_t size) {
+        return folly::makeSemiFuture().deferValue(
+            [this, ptr, offset, size](folly::Unit) { return ReadAt(ptr, offset, size); });
+    }
 
     /**
      * @brief read data from the stream to a object with given type
