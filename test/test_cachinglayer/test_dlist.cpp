@@ -190,10 +190,10 @@ TEST_F(DListTest, PolicyTighteningDrainsExistingReservationWithInflightWork) {
 }
 
 TEST_F(DListTest, PolicyDependentRequirementAboveCapacityWaitsForShrink) {
-    auto group = CreateMemoryGroup(LoadingOverheadPolicy::Fixed(60));
+    auto group = CreateMemoryGroup(LoadingOverheadPolicy::Budget(60));
     ASSERT_NE(group, nullptr);
     LoadingOverheadConfig binding{
-        LoadingOverheadGroupBinding{group},
+        LoadingOverheadGroupBinding{group, 0},
         std::nullopt,
     };
     dlist->BindLoadingOverheadGroups(binding);
@@ -202,7 +202,7 @@ TEST_F(DListTest, PolicyDependentRequirementAboveCapacityWaitsForShrink) {
         /*loaded=*/{60, 0}, /*overhead=*/{60, 0}, &binding, std::chrono::milliseconds(1000));
     ASSERT_FALSE(waiter.isReady());
 
-    ASSERT_EQ(dlist->UpdateLoadingOverheadGroup(group, LoadingOverheadPolicy::Fixed(30)),
+    ASSERT_EQ(dlist->UpdateLoadingOverheadGroup(group, LoadingOverheadPolicy::Budget(30)),
               LoadingOverheadUpdateResult::kApplied);
     auto result = std::move(waiter).get();
     ASSERT_TRUE(result.success);
@@ -216,10 +216,10 @@ TEST_F(DListTest, PolicyDependentRequirementAboveCapacityWaitsForShrink) {
 TEST_F(DListTest, QueuedRequirementAboveCapacityWaitsForLaterShrink) {
     ASSERT_TRUE(std::move(dlist->ReserveLoadingResourceWithTimeout({100, 0}, std::chrono::milliseconds(0))).get());
 
-    auto group = CreateMemoryGroup(LoadingOverheadPolicy::Fixed(20));
+    auto group = CreateMemoryGroup(LoadingOverheadPolicy::Budget(20));
     ASSERT_NE(group, nullptr);
     LoadingOverheadConfig binding{
-        LoadingOverheadGroupBinding{group},
+        LoadingOverheadGroupBinding{group, 0},
         std::nullopt,
     };
     dlist->BindLoadingOverheadGroups(binding);
@@ -228,10 +228,10 @@ TEST_F(DListTest, QueuedRequirementAboveCapacityWaitsForLaterShrink) {
         /*loaded=*/{60, 0}, /*overhead=*/{60, 0}, &binding, std::chrono::milliseconds(-1));
     ASSERT_FALSE(waiter.isReady());
 
-    ASSERT_EQ(dlist->UpdateLoadingOverheadGroup(group, LoadingOverheadPolicy::Fixed(60)),
+    ASSERT_EQ(dlist->UpdateLoadingOverheadGroup(group, LoadingOverheadPolicy::Budget(60)),
               LoadingOverheadUpdateResult::kApplied);
     ASSERT_FALSE(waiter.isReady());
-    ASSERT_EQ(dlist->UpdateLoadingOverheadGroup(group, LoadingOverheadPolicy::Fixed(30)),
+    ASSERT_EQ(dlist->UpdateLoadingOverheadGroup(group, LoadingOverheadPolicy::Budget(30)),
               LoadingOverheadUpdateResult::kApplied);
     dlist->ReleaseLoadingResource({90, 0});
 
@@ -256,10 +256,10 @@ TEST_F(DListTest, AggregateOverflowDuringWaiterRetryFailsCleanly) {
                     .get());
 
     auto group =
-        local_dlist->CreateLoadingOverheadGroup(LoadingOverheadDimension::kMemory, LoadingOverheadPolicy::Fixed(0));
+        local_dlist->CreateLoadingOverheadGroup(LoadingOverheadDimension::kMemory, LoadingOverheadPolicy::Executor(0));
     ASSERT_NE(group, nullptr);
     LoadingOverheadConfig binding{
-        LoadingOverheadGroupBinding{group},
+        LoadingOverheadGroupBinding{group, 0},
         std::nullopt,
     };
     local_dlist->BindLoadingOverheadGroups(binding);
@@ -279,7 +279,7 @@ TEST_F(DListTest, AggregateOverflowDuringWaiterRetryFailsCleanly) {
     ASSERT_TRUE(large_reservation.success);
     ASSERT_EQ(large_reservation.reserved, ResourceUsage{});
 
-    ASSERT_NO_THROW(EXPECT_EQ(local_dlist->UpdateLoadingOverheadGroup(group, LoadingOverheadPolicy::Fixed(0)),
+    ASSERT_NO_THROW(EXPECT_EQ(local_dlist->UpdateLoadingOverheadGroup(group, LoadingOverheadPolicy::Executor(0)),
                               LoadingOverheadUpdateResult::kApplied));
     ASSERT_TRUE(overflow_waiter.isReady());
     EXPECT_FALSE(std::move(overflow_waiter).get().success);
@@ -360,10 +360,10 @@ TEST_F(DListTest, PolicyExpansionReconcilesOnNextReserveAndRollsBackFailure) {
 TEST_F(DListTest, PolicyGrowthReheapsIndefiniteWaiters) {
     ASSERT_TRUE(std::move(dlist->ReserveLoadingResourceWithTimeout({100, 0}, std::chrono::milliseconds(0))).get());
 
-    auto group = CreateMemoryGroup(LoadingOverheadPolicy::Fixed(5));
+    auto group = CreateMemoryGroup(LoadingOverheadPolicy::Budget(5));
     ASSERT_NE(group, nullptr);
     LoadingOverheadConfig binding{
-        LoadingOverheadGroupBinding{group},
+        LoadingOverheadGroupBinding{group, 0},
         std::nullopt,
     };
     dlist->BindLoadingOverheadGroups(binding);
@@ -374,7 +374,7 @@ TEST_F(DListTest, PolicyGrowthReheapsIndefiniteWaiters) {
     ASSERT_FALSE(growing.isReady());
     ASSERT_FALSE(smaller.isReady());
 
-    ASSERT_EQ(dlist->UpdateLoadingOverheadGroup(group, LoadingOverheadPolicy::Fixed(20)),
+    ASSERT_EQ(dlist->UpdateLoadingOverheadGroup(group, LoadingOverheadPolicy::Budget(20)),
               LoadingOverheadUpdateResult::kApplied);
     dlist->ReleaseLoadingResource({10, 0});
 
@@ -394,16 +394,16 @@ TEST_F(DListTest, PolicyGrowthReheapsIndefiniteWaiters) {
 TEST_F(DListTest, PolicyShrinkRechecksNonTopIndefiniteWaiter) {
     ASSERT_TRUE(std::move(dlist->ReserveLoadingResourceWithTimeout({100, 0}, std::chrono::milliseconds(0))).get());
 
-    auto blocking_group = CreateMemoryGroup(LoadingOverheadPolicy::Fixed(10));
-    auto shrinking_group = CreateMemoryGroup(LoadingOverheadPolicy::Fixed(20));
+    auto blocking_group = CreateMemoryGroup(LoadingOverheadPolicy::Budget(10));
+    auto shrinking_group = CreateMemoryGroup(LoadingOverheadPolicy::Budget(20));
     ASSERT_NE(blocking_group, nullptr);
     ASSERT_NE(shrinking_group, nullptr);
     LoadingOverheadConfig blocking_binding{
-        LoadingOverheadGroupBinding{blocking_group},
+        LoadingOverheadGroupBinding{blocking_group, 0},
         std::nullopt,
     };
     LoadingOverheadConfig shrinking_binding{
-        LoadingOverheadGroupBinding{shrinking_group},
+        LoadingOverheadGroupBinding{shrinking_group, 0},
         std::nullopt,
     };
     dlist->BindLoadingOverheadGroups(blocking_binding);
@@ -416,7 +416,7 @@ TEST_F(DListTest, PolicyShrinkRechecksNonTopIndefiniteWaiter) {
     ASSERT_FALSE(blocking.isReady());
     ASSERT_FALSE(shrinking.isReady());
 
-    ASSERT_EQ(dlist->UpdateLoadingOverheadGroup(shrinking_group, LoadingOverheadPolicy::Fixed(5)),
+    ASSERT_EQ(dlist->UpdateLoadingOverheadGroup(shrinking_group, LoadingOverheadPolicy::Budget(5)),
               LoadingOverheadUpdateResult::kApplied);
     dlist->ReleaseLoadingResource({8, 0});
 
@@ -538,10 +538,10 @@ TEST_F(DListTest, FractionalLoadingFactorKeepsGroupAggregateAdditive) {
     auto scaled_dlist = std::make_shared<DList>(true, initial_limit, low_watermark, high_watermark, scaled_config);
 
     auto group =
-        scaled_dlist->CreateLoadingOverheadGroup(LoadingOverheadDimension::kMemory, LoadingOverheadPolicy::Fixed(2));
+        scaled_dlist->CreateLoadingOverheadGroup(LoadingOverheadDimension::kMemory, LoadingOverheadPolicy::Budget(2));
     ASSERT_NE(group, nullptr);
     LoadingOverheadConfig binding{
-        LoadingOverheadGroupBinding{group},
+        LoadingOverheadGroupBinding{group, 0},
         std::nullopt,
     };
     scaled_dlist->BindLoadingOverheadGroups(binding);
@@ -570,10 +570,10 @@ TEST_F(DListTest, FractionalLoadingFactorScalesRequestLocalAndGroupSeparately) {
     auto scaled_dlist = std::make_shared<DList>(true, initial_limit, low_watermark, high_watermark, scaled_config);
 
     auto group =
-        scaled_dlist->CreateLoadingOverheadGroup(LoadingOverheadDimension::kMemory, LoadingOverheadPolicy::Fixed(1));
+        scaled_dlist->CreateLoadingOverheadGroup(LoadingOverheadDimension::kMemory, LoadingOverheadPolicy::Budget(1));
     ASSERT_NE(group, nullptr);
     LoadingOverheadConfig binding{
-        LoadingOverheadGroupBinding{group},
+        LoadingOverheadGroupBinding{group, 0},
         std::nullopt,
     };
     scaled_dlist->BindLoadingOverheadGroups(binding);
@@ -632,7 +632,7 @@ TEST_F(DListTest, GroupReconfigurationReprocessesWaitersWithNewBound) {
     auto group = CreateMemoryGroup(LoadingOverheadPolicy::Passthrough());
     ASSERT_NE(group, nullptr);
     LoadingOverheadConfig binding{
-        LoadingOverheadGroupBinding{group},
+        LoadingOverheadGroupBinding{group, 0},
         std::nullopt,
     };
     dlist->BindLoadingOverheadGroups(binding);
@@ -645,7 +645,7 @@ TEST_F(DListTest, GroupReconfigurationReprocessesWaitersWithNewBound) {
         /*loaded=*/{}, /*overhead=*/{30, 0}, &binding, std::chrono::milliseconds(-1));
     ASSERT_FALSE(waiter.isReady());
 
-    EXPECT_EQ(dlist->UpdateLoadingOverheadGroup(group, LoadingOverheadPolicy::Fixed(80)),
+    EXPECT_EQ(dlist->UpdateLoadingOverheadGroup(group, LoadingOverheadPolicy::Budget(80)),
               LoadingOverheadUpdateResult::kApplied);
     EXPECT_TRUE(waiter.isReady());
     const auto waiter_result = std::move(waiter).get();

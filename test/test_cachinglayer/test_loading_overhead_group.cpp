@@ -78,9 +78,9 @@ TEST_F(LoadingOverheadGroupTest, FailedBindingDoesNotAttachConfiguredDimensions)
               LoadingOverheadUpdateResult::kApplied);
 }
 
-TEST_F(LoadingOverheadGroupTest, FixedGroupCapsAndReleasesReservation) {
-    auto group = CreateMemoryGroup(LoadingOverheadPolicy::Fixed(200));
-    auto binding = BindMemory(group);
+TEST_F(LoadingOverheadGroupTest, BudgetGroupCapsAndReleasesReservation) {
+    auto group = CreateMemoryGroup(LoadingOverheadPolicy::Budget(200));
+    auto binding = BindMemory(group, 0);
 
     EXPECT_EQ(Reserve(binding, {150, 0}), (ResourceUsage{150, 0}));
     EXPECT_EQ(Reserve(binding, {100, 0}), (ResourceUsage{50, 0}));
@@ -92,19 +92,19 @@ TEST_F(LoadingOverheadGroupTest, FixedGroupCapsAndReleasesReservation) {
 }
 
 TEST_F(LoadingOverheadGroupTest, GroupsReserveIndependently) {
-    auto vector_group = CreateMemoryGroup(LoadingOverheadPolicy::Fixed(200));
-    auto scalar_group = CreateMemoryGroup(LoadingOverheadPolicy::Fixed(100));
+    auto vector_group = CreateMemoryGroup(LoadingOverheadPolicy::Budget(200));
+    auto scalar_group = CreateMemoryGroup(LoadingOverheadPolicy::Budget(100));
 
-    auto vector = BindMemory(vector_group);
-    auto scalar = BindMemory(scalar_group);
+    auto vector = BindMemory(vector_group, 0);
+    auto scalar = BindMemory(scalar_group, 0);
 
     EXPECT_EQ(Reserve(vector, {300, 0}), (ResourceUsage{200, 0}));
     EXPECT_EQ(Reserve(scalar, {300, 0}), (ResourceUsage{100, 0}));
 }
 
 TEST_F(LoadingOverheadGroupTest, ConcurrentReserveReleasePreservesAccounting) {
-    auto group = CreateMemoryGroup(LoadingOverheadPolicy::Fixed(200));
-    auto binding = BindMemory(group);
+    auto group = CreateMemoryGroup(LoadingOverheadPolicy::Budget(200));
+    auto binding = BindMemory(group, 0);
 
     constexpr int kThreadCount = 10;
     constexpr int kOperationsPerThread = 100;
@@ -181,19 +181,19 @@ TEST_F(LoadingOverheadGroupTest, ExecutorBoundSaturatesOnOverflow) {
 }
 
 TEST_F(LoadingOverheadGroupTest, AggregateOverflowIsRejectedBeforeEitherDimensionMutates) {
-    auto memory_group = CreateMemoryGroup(LoadingOverheadPolicy::Fixed(10));
+    auto memory_group = CreateMemoryGroup(LoadingOverheadPolicy::Budget(10));
     auto file_group =
-        dlist_->CreateLoadingOverheadGroup(LoadingOverheadDimension::kFile, LoadingOverheadPolicy::Fixed(1));
+        dlist_->CreateLoadingOverheadGroup(LoadingOverheadDimension::kFile, LoadingOverheadPolicy::Budget(1));
     ASSERT_NE(memory_group, nullptr);
     ASSERT_NE(file_group, nullptr);
 
     LoadingOverheadConfig file_only{
         std::nullopt,
-        LoadingOverheadGroupBinding{file_group},
+        LoadingOverheadGroupBinding{file_group, 0},
     };
     LoadingOverheadConfig both_dimensions{
-        LoadingOverheadGroupBinding{memory_group},
-        LoadingOverheadGroupBinding{file_group},
+        LoadingOverheadGroupBinding{memory_group, 0},
+        LoadingOverheadGroupBinding{file_group, 0},
     };
     dlist_->BindLoadingOverheadGroups(file_only);
     dlist_->BindLoadingOverheadGroups(both_dimensions);
@@ -315,14 +315,14 @@ TEST_F(LoadingOverheadGroupTest, FailedReserveRevertsDeltaAfterPolicyExpansion) 
 }
 
 TEST_F(LoadingOverheadGroupTest, DimensionsUseIndependentGroupsWhileAbsentFilePassesThrough) {
-    auto memory_group = CreateMemoryGroup(LoadingOverheadPolicy::Fixed(200));
+    auto memory_group = CreateMemoryGroup(LoadingOverheadPolicy::Budget(200));
     auto file_group =
-        dlist_->CreateLoadingOverheadGroup(LoadingOverheadDimension::kFile, LoadingOverheadPolicy::Fixed(50));
+        dlist_->CreateLoadingOverheadGroup(LoadingOverheadDimension::kFile, LoadingOverheadPolicy::Budget(50));
 
-    auto scalar_binding = BindMemory(memory_group);
+    auto scalar_binding = BindMemory(memory_group, 0);
     LoadingOverheadConfig field_binding{
-        LoadingOverheadGroupBinding{memory_group},
-        LoadingOverheadGroupBinding{file_group},
+        LoadingOverheadGroupBinding{memory_group, 0},
+        LoadingOverheadGroupBinding{file_group, 0},
     };
     dlist_->BindLoadingOverheadGroups(field_binding);
 

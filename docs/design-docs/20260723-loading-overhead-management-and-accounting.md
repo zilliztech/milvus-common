@@ -217,7 +217,6 @@ The policy is immutable as a value and replaceable at the Group level.
 
 | Policy | Bound | Intended use |
 |---|---:|---|
-| `Fixed(upper_bound)` | `upper_bound` | Static compatibility or explicitly configured cap. |
 | `Passthrough()` | `INT64_MAX` | Named Group with no cap; active overhead is still aggregated in Group state. |
 | `Budget(capacity)` | `capacity == 0 ? unlimited : max(capacity, max_runtime_unit)` | Runtime transient-memory Budget. A single oversized unit must still make progress safely. |
 | `Executor(workers)` | `saturating_multiply(workers, max_runtime_unit)` | Executor whose configured concurrency bounds simultaneous transient work. |
@@ -242,7 +241,7 @@ struct LoadingOverheadConfig {
 
 The configuration stored in Translator Meta is a delivery mechanism, not the registration itself. CacheSlot copies the configuration during construction and calls `DList::BindLoadingOverheadGroups()` with the Handle. That Bind call is the point at which the CacheSlot becomes a Group member and contributes its `max_runtime_unit` metadata.
 
-`max_runtime_unit` is a conservative bound for one runtime unit from that binding. It is not the sum of an arbitrary multi-cell load request. Budget and Executor policies require every binding to provide it. Fixed and Passthrough policies do not.
+`max_runtime_unit` is a conservative bound for one runtime unit from that binding. It is not the sum of an arbitrary multi-cell load request. Budget and Executor policies require every binding to provide it. Passthrough does not.
 
 The Group caches the maximum bound across all currently attached bindings, including idle CacheSlots. Duplicate values are retained in a multiset so unbinding one CacheSlot does not accidentally remove another CacheSlot's contribution.
 
@@ -294,7 +293,6 @@ T(S, P, R) = min(max(S, 0), B(P, R))
 The built-in policy bounds are:
 
 ```text
-Fixed(U):       B = U
 Passthrough:    B = INT64_MAX
 Budget(C):      B = (C == 0) ? INT64_MAX : max(C, R)
 Executor(W):    B = saturating_multiply(W, R)
@@ -337,7 +335,7 @@ The release delta is determined by the Group's aggregate state, not by the delta
 
 Negative state is treated as an invariant violation, logged, and clamped to zero to keep later accounting usable.
 
-### 5.4 Example: Fixed or Budget Bound
+### 5.4 Example: Budget Bound
 
 Assume a 200-byte Group bound and three requests with overhead `150`, `100`, and `100`:
 
@@ -726,9 +724,9 @@ The unbound file estimate still participates fully in DList admission. A memory 
 
 CacheSlot can also register memory and file with separate Groups and separate policy kinds. A Handle created for memory cannot be used for a file-dimension Bind.
 
-### 11.4 Fixed and Explicit Passthrough Groups
+### 11.4 Explicit Passthrough Groups
 
-`Fixed` is useful for a static upper bound or staged migration from the legacy tracker. `Passthrough` is useful when the owner wants stable explicit Group identity today and may switch policies later.
+`Passthrough` is useful when the owner wants stable explicit Group identity today and may switch policies later.
 
 When no shared ownership or later replacement is needed, omitting the dimension is simpler than creating a Passthrough Group.
 
@@ -781,8 +779,8 @@ Policy replacement intentionally does not maintain `Q == T` at every instant. Th
 
 ### 13.1 Policy and Group Tests
 
-- negative Fixed, Budget, and Executor inputs are rejected;
-- Fixed capping and aggregate release;
+- negative Budget and Executor inputs are rejected;
+- Budget capping and aggregate release;
 - independent Groups and independent dimensions;
 - Budget/Executor runtime-unit requirements;
 - Budget zero as uncapped behavior;

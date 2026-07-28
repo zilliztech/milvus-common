@@ -16,10 +16,6 @@ concept EvaluatesLoadingOverhead = requires(const Policy& policy) {
 
 static_assert(!EvaluatesLoadingOverhead<LoadingOverheadPolicy>);
 
-TEST(LoadingOverheadPolicyTest, FixedRejectsNegativeBound) {
-    EXPECT_THROW(LoadingOverheadPolicy::Fixed(-1), std::invalid_argument);
-}
-
 TEST(LoadingOverheadPolicyTest, BudgetRejectsNegativeCapacity) {
     EXPECT_THROW(LoadingOverheadPolicy::Budget(-1), std::invalid_argument);
 }

@@ -156,8 +156,6 @@ LoadingOverheadGroup::requiresRuntimeUnitBound(const LoadingOverheadPolicy& poli
 int64_t
 LoadingOverheadGroup::resolveBound(const LoadingOverheadPolicy& policy, int64_t max_runtime_unit_bytes) noexcept {
     switch (policy.kind_) {
-        case LoadingOverheadPolicy::Kind::kFixed:
-            return policy.fixed_upper_bound_;
         case LoadingOverheadPolicy::Kind::kPassthrough:
             return std::numeric_limits<int64_t>::max();
         case LoadingOverheadPolicy::Kind::kBudget:

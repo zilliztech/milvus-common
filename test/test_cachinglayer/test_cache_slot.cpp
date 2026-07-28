@@ -2159,7 +2159,7 @@ TEST(CacheSlotLoadingOverheadTest, GroupIntegration) {
     auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
 
     auto group =
-        dlist->CreateLoadingOverheadGroup(LoadingOverheadDimension::kMemory, LoadingOverheadPolicy::Fixed(500));
+        dlist->CreateLoadingOverheadGroup(LoadingOverheadDimension::kMemory, LoadingOverheadPolicy::Budget(500));
     ASSERT_NE(group, nullptr);
 
     const int64_t cell_loaded_size = 100;
@@ -2169,7 +2169,7 @@ TEST(CacheSlotLoadingOverheadTest, GroupIntegration) {
         std::vector<std::pair<cid_t, int64_t>>{{0, cell_loaded_size}, {1, cell_loaded_size}},
         std::unordered_map<cl_uid_t, cid_t>{{0, 0}, {1, 1}}, "test_group_integration", StorageType::MEMORY);
     translator->SetLoadingOverhead({cell_loading_overhead, 0});
-    translator->SetLoadingOverheadConfig(LoadingOverheadConfig{LoadingOverheadGroupBinding{group}, std::nullopt});
+    translator->SetLoadingOverheadConfig(LoadingOverheadConfig{LoadingOverheadGroupBinding{group, 0}, std::nullopt});
     auto* translator_ptr = translator.get();
 
     auto cache_slot =
@@ -2356,14 +2356,14 @@ TEST(CacheSlotLoadingOverheadTest, PassthroughFileOverheadParticipatesInAdmissio
     ResourceUsage limit{110, 200};
     auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
     auto group =
-        dlist->CreateLoadingOverheadGroup(LoadingOverheadDimension::kMemory, LoadingOverheadPolicy::Fixed(100));
+        dlist->CreateLoadingOverheadGroup(LoadingOverheadDimension::kMemory, LoadingOverheadPolicy::Budget(100));
     ASSERT_NE(group, nullptr);
 
     auto translator = std::make_unique<MockTranslator>(std::vector<std::pair<cid_t, int64_t>>{{0, 10}},
                                                        std::unordered_map<cl_uid_t, cid_t>{{0, 0}},
                                                        "test_dimension_admission", StorageType::MEMORY);
     translator->SetLoadingOverhead({200, 200});
-    translator->SetLoadingOverheadConfig(LoadingOverheadConfig{LoadingOverheadGroupBinding{group}, std::nullopt});
+    translator->SetLoadingOverheadConfig(LoadingOverheadConfig{LoadingOverheadGroupBinding{group, 0}, std::nullopt});
 
     auto cache_slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, false,
                                                             std::chrono::milliseconds(0), std::chrono::milliseconds(0));
@@ -2376,14 +2376,14 @@ TEST(CacheSlotLoadingOverheadTest, InsufficientDiskRejectsPassthroughFileOverhea
     ResourceUsage limit{1000, 199};
     auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
     auto group =
-        dlist->CreateLoadingOverheadGroup(LoadingOverheadDimension::kMemory, LoadingOverheadPolicy::Fixed(100));
+        dlist->CreateLoadingOverheadGroup(LoadingOverheadDimension::kMemory, LoadingOverheadPolicy::Budget(100));
     ASSERT_NE(group, nullptr);
 
     auto translator = std::make_unique<MockTranslator>(std::vector<std::pair<cid_t, int64_t>>{{0, 10}},
                                                        std::unordered_map<cl_uid_t, cid_t>{{0, 0}},
                                                        "test_dimension_disk_reject", StorageType::MEMORY);
     translator->SetLoadingOverhead({200, 200});
-    translator->SetLoadingOverheadConfig(LoadingOverheadConfig{LoadingOverheadGroupBinding{group}, std::nullopt});
+    translator->SetLoadingOverheadConfig(LoadingOverheadConfig{LoadingOverheadGroupBinding{group, 0}, std::nullopt});
     auto* translator_ptr = translator.get();
 
     auto cache_slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, false,
@@ -2400,7 +2400,7 @@ TEST(CacheSlotLoadingOverheadTest, GroupCleanupOnException) {
     auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
 
     auto group =
-        dlist->CreateLoadingOverheadGroup(LoadingOverheadDimension::kMemory, LoadingOverheadPolicy::Fixed(500));
+        dlist->CreateLoadingOverheadGroup(LoadingOverheadDimension::kMemory, LoadingOverheadPolicy::Budget(500));
     ASSERT_NE(group, nullptr);
 
     const int64_t cell_loaded_size = 100;
@@ -2410,7 +2410,7 @@ TEST(CacheSlotLoadingOverheadTest, GroupCleanupOnException) {
                                                        std::unordered_map<cl_uid_t, cid_t>{{0, 0}},
                                                        "test_group_exception", StorageType::MEMORY);
     translator->SetLoadingOverhead({cell_loading_overhead, 0});
-    translator->SetLoadingOverheadConfig(LoadingOverheadConfig{LoadingOverheadGroupBinding{group}, std::nullopt});
+    translator->SetLoadingOverheadConfig(LoadingOverheadConfig{LoadingOverheadGroupBinding{group, 0}, std::nullopt});
     translator->SetShouldThrow(true);
 
     auto cache_slot =
@@ -2423,7 +2423,7 @@ TEST(CacheSlotLoadingOverheadTest, GroupCleanupOnException) {
     EXPECT_ANY_THROW(cache_slot->PinCellsDirect(op_ctx.get(), {0}));
 
     // Bind again for verification (CacheSlot is already bound internally).
-    LoadingOverheadConfig verification_binding{LoadingOverheadGroupBinding{group}, std::nullopt};
+    LoadingOverheadConfig verification_binding{LoadingOverheadGroupBinding{group, 0}, std::nullopt};
     dlist->BindLoadingOverheadGroups(verification_binding);
 
     // Verify Group state is clean by reserving the full Group bound.
@@ -2447,7 +2447,7 @@ TEST(CacheSlotLoadingOverheadTest, BonusCellsRetryWithGroup) {
     auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
 
     auto group =
-        dlist->CreateLoadingOverheadGroup(LoadingOverheadDimension::kMemory, LoadingOverheadPolicy::Fixed(100));
+        dlist->CreateLoadingOverheadGroup(LoadingOverheadDimension::kMemory, LoadingOverheadPolicy::Budget(100));
     ASSERT_NE(group, nullptr);
 
     const int64_t cell_loaded_size = 100;
@@ -2461,7 +2461,7 @@ TEST(CacheSlotLoadingOverheadTest, BonusCellsRetryWithGroup) {
         std::vector<std::pair<cid_t, int64_t>>{{0, cell_loaded_size}, {1, cell_loaded_size}, {2, cell_loaded_size}},
         std::unordered_map<cl_uid_t, cid_t>{{0, 0}, {1, 1}, {2, 2}}, "test_bonus_retry", StorageType::MEMORY);
     translator->SetLoadingOverhead({cell_loading_overhead, 0});
-    translator->SetLoadingOverheadConfig(LoadingOverheadConfig{LoadingOverheadGroupBinding{group}, std::nullopt});
+    translator->SetLoadingOverheadConfig(LoadingOverheadConfig{LoadingOverheadGroupBinding{group, 0}, std::nullopt});
     translator->SetExtraReturnCids({{0, {1, 2}}});
 
     auto cache_slot =

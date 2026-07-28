@@ -30,20 +30,12 @@ using LoadingOverheadGroupHandle = std::shared_ptr<LoadingOverheadGroup>;
 class LoadingOverheadPolicy {
  private:
     enum class Kind {
-        kFixed,
         kPassthrough,
         kBudget,
         kExecutor,
     };
 
  public:
-    static LoadingOverheadPolicy
-    Fixed(int64_t upper_bound) {
-        LoadingOverheadPolicy policy{Kind::kFixed};
-        policy.fixed_upper_bound_ = ValidateNonNegative(upper_bound, "fixed upper bound");
-        return policy;
-    }
-
     static LoadingOverheadPolicy
     Passthrough() {
         return LoadingOverheadPolicy{Kind::kPassthrough};
@@ -79,7 +71,6 @@ class LoadingOverheadPolicy {
 
     Kind kind_;
     union {
-        int64_t fixed_upper_bound_;
         int64_t budget_capacity_bytes_;
         int64_t configured_workers_;
         int64_t unused_;
