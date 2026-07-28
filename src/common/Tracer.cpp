@@ -105,7 +105,8 @@ initTelemetry(const TraceConfig& cfg) {
     }
     if (export_created) {
         auto processor = trace_sdk::BatchSpanProcessorFactory::Create(std::move(exporter), {});
-        resource::ResourceAttributes attributes = {{"service.name", TRACE_SERVICE_SEGCORE}, {"NodeID", cfg.nodeID}};
+        auto service_name = cfg.clusterID + "-" + TRACE_SERVICE_SEGCORE;
+        resource::ResourceAttributes attributes = {{"service.name", service_name}, {"NodeID", cfg.nodeID}};
         auto resource = resource::Resource::Create(attributes);
         auto sampler = std::make_unique<trace_sdk::ParentBasedSampler>(std::make_shared<trace_sdk::AlwaysOnSampler>());
         std::shared_ptr<trace::TracerProvider> provider =
