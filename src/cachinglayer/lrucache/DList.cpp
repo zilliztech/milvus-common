@@ -311,7 +311,8 @@ DList::validateLoadingOverheadBinding(const std::optional<LoadingOverheadGroupBi
         return;
     }
     if (!binding->group) {
-        throw std::invalid_argument("loading-overhead binding requires a Group from the matching dimension");
+        ThrowInfo(milvus::ErrorCode::InvalidParameter,
+                  "loading-overhead binding requires a Group from the matching dimension");
     }
     binding->group->validateBinding(dimension, binding->max_runtime_unit);
 }
@@ -319,7 +320,7 @@ DList::validateLoadingOverheadBinding(const std::optional<LoadingOverheadGroupBi
 DList::LoadingOverheadDelta
 DList::reserveLoadingOverhead(const LoadingOverheadConfig& config, const ResourceUsage& overhead) {
     if (!overhead.AllGEZero()) {
-        throw std::invalid_argument("loading overhead must be non-negative");
+        ThrowInfo(milvus::ErrorCode::InvalidParameter, "loading overhead must be non-negative");
     }
 
     validateLoadingOverheadBinding(config.memory, LoadingOverheadDimension::kMemory);
@@ -1017,7 +1018,10 @@ DList::handleWaitingRequests() {
                 fulfilled = attempt.result.success;
                 actual = attempt.result.reserved;
                 attempted_requirement = attempt.required_size;
-            } catch (const std::overflow_error& error) {
+            } catch (const milvus::SegcoreError& error) {
+                if (error.get_error_code() != milvus::ErrorCode::InvalidParameter) {
+                    throw;
+                }
                 auto request = std::move(request_ptr_ref);
                 waiting_queue_.pop();
                 if (waiting_requests_map_.erase(request->request_id) > 0) {

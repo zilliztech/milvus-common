@@ -15,8 +15,6 @@
 #include <memory>
 #include <optional>
 #include <set>
-#include <stdexcept>
-#include <string>
 #include <utility>
 
 #include "cachinglayer/Utils.h"
@@ -64,7 +62,7 @@ class LoadingOverheadPolicy {
     static int64_t
     ValidateNonNegative(int64_t value, const char* name) {
         if (value < 0) {
-            throw std::invalid_argument(std::string("LoadingOverheadPolicy ") + name + " must be non-negative");
+            ThrowInfo(milvus::ErrorCode::InvalidParameter, "LoadingOverheadPolicy {} must be non-negative", name);
         }
         return value;
     }

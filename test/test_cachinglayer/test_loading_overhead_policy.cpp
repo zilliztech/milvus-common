@@ -16,12 +16,25 @@ concept EvaluatesLoadingOverhead = requires(const Policy& policy) {
 
 static_assert(!EvaluatesLoadingOverhead<LoadingOverheadPolicy>);
 
+template <typename Fn>
+void
+ExpectInvalidParameter(Fn&& fn) {
+    try {
+        fn();
+        ADD_FAILURE() << "Expected InvalidParameter";
+    } catch (const milvus::SegcoreError& error) {
+        EXPECT_EQ(error.get_error_code(), milvus::ErrorCode::InvalidParameter);
+    } catch (const std::exception& error) {
+        ADD_FAILURE() << "Expected SegcoreError, got: " << error.what();
+    }
+}
+
 TEST(LoadingOverheadPolicyTest, BudgetRejectsNegativeCapacity) {
-    EXPECT_THROW(LoadingOverheadPolicy::Budget(-1), std::invalid_argument);
+    ExpectInvalidParameter([] { (void)LoadingOverheadPolicy::Budget(-1); });
 }
 
 TEST(LoadingOverheadPolicyTest, ExecutorRejectsNegativeWorkerCount) {
-    EXPECT_THROW(LoadingOverheadPolicy::Executor(-1), std::invalid_argument);
+    ExpectInvalidParameter([] { (void)LoadingOverheadPolicy::Executor(-1); });
 }
 
 }  // namespace

@@ -15,6 +15,19 @@
 using namespace milvus::cachinglayer;
 using milvus::cachinglayer::internal::DList;
 
+template <typename Fn>
+void
+ExpectInvalidParameter(Fn&& fn) {
+    try {
+        fn();
+        ADD_FAILURE() << "Expected InvalidParameter";
+    } catch (const milvus::SegcoreError& error) {
+        EXPECT_EQ(error.get_error_code(), milvus::ErrorCode::InvalidParameter);
+    } catch (const std::exception& error) {
+        ADD_FAILURE() << "Expected SegcoreError, got: " << error.what();
+    }
+}
+
 class LoadingOverheadGroupTest : public ::testing::Test {
  protected:
     LoadingOverheadGroupHandle
@@ -58,21 +71,23 @@ class LoadingOverheadGroupTest : public ::testing::Test {
 };
 
 TEST_F(LoadingOverheadGroupTest, BindingRequiresGroup) {
-    EXPECT_THROW(dlist_->BindLoadingOverheadGroups(LoadingOverheadConfig{
-                     LoadingOverheadGroupBinding{},
-                     std::nullopt,
-                 }),
-                 std::invalid_argument);
+    ExpectInvalidParameter([&] {
+        dlist_->BindLoadingOverheadGroups(LoadingOverheadConfig{
+            LoadingOverheadGroupBinding{},
+            std::nullopt,
+        });
+    });
 }
 
 TEST_F(LoadingOverheadGroupTest, FailedBindingDoesNotAttachConfiguredDimensions) {
     auto memory = CreateMemoryGroup(LoadingOverheadPolicy::Passthrough());
 
-    EXPECT_THROW(dlist_->BindLoadingOverheadGroups(LoadingOverheadConfig{
-                     LoadingOverheadGroupBinding{memory},
-                     LoadingOverheadGroupBinding{memory},
-                 }),
-                 std::invalid_argument);
+    ExpectInvalidParameter([&] {
+        dlist_->BindLoadingOverheadGroups(LoadingOverheadConfig{
+            LoadingOverheadGroupBinding{memory},
+            LoadingOverheadGroupBinding{memory},
+        });
+    });
 
     EXPECT_EQ(dlist_->UpdateLoadingOverheadGroup(memory, LoadingOverheadPolicy::Executor(1)),
               LoadingOverheadUpdateResult::kApplied);
@@ -133,11 +148,23 @@ TEST_F(LoadingOverheadGroupTest, ConcurrentReserveReleasePreservesAccounting) {
 TEST_F(LoadingOverheadGroupTest, BindingRejectsInvalidMetadata) {
     auto group = CreateMemoryGroup(LoadingOverheadPolicy::Passthrough());
 
-    EXPECT_THROW(dlist_->BindLoadingOverheadGroups(LoadingOverheadConfig{
-                     LoadingOverheadGroupBinding{group, -1},
-                     std::nullopt,
-                 }),
-                 std::invalid_argument);
+    ExpectInvalidParameter([&] {
+        dlist_->BindLoadingOverheadGroups(LoadingOverheadConfig{
+            LoadingOverheadGroupBinding{group, -1},
+            std::nullopt,
+        });
+    });
+}
+
+TEST_F(LoadingOverheadGroupTest, NegativeDemandReturnsInvalidParameter) {
+    auto group = CreateMemoryGroup(LoadingOverheadPolicy::Budget(100));
+    auto binding = BindMemory(group, 0);
+
+    ExpectInvalidParameter([&] {
+        (void)std::move(dlist_->ReserveLoadingResourceWithTimeout(
+                            /*loaded=*/{}, /*overhead=*/{-1, 0}, &binding, std::chrono::milliseconds(0)))
+            .get();
+    });
 }
 
 TEST_F(LoadingOverheadGroupTest, GroupUsesBoundRuntimeUnit) {
@@ -200,13 +227,11 @@ TEST_F(LoadingOverheadGroupTest, AggregateOverflowIsRejectedBeforeEitherDimensio
 
     constexpr auto kMax = std::numeric_limits<int64_t>::max();
     EXPECT_EQ(Reserve(file_only, {0, kMax}), (ResourceUsage{0, 1}));
-    ASSERT_THROW(
-        {
-            (void)std::move(dlist_->ReserveLoadingResourceWithTimeout(
-                                /*loaded=*/{}, /*overhead=*/{5, 1}, &both_dimensions, std::chrono::milliseconds(0)))
-                .get();
-        },
-        std::overflow_error);
+    ExpectInvalidParameter([&] {
+        (void)std::move(dlist_->ReserveLoadingResourceWithTimeout(
+                            /*loaded=*/{}, /*overhead=*/{5, 1}, &both_dimensions, std::chrono::milliseconds(0)))
+            .get();
+    });
 
     EXPECT_EQ(Reserve(both_dimensions, {10, 0}), (ResourceUsage{10, 0}));
     EXPECT_EQ(Release(both_dimensions, {10, 0}), (ResourceUsage{10, 0}));
@@ -216,18 +241,20 @@ TEST_F(LoadingOverheadGroupTest, AggregateOverflowIsRejectedBeforeEitherDimensio
 TEST_F(LoadingOverheadGroupTest, BoundedGroupRequiresBoundRuntimeUnit) {
     auto executor = CreateMemoryGroup(LoadingOverheadPolicy::Executor(1));
 
-    EXPECT_THROW(dlist_->BindLoadingOverheadGroups(LoadingOverheadConfig{
-                     LoadingOverheadGroupBinding{executor},
-                     std::nullopt,
-                 }),
-                 std::invalid_argument);
+    ExpectInvalidParameter([&] {
+        dlist_->BindLoadingOverheadGroups(LoadingOverheadConfig{
+            LoadingOverheadGroupBinding{executor},
+            std::nullopt,
+        });
+    });
 
     auto budget = CreateMemoryGroup(LoadingOverheadPolicy::Budget(100));
-    EXPECT_THROW(dlist_->BindLoadingOverheadGroups(LoadingOverheadConfig{
-                     LoadingOverheadGroupBinding{budget},
-                     std::nullopt,
-                 }),
-                 std::invalid_argument);
+    ExpectInvalidParameter([&] {
+        dlist_->BindLoadingOverheadGroups(LoadingOverheadConfig{
+            LoadingOverheadGroupBinding{budget},
+            std::nullopt,
+        });
+    });
 }
 
 TEST_F(LoadingOverheadGroupTest, PassthroughAllowsMissingRuntimeUnitButBoundedReconfigurationDoesNot) {

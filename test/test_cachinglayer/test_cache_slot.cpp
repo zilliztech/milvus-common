@@ -2252,9 +2252,13 @@ TEST(CacheSlotLoadingOverheadTest, InvalidGroupBindingDoesNotLeakSlotMetrics) {
         std::nullopt,
     });
 
-    EXPECT_THROW(std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, false,
-                                                       std::chrono::milliseconds(5000), std::chrono::milliseconds(0)),
-                 std::invalid_argument);
+    try {
+        (void)std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, false,
+                                                    std::chrono::milliseconds(5000), std::chrono::milliseconds(0));
+        ADD_FAILURE() << "Expected InvalidParameter";
+    } catch (const milvus::SegcoreError& error) {
+        EXPECT_EQ(error.get_error_code(), milvus::ErrorCode::InvalidParameter);
+    }
     EXPECT_EQ(slot_count.Value(), slot_baseline);
     EXPECT_EQ(cell_count.Value(), cell_baseline);
 

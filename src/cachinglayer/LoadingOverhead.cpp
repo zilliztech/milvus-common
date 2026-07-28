@@ -31,13 +31,16 @@ void
 LoadingOverheadGroup::validateBinding(LoadingOverheadDimension dimension,
                                       const std::optional<int64_t>& max_runtime_unit) const {
     if (dimension_ != dimension) {
-        throw std::invalid_argument("loading-overhead binding requires a Group from the matching dimension");
+        ThrowInfo(milvus::ErrorCode::InvalidParameter,
+                  "loading-overhead binding requires a Group from the matching dimension");
     }
     if (max_runtime_unit.has_value() && max_runtime_unit.value() < 0) {
-        throw std::invalid_argument("loading-overhead binding runtime-unit bound must be non-negative");
+        ThrowInfo(milvus::ErrorCode::InvalidParameter,
+                  "loading-overhead binding runtime-unit bound must be non-negative");
     }
     if (!max_runtime_unit.has_value() && requiresRuntimeUnitBound(policy_)) {
-        throw std::invalid_argument("bounded loading-overhead Group binding requires max_runtime_unit");
+        ThrowInfo(milvus::ErrorCode::InvalidParameter,
+                  "bounded loading-overhead Group binding requires max_runtime_unit");
     }
 }
 
@@ -87,10 +90,10 @@ LoadingOverheadGroup::updatePolicy(LoadingOverheadPolicy policy) {
 void
 LoadingOverheadGroup::validateReserve(int64_t overhead) const {
     if (overhead < 0) {
-        throw std::invalid_argument("loading-overhead Group demand must be non-negative");
+        ThrowInfo(milvus::ErrorCode::InvalidParameter, "loading-overhead Group demand must be non-negative");
     }
     if (sum_of_overhead_ > std::numeric_limits<int64_t>::max() - overhead) {
-        throw std::overflow_error("loading-overhead Group aggregate demand exceeds int64_t");
+        ThrowInfo(milvus::ErrorCode::InvalidParameter, "loading-overhead Group aggregate demand exceeds int64_t");
     }
 }
 
