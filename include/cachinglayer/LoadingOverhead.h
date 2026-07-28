@@ -115,7 +115,7 @@ class LoadingOverheadGroup {
     bind(const std::optional<int64_t>& max_runtime_unit);
 
     void
-    unbind(LoadingOverheadDimension dimension, const std::optional<int64_t>& max_runtime_unit) noexcept;
+    unbind(const std::optional<int64_t>& max_runtime_unit) noexcept;
 
     LoadingOverheadUpdateResult
     updatePolicy(LoadingOverheadPolicy policy);

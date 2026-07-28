@@ -76,7 +76,7 @@ DList::BindLoadingOverheadGroups(const LoadingOverheadConfig& config) {
         }
     } catch (...) {
         if (memory_bound) {
-            config.memory->group->unbind(LoadingOverheadDimension::kMemory, config.memory->max_runtime_unit);
+            config.memory->group->unbind(config.memory->max_runtime_unit);
         }
         throw;
     }
@@ -89,14 +89,14 @@ DList::UnbindLoadingOverheadGroups(const LoadingOverheadConfig& config) {
         std::lock_guard<std::mutex> lock(list_mtx_);
         if (config.memory.has_value()) {
             if (config.memory->group) {
-                config.memory->group->unbind(LoadingOverheadDimension::kMemory, config.memory->max_runtime_unit);
+                config.memory->group->unbind(config.memory->max_runtime_unit);
             } else {
                 LOG_ERROR("[MCL] LoadingOverheadGroup cannot unbind invalid memory Group");
             }
         }
         if (config.file.has_value()) {
             if (config.file->group) {
-                config.file->group->unbind(LoadingOverheadDimension::kFile, config.file->max_runtime_unit);
+                config.file->group->unbind(config.file->max_runtime_unit);
             } else {
                 LOG_ERROR("[MCL] LoadingOverheadGroup cannot unbind invalid file Group");
             }

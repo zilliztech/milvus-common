@@ -52,13 +52,7 @@ LoadingOverheadGroup::bind(const std::optional<int64_t>& max_runtime_unit) {
 }
 
 void
-LoadingOverheadGroup::unbind(LoadingOverheadDimension dimension,
-                             const std::optional<int64_t>& max_runtime_unit) noexcept {
-    if (dimension_ != dimension) {
-        LOG_ERROR("[MCL] LoadingOverheadGroup cannot unbind invalid {} Group", DimensionName(dimension));
-        return;
-    }
-
+LoadingOverheadGroup::unbind(const std::optional<int64_t>& max_runtime_unit) noexcept {
     if (max_runtime_unit.has_value()) {
         const auto unit_it = runtime_unit_bounds_.find(max_runtime_unit.value());
         if (unit_it == runtime_unit_bounds_.end()) {
