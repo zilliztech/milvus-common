@@ -87,6 +87,9 @@ class MockTranslator : public Translator<TestCell> {
 
     std::pair<ResourceUsage, ResourceUsage>
     estimated_byte_size_of_cell(cid_t cid) const override {
+        if (auto it = loaded_size_overrides_.find(cid); it != loaded_size_overrides_.end()) {
+            return {it->second, loading_overhead_};
+        }
         auto it = cell_sizes_.find(cid);
         if (it != cell_sizes_.end()) {
             return {{it->second, 0}, loading_overhead_};
@@ -170,6 +173,11 @@ class MockTranslator : public Translator<TestCell> {
             cid_load_delay_ms_[pair.first] = pair.second;
         }
     }
+
+    void
+    SetLoadedSize(cid_t cid, ResourceUsage loaded_size) {
+        loaded_size_overrides_[cid] = loaded_size;
+    }
     void
     SetShouldThrow(bool should_throw) {
         load_should_throw_ = should_throw;
@@ -217,6 +225,7 @@ class MockTranslator : public Translator<TestCell> {
  private:
     std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map_;
     std::unordered_map<cid_t, int64_t> cell_sizes_;
+    std::unordered_map<cid_t, ResourceUsage> loaded_size_overrides_;
     std::unordered_set<cid_t> cid_set_;
     const size_t num_unique_cids_;
     const std::string key_;
@@ -955,6 +964,37 @@ TEST_F(CacheSlotTest, PinAllCellsWithCancellationToken) {
     }
 }
 
+TEST(PinAllCellsTest, KeepsSingleLoadRequestAndAllCellsPinned) {
+    constexpr int64_t kMiB = 1024LL * 1024;
+    constexpr int64_t kGiB = 1024 * kMiB;
+    auto limit = ResourceUsage{10 * kGiB, 10 * kGiB};
+    auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
+
+    std::vector<std::pair<cid_t, int64_t>> cell_sizes = {{0, 600 * kMiB}, {1, 400 * kMiB}, {2, 400 * kMiB}};
+    std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map = {{0, 0}, {1, 1}, {2, 2}};
+    auto translator =
+        std::make_unique<MockTranslator>(cell_sizes, uid_to_cid_map, "pin_all_size_batched_slot", StorageType::MEMORY);
+    translator->SetLoadedSize(0, ResourceUsage{600 * kMiB, 600 * kMiB});
+    auto* translator_ptr = translator.get();
+    auto cache_slot =
+        std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                              std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
+    auto op_ctx = std::make_unique<milvus::OpContext>();
+
+    auto accessor = SemiInlineGet(cache_slot->PinAllCells(op_ctx.get()));
+
+    ASSERT_EQ(translator_ptr->GetRequestedCids().size(), 1);
+    auto requested_cids = translator_ptr->GetRequestedCids()[0];
+    std::sort(requested_cids.begin(), requested_cids.end());
+    EXPECT_EQ(requested_cids, (std::vector<cid_t>{0, 1, 2}));
+    for (cid_t cid = 0; cid < 3; ++cid) {
+        ASSERT_NE(accessor->get_ith_cell(cid), nullptr);
+    }
+    EXPECT_FALSE(cache_slot->ManualEvictAll());
+    accessor.reset();
+    EXPECT_TRUE(cache_slot->ManualEvictAll());
+}
+
 class CacheSlotConcurrentTest : public CacheSlotTest, public ::testing::WithParamInterface<bool> {};
 
 TEST_P(CacheSlotConcurrentTest, ConcurrentAccessMultipleSlots) {
@@ -1199,11 +1239,13 @@ class MockTranslatorWithWarmup : public Translator<TestCell> {
  public:
     MockTranslatorWithWarmup(std::vector<std::pair<cid_t, int64_t>> cell_sizes,
                              std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map, const std::string& key,
-                             StorageType storage_type, CacheWarmupPolicy warmup_policy)
+                             StorageType storage_type, CacheWarmupPolicy warmup_policy,
+                             ResourceUsage loading_overhead = {})
         : uid_to_cid_map_(std::move(uid_to_cid_map)),
           num_unique_cids_(cell_sizes.size()),
           key_(key),
-          meta_(storage_type, CellIdMappingMode::CUSTOMIZED, CellDataType::OTHER, warmup_policy, true) {
+          meta_(storage_type, CellIdMappingMode::CUSTOMIZED, CellDataType::OTHER, warmup_policy, true),
+          loading_overhead_(loading_overhead) {
         cid_set_.reserve(cell_sizes.size());
         cell_sizes_.reserve(cell_sizes.size());
         for (const auto& pair : cell_sizes) {
@@ -1233,11 +1275,14 @@ class MockTranslatorWithWarmup : public Translator<TestCell> {
 
     std::pair<ResourceUsage, ResourceUsage>
     estimated_byte_size_of_cell(cid_t cid) const override {
+        if (auto it = loaded_size_overrides_.find(cid); it != loaded_size_overrides_.end()) {
+            return {it->second, loading_overhead_};
+        }
         auto it = cell_sizes_.find(cid);
         if (it != cell_sizes_.end()) {
-            return {{it->second, 0}, {0, 0}};
+            return {{it->second, 0}, loading_overhead_};
         }
-        return {{1, 0}, {0, 0}};
+        return {{1, 0}, loading_overhead_};
     }
 
     int64_t
@@ -1267,6 +1312,7 @@ class MockTranslatorWithWarmup : public Translator<TestCell> {
     std::vector<std::pair<cid_t, std::unique_ptr<TestCell>>>
     get_cells(milvus::OpContext* ctx, const std::vector<cid_t>& cids) override {
         get_cells_call_count_++;
+        requested_cids_.push_back(cids);
         if (shared_call_counter_) {
             shared_call_counter_->fetch_add(1);
         }
@@ -1321,9 +1367,19 @@ class MockTranslatorWithWarmup : public Translator<TestCell> {
         }
     }
 
+    void
+    SetLoadedSize(cid_t cid, ResourceUsage loaded_size) {
+        loaded_size_overrides_[cid] = loaded_size;
+    }
+
     int
     GetCellsCallCount() const {
         return get_cells_call_count_;
+    }
+
+    const std::vector<std::vector<cid_t>>&
+    GetRequestedCids() const {
+        return requested_cids_;
     }
 
     milvus::OpContext*
@@ -1367,12 +1423,15 @@ class MockTranslatorWithWarmup : public Translator<TestCell> {
  private:
     std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map_;
     std::unordered_map<cid_t, int64_t> cell_sizes_;
+    std::unordered_map<cid_t, ResourceUsage> loaded_size_overrides_;
     std::unordered_set<cid_t> cid_set_;
     const size_t num_unique_cids_;
     const std::string key_;
     Meta meta_;
+    ResourceUsage loading_overhead_;
     std::unordered_map<cid_t, int> cid_load_delay_ms_;
     std::atomic<int> get_cells_call_count_ = 0;
+    std::vector<std::vector<cid_t>> requested_cids_;
     milvus::OpContext* last_ctx_ = nullptr;
     bool last_ctx_has_trace_ = false;
     std::optional<std::string> last_trace_id_hex_;
@@ -1482,6 +1541,81 @@ TEST(WarmupTest, WarmupPassesCtxToGetCells) {
     EXPECT_EQ(translator_ptr->GetCellsCallCount(), 1);
     // Verify that the ctx was passed through to get_cells
     EXPECT_EQ(translator_ptr->GetLastCtx(), op_ctx.get());
+}
+
+TEST(WarmupTest, WarmupUsesCidsWithoutUidRemapping) {
+    auto limit = ResourceUsage{10000, 0};
+    auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
+
+    std::vector<std::pair<cid_t, int64_t>> cell_sizes = {{0, 100}, {1, 100}};
+    std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map = {{100, 0}, {101, 1}};
+    auto translator = std::make_unique<MockTranslatorWithWarmup>(
+        cell_sizes, uid_to_cid_map, "cid_warmup_slot", StorageType::MEMORY, CacheWarmupPolicy::CacheWarmupPolicy_Sync);
+    auto* translator_ptr = translator.get();
+
+    auto cache_slot =
+        std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                              std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
+
+    EXPECT_NO_THROW(cache_slot->Warmup(nullptr));
+
+    ASSERT_EQ(translator_ptr->GetRequestedCids().size(), 1);
+    auto requested_cids = translator_ptr->GetRequestedCids()[0];
+    std::sort(requested_cids.begin(), requested_cids.end());
+    EXPECT_EQ(requested_cids, (std::vector<cid_t>{0, 1}));
+}
+
+TEST(WarmupTest, SyncWarmupSplitsPinCellsAt512MiBLoadedSize) {
+    constexpr int64_t kMiB = 1024LL * 1024;
+    constexpr int64_t kGiB = 1024 * kMiB;
+    auto limit = ResourceUsage{10 * kGiB, 10 * kGiB};
+    auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
+
+    std::vector<std::pair<cid_t, int64_t>> cell_sizes = {{0, 300 * kMiB}, {1, 200 * kMiB}, {2, 200 * kMiB}};
+    std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map = {{0, 0}, {1, 1}, {2, 2}};
+    auto translator = std::make_unique<MockTranslatorWithWarmup>(
+        cell_sizes, uid_to_cid_map, "size_batched_warmup_slot", StorageType::MEMORY,
+        CacheWarmupPolicy::CacheWarmupPolicy_Sync, ResourceUsage{2 * kGiB, 0});
+    translator->SetLoadedSize(0, ResourceUsage{300 * kMiB, 300 * kMiB});
+    auto* translator_ptr = translator.get();
+
+    auto cache_slot =
+        std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                              std::chrono::milliseconds(100000), std::chrono::milliseconds(1000));
+
+    EXPECT_NO_THROW(cache_slot->Warmup(nullptr));
+
+    ASSERT_EQ(translator_ptr->GetRequestedCids().size(), 2);
+    auto first_batch = translator_ptr->GetRequestedCids()[0];
+    std::sort(first_batch.begin(), first_batch.end());
+    EXPECT_EQ(first_batch, (std::vector<cid_t>{0, 1}));
+    EXPECT_EQ(translator_ptr->GetRequestedCids()[1], std::vector<cid_t>{2});
+}
+
+TEST(WarmupTest, NonEvictableWarmupKeepsSingleLoadRequest) {
+    constexpr int64_t kMiB = 1024LL * 1024;
+    constexpr int64_t kGiB = 1024 * kMiB;
+    auto limit = ResourceUsage{10 * kGiB, 10 * kGiB};
+    auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
+
+    std::vector<std::pair<cid_t, int64_t>> cell_sizes = {{0, 600 * kMiB}, {1, 400 * kMiB}, {2, 400 * kMiB}};
+    std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map = {{0, 0}, {1, 1}, {2, 2}};
+    auto translator =
+        std::make_unique<MockTranslatorWithWarmup>(cell_sizes, uid_to_cid_map, "non_evictable_warmup_slot",
+                                                   StorageType::MEMORY, CacheWarmupPolicy::CacheWarmupPolicy_Sync);
+    translator->SetLoadedSize(0, ResourceUsage{600 * kMiB, 600 * kMiB});
+    auto* translator_ptr = translator.get();
+
+    auto cache_slot =
+        std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), false, true, true,
+                                              std::chrono::milliseconds(100000), std::chrono::milliseconds(1000));
+
+    EXPECT_NO_THROW(cache_slot->Warmup(nullptr));
+
+    ASSERT_EQ(translator_ptr->GetRequestedCids().size(), 1);
+    auto requested_cids = translator_ptr->GetRequestedCids()[0];
+    std::sort(requested_cids.begin(), requested_cids.end());
+    EXPECT_EQ(requested_cids, (std::vector<cid_t>{0, 1, 2}));
 }
 
 TEST(WarmupTraceContextTest, SyncWarmupPassesTraceContext) {
@@ -2002,6 +2136,112 @@ TEST(AsyncWarmupTest, DisabledWarmupStillWorks) {
 }
 
 // ==================== Warmup Loading Timeout Tests ====================
+
+TEST(WarmupTimeoutTest, PositiveTimeoutAppliesAcrossAllBatches) {
+    constexpr int64_t kMiB = 1024LL * 1024;
+    constexpr int64_t kGiB = 1024 * kMiB;
+    auto limit = ResourceUsage{kGiB, 0};
+    auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
+
+    auto initial_blocker = ResourceUsage{600 * kMiB, 0};
+    auto initial_reserve = dlist->ReserveLoadingResourceWithTimeout(initial_blocker, std::chrono::milliseconds(0));
+    ASSERT_TRUE(std::move(initial_reserve).get());
+
+    std::vector<std::pair<cid_t, int64_t>> cell_sizes = {{0, 500 * kMiB}, {1, 600 * kMiB}};
+    std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map = {{0, 0}, {1, 1}};
+    auto translator =
+        std::make_unique<MockTranslatorWithWarmup>(cell_sizes, uid_to_cid_map, "shared_warmup_deadline_slot",
+                                                   StorageType::MEMORY, CacheWarmupPolicy::CacheWarmupPolicy_Sync);
+    auto* translator_ptr = translator.get();
+
+    auto second_blocker = ResourceUsage{500 * kMiB, 0};
+    std::atomic<bool> second_blocker_scheduled = false;
+    std::atomic<bool> second_blocker_reserved = false;
+    std::thread release_second_blocker;
+    translator->SetLoadStartedCallback([&]() {
+        if (second_blocker_scheduled.exchange(true)) {
+            return;
+        }
+        auto reserve = dlist->ReserveLoadingResourceWithTimeout(second_blocker, std::chrono::milliseconds(0));
+        second_blocker_reserved.store(std::move(reserve).get());
+        if (second_blocker_reserved.load()) {
+            release_second_blocker = std::thread([dlist, second_blocker]() {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                dlist->ReleaseLoadingResource(second_blocker);
+            });
+        }
+    });
+
+    auto cache_slot =
+        std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                              std::chrono::milliseconds(100000), std::chrono::milliseconds(600));
+
+    std::thread release_initial_blocker([dlist, initial_blocker]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        dlist->ReleaseLoadingResource(initial_blocker);
+    });
+
+    EXPECT_THROW(cache_slot->Warmup(nullptr), std::exception);
+
+    release_initial_blocker.join();
+    if (release_second_blocker.joinable()) {
+        release_second_blocker.join();
+    }
+    EXPECT_TRUE(second_blocker_reserved.load());
+    EXPECT_EQ(translator_ptr->GetCellsCallCount(), 1);
+}
+
+TEST(WarmupTimeoutTest, SlowFirstBatchExhaustsSharedAdmissionDeadline) {
+    constexpr int64_t kMiB = 1024LL * 1024;
+    constexpr int64_t kGiB = 1024 * kMiB;
+    auto limit = ResourceUsage{kGiB, 0};
+    auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
+
+    std::vector<std::pair<cid_t, int64_t>> cell_sizes = {{0, 500 * kMiB}, {1, 600 * kMiB}};
+    std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map = {{0, 0}, {1, 1}};
+    auto translator =
+        std::make_unique<MockTranslatorWithWarmup>(cell_sizes, uid_to_cid_map, "slow_first_warmup_batch_slot",
+                                                   StorageType::MEMORY, CacheWarmupPolicy::CacheWarmupPolicy_Sync);
+    translator->SetCidLoadDelay({{0, 150}});
+    auto* translator_ptr = translator.get();
+
+    std::promise<void> first_load_completed_promise;
+    auto first_load_completed = first_load_completed_promise.get_future().share();
+    translator->SetLoadCompletedPromise(&first_load_completed_promise);
+
+    // Keep the second batch blocked until shortly after the slow first load completes. A per-batch timeout would wait
+    // and succeed, while the shared warmup deadline has already expired and must reject it immediately.
+    auto second_blocker = ResourceUsage{500 * kMiB, 0};
+    std::atomic<bool> second_blocker_scheduled = false;
+    std::atomic<bool> second_blocker_reserved = false;
+    std::thread release_second_blocker;
+    translator->SetLoadStartedCallback([&]() {
+        if (second_blocker_scheduled.exchange(true)) {
+            return;
+        }
+        auto reserve = dlist->ReserveLoadingResourceWithTimeout(second_blocker, std::chrono::milliseconds(0));
+        second_blocker_reserved.store(std::move(reserve).get());
+        if (second_blocker_reserved.load()) {
+            release_second_blocker = std::thread([dlist, second_blocker, first_load_completed]() {
+                first_load_completed.wait();
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                dlist->ReleaseLoadingResource(second_blocker);
+            });
+        }
+    });
+
+    auto cache_slot =
+        std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                              std::chrono::milliseconds(100000), std::chrono::milliseconds(100));
+
+    EXPECT_THROW(cache_slot->Warmup(nullptr), std::exception);
+
+    if (release_second_blocker.joinable()) {
+        release_second_blocker.join();
+    }
+    EXPECT_TRUE(second_blocker_reserved.load());
+    EXPECT_EQ(translator_ptr->GetCellsCallCount(), 1);
+}
 
 // Test that sync warmup with zero timeout (best-effort) exercises the zero-timeout
 // path in DList::ReserveLoadingResourceWithTimeout. Cell sizes fit within max capacity

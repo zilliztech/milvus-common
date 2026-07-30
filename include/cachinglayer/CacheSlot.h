@@ -111,12 +111,10 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                 return;
 
             case CacheWarmupPolicy::CacheWarmupPolicy_Async: {
-                auto cids = AllCellIds();
-
                 if (prefetch_pool) {
                     std::weak_ptr<CacheSlot<CellT>> weak_self = this->shared_from_this();
                     auto token = warmup_cancel_source_.getToken();
-                    prefetch_pool->add([weak_self, cids = std::move(cids), token]() {
+                    prefetch_pool->add([weak_self, token]() {
                         try {
                             auto self = weak_self.lock();
                             if (!self || token.isCancellationRequested()) {
@@ -125,7 +123,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                             OpContext warmup_ctx(token);
                             // Note: caller ctx is not captured - async warmup intentionally inherits only the
                             // cancellation token, not trace context, storage usage, or other caller metadata.
-                            self->PinCellsDirect(&warmup_ctx, cids, self->warmup_loading_timeout_);
+                            self->PinWarmupCells(&warmup_ctx);
                             // If the slot is not evictable, we don't need to pin the cells anymore after warmup.
                             self->skip_pin_.store(!self->evictable_, std::memory_order_release);
                         } catch (const std::exception& e) {
@@ -139,16 +137,15 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                 // Fallback to sync if no pool provided
                 LOG_WARN("[MCL] Async warmup requested but no prefetch pool provided, falling back to sync");
                 // TODO: Warmup is not tracked for now
-                PinCellsDirect(ctx, cids, warmup_loading_timeout_);
+                PinWarmupCells(ctx);
                 skip_pin_.store(!evictable_, std::memory_order_release);
                 return;
             }
 
             case CacheWarmupPolicy::CacheWarmupPolicy_Sync: {
-                auto cids = AllCellIds();
                 // Sync warmup (original behavior)
                 // TODO: Warmup is not tracked for now
-                PinCellsDirect(ctx, cids, warmup_loading_timeout_);
+                PinWarmupCells(ctx);
                 skip_pin_.store(!evictable_, std::memory_order_release);
                 return;
             }
@@ -358,6 +355,51 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         std::vector<cid_t> cids(translator_->num_cells());
         std::iota(cids.begin(), cids.end(), 0);
         return cids;
+    }
+
+    [[nodiscard]] std::vector<std::vector<cid_t>>
+    LoadedSizeBatches(const std::vector<cid_t>& cids, int64_t max_loaded_bytes = kDefaultLoadedSizeBatchBytes) const {
+        std::vector<std::vector<cid_t>> batches;
+        std::vector<cid_t> batch;
+        int64_t batch_loaded_bytes = 0;
+        batch.reserve(cids.size());
+
+        for (auto cid : cids) {
+            auto loaded_size = translator_->estimated_byte_size_of_cell(cid).first;
+            auto cell_loaded_bytes = std::max(loaded_size.memory_bytes, loaded_size.file_bytes);
+            if (!batch.empty() && cell_loaded_bytes > max_loaded_bytes - batch_loaded_bytes) {
+                batches.push_back(std::move(batch));
+                batch = {};
+                batch_loaded_bytes = 0;
+            }
+            batch.push_back(cid);
+            batch_loaded_bytes += cell_loaded_bytes;
+        }
+
+        if (!batch.empty()) {
+            batches.push_back(std::move(batch));
+        }
+        return batches;
+    }
+
+    void
+    PinWarmupCells(OpContext* ctx) {
+        auto cids = AllCellIds();
+        if (!evictable_) {
+            PinInternal(ctx, cids, warmup_loading_timeout_);
+            return;
+        }
+        auto batches = LoadedSizeBatches(cids);
+        auto deadline = warmup_loading_timeout_.count() > 0 ? std::chrono::steady_clock::now() + warmup_loading_timeout_
+                                                            : std::chrono::steady_clock::time_point::max();
+        for (const auto& batch : batches) {
+            auto timeout = warmup_loading_timeout_;
+            if (timeout.count() > 0) {
+                timeout = std::max(std::chrono::milliseconds(0), std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                                     deadline - std::chrono::steady_clock::now()));
+            }
+            PinInternal(ctx, batch, timeout);
+        }
     }
 
     std::shared_ptr<CellAccessor<CellT>>
@@ -719,6 +761,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     const bool storage_usage_tracking_enabled_;
     std::chrono::milliseconds loading_timeout_{100000};
     std::chrono::milliseconds warmup_loading_timeout_{0};
+    static constexpr int64_t kDefaultLoadedSizeBatchBytes = 1LL << 29;
     uint64_t overhead_handle_{0};
     std::atomic<bool> warmup_called_{false};
     std::atomic<bool> skip_pin_{false};
