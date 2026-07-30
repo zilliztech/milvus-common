@@ -398,11 +398,19 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     PinWarmupCells(OpContext* ctx) {
         auto cids = AllCellIds();
         if (!evictable_) {
-            PinCellsDirect(ctx, cids, warmup_loading_timeout_);
+            PinInternal(ctx, cids, warmup_loading_timeout_);
             return;
         }
-        for (const auto& batch : LoadedSizeBatches(cids)) {
-            PinCellsDirect(ctx, batch, warmup_loading_timeout_);
+        auto batches = LoadedSizeBatches(cids);
+        auto deadline = warmup_loading_timeout_.count() > 0 ? std::chrono::steady_clock::now() + warmup_loading_timeout_
+                                                            : std::chrono::steady_clock::time_point::max();
+        for (const auto& batch : batches) {
+            auto timeout = warmup_loading_timeout_;
+            if (timeout.count() > 0) {
+                timeout = std::max(std::chrono::milliseconds(0), std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                                     deadline - std::chrono::steady_clock::now()));
+            }
+            PinInternal(ctx, batch, timeout);
         }
     }
 
@@ -774,7 +782,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     std::chrono::milliseconds warmup_loading_timeout_{0};
     // Bind and Unbind must use the same runtime-unit metadata even if Meta is later modified.
     std::optional<LoadingOverheadConfig> loading_overhead_config_;
-    static constexpr int64_t kDefaultLoadedSizeBatchBytes = 1LL << 30;
+    static constexpr int64_t kDefaultLoadedSizeBatchBytes = 1LL << 29;
     std::atomic<bool> warmup_called_{false};
     std::atomic<bool> skip_pin_{false};
 };
