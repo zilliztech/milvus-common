@@ -2191,6 +2191,58 @@ TEST(WarmupTimeoutTest, PositiveTimeoutAppliesAcrossAllBatches) {
     EXPECT_EQ(translator_ptr->GetCellsCallCount(), 1);
 }
 
+TEST(WarmupTimeoutTest, SlowFirstBatchExhaustsSharedAdmissionDeadline) {
+    constexpr int64_t kMiB = 1024LL * 1024;
+    constexpr int64_t kGiB = 1024 * kMiB;
+    auto limit = ResourceUsage{kGiB, 0};
+    auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
+
+    std::vector<std::pair<cid_t, int64_t>> cell_sizes = {{0, 500 * kMiB}, {1, 600 * kMiB}};
+    std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map = {{0, 0}, {1, 1}};
+    auto translator =
+        std::make_unique<MockTranslatorWithWarmup>(cell_sizes, uid_to_cid_map, "slow_first_warmup_batch_slot",
+                                                   StorageType::MEMORY, CacheWarmupPolicy::CacheWarmupPolicy_Sync);
+    translator->SetCidLoadDelay({{0, 150}});
+    auto* translator_ptr = translator.get();
+
+    std::promise<void> first_load_completed_promise;
+    auto first_load_completed = first_load_completed_promise.get_future().share();
+    translator->SetLoadCompletedPromise(&first_load_completed_promise);
+
+    // Keep the second batch blocked until shortly after the slow first load completes. A per-batch timeout would wait
+    // and succeed, while the shared warmup deadline has already expired and must reject it immediately.
+    auto second_blocker = ResourceUsage{500 * kMiB, 0};
+    std::atomic<bool> second_blocker_scheduled = false;
+    std::atomic<bool> second_blocker_reserved = false;
+    std::thread release_second_blocker;
+    translator->SetLoadStartedCallback([&]() {
+        if (second_blocker_scheduled.exchange(true)) {
+            return;
+        }
+        auto reserve = dlist->ReserveLoadingResourceWithTimeout(second_blocker, std::chrono::milliseconds(0));
+        second_blocker_reserved.store(std::move(reserve).get());
+        if (second_blocker_reserved.load()) {
+            release_second_blocker = std::thread([dlist, second_blocker, first_load_completed]() {
+                first_load_completed.wait();
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                dlist->ReleaseLoadingResource(second_blocker);
+            });
+        }
+    });
+
+    auto cache_slot =
+        std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                              std::chrono::milliseconds(100000), std::chrono::milliseconds(100));
+
+    EXPECT_THROW(cache_slot->Warmup(nullptr), std::exception);
+
+    if (release_second_blocker.joinable()) {
+        release_second_blocker.join();
+    }
+    EXPECT_TRUE(second_blocker_reserved.load());
+    EXPECT_EQ(translator_ptr->GetCellsCallCount(), 1);
+}
+
 // Test that sync warmup with zero timeout (best-effort) exercises the zero-timeout
 // path in DList::ReserveLoadingResourceWithTimeout. Cell sizes fit within max capacity
 // but resources are pre-reserved so reservation fails at the zero-timeout check.
