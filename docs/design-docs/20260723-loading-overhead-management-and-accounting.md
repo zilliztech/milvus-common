@@ -29,7 +29,7 @@ This design introduces explicit loading-overhead Groups. A Group aggregates acti
 - Aggregate loading overhead across CacheSlots governed by the same runtime limiter.
 - Support multiple independent Groups in one process.
 - Keep memory and file accounting independent.
-- Support fixed, passthrough, Budget-backed, and executor-backed policies.
+- Support passthrough, Budget-backed, and executor-backed policies.
 - Allow an authoritative owner to replace a Group policy at runtime.
 - Serialize Group binding, admission, rollback, release, policy replacement, and waiter retry with `DList` accounting.
 - Preserve request-local passthrough behavior for dimensions that do not join a Group.
@@ -606,13 +606,15 @@ A policy update or another request's Group activity can change a waiter's requir
 
 During processing:
 
-- the current requirement is recomputed;
+- the current requirement is recomputed when a waiter is attempted;
 - a permanently impossible request whose policy-independent minimum exceeds DList capacity fails immediately;
 - aggregate-demand overflow discovered during retry fails only that waiter and does not unwind the outer DList transition;
 - a capacity-blocked request is reinserted with its refreshed requirement;
-- peers with exactly the same deadline are also examined so a stale or newly larger top request cannot hide a smaller request that now fits.
+- peers with exactly the same deadline are also examined so a blocked stale or newly larger top request cannot hide another request that already fits.
 
-Finite waiters retain the exact `steady_clock::now() + timeout` deadline. They are scanned together only when those deadlines are exactly equal. Indefinite waiters use `time_point::max()`, so they share one equal-deadline scan set. Scanning that set is an intentional correctness trade-off that prevents a stale top waiter from hiding another indefinite waiter that already fits.
+The size key is best-effort for Group-aware waiters. If a stale heap top still fits under current Group state, DList admits it without first refreshing and rebuilding all equal-deadline peers. Strict current-size ordering is intentionally not guaranteed because every admission can change shared Group state and require another O(N) refresh.
+
+Finite waiters retain the exact `steady_clock::now() + timeout` deadline. They are scanned together only when those deadlines are exactly equal. Indefinite waiters use `time_point::max()`, so they share one equal-deadline scan set. Scanning that set is an intentional correctness trade-off that prevents a blocked stale top waiter from hiding another indefinite waiter that already fits.
 
 ### 9.2 Reprocessing Triggers
 

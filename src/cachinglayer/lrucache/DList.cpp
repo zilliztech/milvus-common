@@ -1008,6 +1008,11 @@ DList::handleWaitingRequests() {
 
         // Try to fulfill: Group-aware path computes delta under lock;
         // request-local path uses required_size directly.
+        //
+        // NOTE: A Group-aware request's required_size is a cached, best-effort heap key. Dynamic policy or aggregate
+        // state changes may make it stale while queued. If the stale heap top still fits, we intentionally admit it
+        // without rebuilding all equal-deadline peers; strict size ordering would require repeated O(N) refreshes as
+        // each admission changes shared Group state. A failed attempt refreshes the key and scans equal-deadline peers.
         bool fulfilled = false;
         ResourceUsage actual{};
         auto attempted_requirement = request_ptr_ref->required_size;

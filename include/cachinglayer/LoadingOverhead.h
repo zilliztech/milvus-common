@@ -169,7 +169,7 @@ struct LoadingOverheadGroupBinding {
      * The Group caches the maximum value across attached bindings. A
      * policy that bounds Budget acquisitions or executor tasks requires
      * this value on every binding; binding or policy replacement is
-     * rejected otherwise. Fixed and Passthrough Groups do not require it. It
+     * rejected otherwise. Passthrough Groups do not require it. It
      * must describe one runtime unit, not the sum of a multi-cell load request.
      *
      * @pre When present, the value is non-negative.
