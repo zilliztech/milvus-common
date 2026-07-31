@@ -16,7 +16,7 @@
 #include <memory>
 
 #include "cachinglayer/CacheSlot.h"
-#include "cachinglayer/LoadingOverheadTracker.h"
+#include "cachinglayer/LoadingOverhead.h"
 #include "cachinglayer/TieredStorageConfig.h"
 #include "cachinglayer/Translator.h"
 #include "cachinglayer/Utils.h"
@@ -42,6 +42,21 @@ class Manager {
     static void
     UpdateConfig(std::chrono::milliseconds loading_timeout, std::chrono::milliseconds warmup_loading_timeout,
                  bool storage_usage_tracking_enabled, CacheWarmupPolicies warmup_policies);
+
+    // Creates one Group before it is referenced by any Translator binding.
+    static LoadingOverheadGroupHandle
+    CreateLoadingOverheadGroup(LoadingOverheadDimension dimension, LoadingOverheadPolicy policy);
+
+    // Replaces the policy of an existing Group while preserving its runtime
+    // state. Calling contract for the authoritative owner of that Group:
+    // - Serialize all reconfigurations and build the policy from the latest
+    //   configured Budget/TP limit in the same serialized section.
+    // - Expansion: update the Group before increasing the actual Budget/TP.
+    //   Existing reservation reconciles on the next request Reserve.
+    // - Tightening: restrict the actual Budget/TP first, then update the Group
+    //   with the desired policy. Existing reservation drains lazily with inflight work.
+    static LoadingOverheadUpdateResult
+    UpdateLoadingOverheadGroup(const LoadingOverheadGroupHandle& group, LoadingOverheadPolicy policy);
 
     ~Manager();
 
@@ -146,7 +161,6 @@ class Manager {
 
     std::shared_ptr<internal::DList> dlist_{nullptr};
     std::shared_ptr<folly::CPUThreadPoolExecutor> prefetch_pool_{nullptr};
-    std::shared_ptr<LoadingOverheadTracker> loading_overhead_tracker_ = std::make_shared<LoadingOverheadTracker>();
     bool eviction_enabled_{false};
 };  // class Manager
 
