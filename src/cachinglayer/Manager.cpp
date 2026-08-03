@@ -67,7 +67,7 @@ Manager::ConfigureTieredStorage(CacheWarmupPolicies warmup_policies, CacheLimit 
             "background eviction enabled: {}, eviction interval: {} ms, "
             "physical memory max ratio: {}, max disk usage percentage: {}, "
             "loading resource factor: {}, cache cell unaccessed survival time: "
-            "{} ms, warmup policies: {}",
+            "{} s, warmup policies: {}",
             FormatBytes(low_watermark.memory_bytes), FormatBytes(high_watermark.memory_bytes),
             FormatBytes(max.memory_bytes), FormatBytes(low_watermark.file_bytes),
             FormatBytes(high_watermark.file_bytes), FormatBytes(max.file_bytes),
