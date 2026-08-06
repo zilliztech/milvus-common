@@ -81,6 +81,10 @@ enum ErrorCode {
     //       IO error becomes non-retriable and regresses availability.
     StorageError = 2044,
     StorageTransientError = 2045,
+    // Index building found that the target field has no indexable data. This
+    // is a control-flow signal: the build should be treated as finished
+    // without producing index files, rather than retried or reported failed.
+    IndexBuildSkip = 2047,
 
     KnowhereError = 2099,
 };
