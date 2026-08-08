@@ -16,6 +16,7 @@ find_package(Threads REQUIRED)
 
 set(ALL_TEST_FILES
     init_gtest.cpp
+    FeatureReportTest.cpp
     TracerTest.cpp
     StreamTest.cpp
     PtrHashTest.cpp
