@@ -23,6 +23,8 @@
 namespace fs = std::filesystem;
 using milvus::cachinglayer::internal::getContainerMemLimit;
 using milvus::cachinglayer::internal::getCurrentProcessMemoryUsage;
+using milvus::cachinglayer::internal::getMaxLoadingMemSize;
+using milvus::cachinglayer::internal::getHostTotalMemory;
 using milvus::cachinglayer::internal::getSystemDiskInfo;
 using milvus::cachinglayer::internal::getSystemMemoryInfo;
 using milvus::cachinglayer::internal::SystemResourceInfo;
@@ -88,6 +90,39 @@ TEST(Utils, GetContainerMemLimitEnvOnly) {
 #else
     GTEST_SKIP() << "getContainerMemLimit is only implemented on Linux";
 #endif
+}
+
+TEST(Utils, GetMaxLoadingMemSizeUsesCgroupLimit) {
+#ifdef __linux__
+    EnvGuard guard_root("MCL_CGROUP_ROOT", "/path/that/does/not/exist");
+    EnvGuard guard_proc("MCL_PROC_CGROUP", "/path/that/does/not/exist");
+    EnvGuard guard_mem("MEM_LIMIT", "1073741824");
+
+    EXPECT_EQ(getMaxLoadingMemSize(0.25), 268435456);
+    EXPECT_EQ(getMaxLoadingMemSize(1.0), 1073741824);
+    EXPECT_EQ(getMaxLoadingMemSize(0.0), 0);
+#else
+    GTEST_SKIP() << "getMaxLoadingMemSize is only implemented on Linux";
+#endif
+}
+
+TEST(Utils, GetMaxLoadingMemSizeFallsBackToHostMemoryWithoutCgroupLimit) {
+#ifdef __linux__
+    EnvGuard guard_root("MCL_CGROUP_ROOT", "/path/that/does/not/exist");
+    EnvGuard guard_proc("MCL_PROC_CGROUP", "/path/that/does/not/exist");
+    EnvGuard guard_mem("MEM_LIMIT", nullptr);
+
+    const auto host_memory = getHostTotalMemory();
+    ASSERT_GT(host_memory, 0);
+    EXPECT_EQ(getMaxLoadingMemSize(0.5), static_cast<int64_t>(host_memory * 0.5));
+#else
+    GTEST_SKIP() << "getMaxLoadingMemSize is only implemented on Linux";
+#endif
+}
+
+TEST(Utils, GetMaxLoadingMemSizeRejectsInvalidRatio) {
+    EXPECT_THROW(getMaxLoadingMemSize(-0.1), milvus::SegcoreError);
+    EXPECT_THROW(getMaxLoadingMemSize(1.1), milvus::SegcoreError);
 }
 
 // MEM_LIMIT should override any cgroup limits when present.

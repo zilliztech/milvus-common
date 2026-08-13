@@ -225,6 +225,19 @@ getContainerMemLimit() {
     return 0;
 }
 
+int64_t
+getMaxLoadingMemSize(double max_loading_mem_ratio) {
+    AssertInfo(max_loading_mem_ratio >= 0 && max_loading_mem_ratio <= 1,
+               "[MCL] max loading memory ratio must be between 0 and 1, got {}", max_loading_mem_ratio);
+
+    const auto total_memory = getSystemMemoryInfo().total_bytes;
+    if (total_memory <= 0 || total_memory == std::numeric_limits<int64_t>::max()) {
+        LOG_WARN("[MCL] Cannot determine effective memory limit; max loading memory remains unlimited");
+        return -1;
+    }
+    return static_cast<int64_t>(total_memory * max_loading_mem_ratio);
+}
+
 SystemResourceInfo
 getSystemMemoryInfo() {
     SystemResourceInfo info;

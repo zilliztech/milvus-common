@@ -51,7 +51,10 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std
                   max_resource_limit_.load().ToString());
         return folly::makeSemiFuture(false);
     }
-    if (reserveResourceInternal(size)) {
+    if (exceedMaxLoadingMemSize()) {
+        LOG_DEBUG("[MCL] Reserve size={} waits for max_loading_mem_size_={}, current loading size={}", size.ToString(),
+                  FormatBytes(max_loading_mem_size_.load()), total_loading_size_.load().ToString());
+    } else if (reserveResourceInternal(size)) {
         return folly::makeSemiFuture(true);
     }
 
@@ -132,6 +135,13 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std
     }
 
     return std::move(future);
+}
+
+bool
+DList::exceedMaxLoadingMemSize() const {
+    const auto max_loading_mem_size = max_loading_mem_size_.load();
+    const auto total_loading_size = total_loading_size_.load();
+    return max_loading_mem_size >= 0 && total_loading_size.memory_bytes >= max_loading_mem_size;
 }
 
 bool
@@ -273,9 +283,11 @@ DList::usageInfo() const {
             static_cast<double>(using_resources.file_bytes) / curr_high_watermark.file_bytes * precision);
     }
 
-    info += fmt::format("); evictable_size_: {}; total_loaded_size_: {}; total_loading_size_: {}; ",
-                        evictable_size_.load().ToString(), total_loaded_size_.load().ToString(),
-                        total_loading_size_.load().ToString());
+    info += fmt::format(
+        "); evictable_size_: {}; total_loaded_size_: {}; total_loading_size_: {}; "
+        "max_loading_mem_size_: {}; ",
+        evictable_size_.load().ToString(), total_loaded_size_.load().ToString(), total_loading_size_.load().ToString(),
+        FormatBytes(max_loading_mem_size_.load()));
 
     return info;
 }
@@ -492,6 +504,21 @@ DList::UpdateHighWatermark(const ResourceUsage& new_high_watermark) {
 }
 
 void
+DList::UpdateMaxLoadingMemSize(int64_t new_max_loading_mem_size) {
+    AssertInfo(new_max_loading_mem_size >= -1,
+               "[MCL] max loading memory size must be -1 or greater. new_max_loading_mem_size: {}",
+               new_max_loading_mem_size);
+    std::vector<std::unique_ptr<WaitingRequest>> to_destroy;
+    {
+        std::unique_lock<std::mutex> lock(list_mtx_);
+        LOG_INFO("[MCL] UpdateMaxLoadingMemSize: from {} to {}", FormatBytes(max_loading_mem_size_.load()),
+                 FormatBytes(new_max_loading_mem_size));
+        max_loading_mem_size_ = new_max_loading_mem_size;
+        to_destroy = handleWaitingRequests();
+    }
+}
+
+void
 DList::ReleaseLoadingResource(const ResourceUsage& loading_size) {
     auto size = loading_size * eviction_config_.loading_resource_factor;
     total_loading_size_ -= size;
@@ -673,7 +700,7 @@ DList::handleWaitingRequests() {
             continue;
         }
 
-        if (reserveResourceInternal(request_ptr_ref->required_size)) {
+        if (!exceedMaxLoadingMemSize() && reserveResourceInternal(request_ptr_ref->required_size)) {
             auto request = std::move(request_ptr_ref);
 
             if (waiting_requests_map_.erase(request->request_id) > 0) {

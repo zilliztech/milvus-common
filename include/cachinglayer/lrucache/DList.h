@@ -35,13 +35,18 @@ namespace milvus::cachinglayer::internal {
 class DList : public std::enable_shared_from_this<DList> {
  public:
     DList(bool eviction_enabled, ResourceUsage max_memory, ResourceUsage low_watermark, ResourceUsage high_watermark,
-          EvictionConfig eviction_config)
+          EvictionConfig eviction_config, int64_t max_loading_mem_size = -1)
         : max_resource_limit_(max_memory),
           low_watermark_(low_watermark),
           high_watermark_(high_watermark),
+          max_loading_mem_size_(max_loading_mem_size),
           eviction_config_(eviction_config),
           next_request_id_(1) {
-        // if eviction is disabled, we don't need to initialize the event base and thread
+        AssertInfo(max_loading_mem_size >= -1, "[MCL] max loading memory size must be -1 or greater");
+
+        event_base_thread_ = std::make_unique<folly::ScopedEventBaseThread>("cache-eb");
+
+        // if eviction is disabled, we don't need to initialize the background eviction thread
         if (!eviction_enabled) {
             return;
         }
@@ -57,9 +62,6 @@ class DList : public std::enable_shared_from_this<DList> {
         monitor::cache_high_watermark_bytes(StorageType::DISK).Set(high_watermark.file_bytes);
         monitor::cache_low_watermark_bytes(StorageType::MEMORY).Set(low_watermark.memory_bytes);
         monitor::cache_low_watermark_bytes(StorageType::DISK).Set(low_watermark.file_bytes);
-
-        // Initialize event base and thread
-        event_base_thread_ = std::make_unique<folly::ScopedEventBaseThread>("cache-eb");
 
         if (eviction_config_.background_eviction_enabled) {
             LOG_INFO("[MCL] Starting periodic background eviction loop thread");
@@ -111,6 +113,10 @@ class DList : public std::enable_shared_from_this<DList> {
 
     void
     UpdateHighWatermark(const ResourceUsage& new_high_watermark);
+
+    // Update max loading memory size does not evict loaded cache; it may only wake waiting reserve requests.
+    void
+    UpdateMaxLoadingMemSize(int64_t new_max_loading_mem_size);
 
     // True if no nodes in the list.
     bool
@@ -201,6 +207,10 @@ class DList : public std::enable_shared_from_this<DList> {
     bool
     reserveResourceInternal(const ResourceUsage& size);
 
+    // Returns true when the request would exceed the concurrent loading memory limit.
+    bool
+    exceedMaxLoadingMemSize() const;
+
     void
     evictionLoop();
 
@@ -268,6 +278,7 @@ class DList : public std::enable_shared_from_this<DList> {
     std::atomic<ResourceUsage> max_resource_limit_;
     std::atomic<ResourceUsage> low_watermark_;
     std::atomic<ResourceUsage> high_watermark_;
+    std::atomic<int64_t> max_loading_mem_size_;
     const EvictionConfig eviction_config_;
 
     std::thread bg_eviction_thread_;
