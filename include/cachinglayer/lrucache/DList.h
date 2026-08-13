@@ -114,7 +114,7 @@ class DList : public std::enable_shared_from_this<DList> {
     void
     UpdateHighWatermark(const ResourceUsage& new_high_watermark);
 
-    // Update max loading memory size does not evict loaded cache; it may only wake waiting reserve requests.
+    // Update max loading overhead memory size does not evict loaded cache; it may only wake waiting requests.
     void
     UpdateMaxLoadingMemSize(int64_t new_max_loading_mem_size);
 
@@ -123,6 +123,8 @@ class DList : public std::enable_shared_from_this<DList> {
     IsEmpty() const;
 
     // Reserve loading resource with timeout, called before loading a cell.
+    // The two-size overload takes the estimated loaded size separately so the
+    // max loading limit can be applied to loading overhead only.
     // When timeout > 0, the request will wait up to the specified duration.
     // When timeout == 0, the request will fail immediately without entering the
     //   waiting queue (best-effort mode, used for warmup scenarios).
@@ -133,9 +135,16 @@ class DList : public std::enable_shared_from_this<DList> {
     ReserveLoadingResourceWithTimeout(const ResourceUsage& size, std::chrono::milliseconds timeout,
                                       OpContext* ctx = nullptr);
 
+    folly::SemiFuture<bool>
+    ReserveLoadingResourceWithTimeout(const ResourceUsage& loading_size, const ResourceUsage& loaded_size,
+                                      std::chrono::milliseconds timeout, OpContext* ctx = nullptr);
+
     // Release resource used for loading, called after loading a cell.
     void
     ReleaseLoadingResource(const ResourceUsage& loading_size);
+
+    void
+    ReleaseLoadingResource(const ResourceUsage& loading_size, const ResourceUsage& loaded_size);
 
     // Called when a cell is loaded.
     void
@@ -177,14 +186,15 @@ class DList : public std::enable_shared_from_this<DList> {
     // Waiting request for timeout-based memory reservation
     struct WaitingRequest {
         ResourceUsage required_size;
+        ResourceUsage overhead_size;
         std::chrono::steady_clock::time_point deadline;
         folly::Promise<bool> promise;
         uint64_t request_id;
         std::optional<folly::CancellationCallback> cancel_cb{std::nullopt};
 
-        WaitingRequest(ResourceUsage size, std::chrono::steady_clock::time_point dl, folly::Promise<bool> p,
-                       uint64_t id)
-            : required_size(size), deadline(dl), promise(std::move(p)), request_id(id) {
+        WaitingRequest(ResourceUsage size, ResourceUsage overhead, std::chrono::steady_clock::time_point dl,
+                       folly::Promise<bool> p, uint64_t id)
+            : required_size(size), overhead_size(overhead), deadline(dl), promise(std::move(p)), request_id(id) {
         }
     };
 
@@ -205,11 +215,11 @@ class DList : public std::enable_shared_from_this<DList> {
 
     // reserveResource without taking lock, must be called with lock held.
     bool
-    reserveResourceInternal(const ResourceUsage& size);
+    reserveResourceInternal(const ResourceUsage& size, const ResourceUsage& overhead_size);
 
-    // Returns true when the request would exceed the concurrent loading memory limit.
+    // Returns true when current loading overhead reaches the concurrent overhead memory limit.
     bool
-    exceedMaxLoadingMemSize() const;
+    exceedMaxOverheadMemSize() const;
 
     void
     evictionLoop();
@@ -279,6 +289,7 @@ class DList : public std::enable_shared_from_this<DList> {
     std::atomic<ResourceUsage> low_watermark_;
     std::atomic<ResourceUsage> high_watermark_;
     std::atomic<int64_t> max_loading_mem_size_;
+    std::atomic<ResourceUsage> total_loading_overhead_size_{};
     const EvictionConfig eviction_config_;
 
     std::thread bg_eviction_thread_;

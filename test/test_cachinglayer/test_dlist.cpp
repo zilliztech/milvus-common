@@ -124,6 +124,11 @@ class DListTest : public ::testing::Test {
     get_loading_memory() const {
         return DLF::get_loading_memory(*dlist);
     }
+
+    [[nodiscard]] ResourceUsage
+    get_loading_overhead_memory() const {
+        return DLF::get_loading_overhead_memory(*dlist);
+    }
 };
 
 TEST_F(DListTest, Initialization) {
@@ -1237,6 +1242,61 @@ TEST_F(DListTest, ReserveMayCrossMaxLoadingMemSizeFromBelow) {
 
     dlist->ReleaseLoadingResource({40, 0});
     dlist->ReleaseLoadingResource({30, 0});
+}
+
+TEST_F(DListTest, MaxLoadingMemSizeLimitsOnlyLoadingOverhead) {
+    dlist->UpdateMaxLoadingMemSize(30);
+
+    auto first = dlist->ReserveLoadingResourceWithTimeout({80, 0}, {60, 0}, std::chrono::milliseconds(0));
+    ASSERT_TRUE(std::move(first).get());
+    EXPECT_EQ(get_loading_memory(), (ResourceUsage{80, 0}));
+    EXPECT_EQ(get_loading_overhead_memory(), (ResourceUsage{20, 0}));
+
+    auto crossing = dlist->ReserveLoadingResourceWithTimeout({10, 0}, {0, 0}, std::chrono::milliseconds(0));
+    ASSERT_TRUE(std::move(crossing).get());
+    EXPECT_EQ(get_loading_memory(), (ResourceUsage{90, 0}));
+    EXPECT_EQ(get_loading_overhead_memory(), (ResourceUsage{30, 0}));
+
+    auto blocked = dlist->ReserveLoadingResourceWithTimeout({5, 0}, {0, 0}, std::chrono::milliseconds(0));
+    EXPECT_FALSE(std::move(blocked).get());
+
+    dlist->ReleaseLoadingResource({80, 0}, {60, 0});
+    dlist->ReleaseLoadingResource({10, 0}, {0, 0});
+    EXPECT_EQ(get_loading_overhead_memory(), ResourceUsage{});
+}
+
+TEST_F(DListTest, ZeroOverheadBypassesZeroOverheadLimit) {
+    dlist->UpdateMaxLoadingMemSize(0);
+
+    auto zero_overhead =
+        dlist->ReserveLoadingResourceWithTimeout({50, 0}, {50, 0}, std::chrono::milliseconds(0));
+    ASSERT_TRUE(std::move(zero_overhead).get());
+    EXPECT_EQ(get_loading_memory(), (ResourceUsage{50, 0}));
+    EXPECT_EQ(get_loading_overhead_memory(), ResourceUsage{});
+
+    auto positive_overhead =
+        dlist->ReserveLoadingResourceWithTimeout({10, 0}, {9, 0}, std::chrono::milliseconds(0));
+    EXPECT_FALSE(std::move(positive_overhead).get());
+
+    dlist->ReleaseLoadingResource({50, 0}, {50, 0});
+}
+
+TEST_F(DListTest, WaitingRequestTracksLoadingOverheadSeparately) {
+    dlist->UpdateMaxLoadingMemSize(20);
+    ASSERT_TRUE(std::move(dlist->ReserveLoadingResourceWithTimeout(
+                             {60, 0}, {40, 0}, std::chrono::milliseconds(100)))
+                    .get());
+
+    auto waiting =
+        dlist->ReserveLoadingResourceWithTimeout({30, 0}, {20, 0}, std::chrono::milliseconds(5000));
+
+    dlist->ReleaseLoadingResource({60, 0}, {40, 0});
+
+    EXPECT_TRUE(std::move(waiting).get());
+    EXPECT_EQ(get_loading_memory(), (ResourceUsage{30, 0}));
+    EXPECT_EQ(get_loading_overhead_memory(), (ResourceUsage{10, 0}));
+
+    dlist->ReleaseLoadingResource({30, 0}, {20, 0});
 }
 
 TEST_F(DListTest, ReserveWaitsForMaxLoadingMemSizeWhenEvictionDisabled) {

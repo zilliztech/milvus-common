@@ -427,17 +427,24 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             // bonus cells should be empty if self_reserve_ is false.
             auto bonus_cids = translator_->bonus_cells_to_be_loaded(loading_cids);
 
+            ResourceUsage essential_loaded_resource;
             for (auto& cid : loading_cids) {
-                essential_loading_resource += translator_->estimated_byte_size_of_cell(cid).second;
+                const auto [loaded_resource, loading_resource] = translator_->estimated_byte_size_of_cell(cid);
+                essential_loaded_resource += loaded_resource;
+                essential_loading_resource += loading_resource;
             }
 
+            ResourceUsage bonus_loaded_resource;
             for (auto& cid : bonus_cids) {
-                bonus_loading_resource += translator_->estimated_byte_size_of_cell(cid).second;
+                const auto [loaded_resource, loading_resource] = translator_->estimated_byte_size_of_cell(cid);
+                bonus_loaded_resource += loaded_resource;
+                bonus_loading_resource += loading_resource;
             }
 
             auto resource_needed_for_loading = essential_loading_resource + bonus_loading_resource;
-            reservation_success =
-                SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(resource_needed_for_loading, timeout, ctx));
+            auto loaded_resource = essential_loaded_resource + bonus_loaded_resource;
+            reservation_success = SemiInlineGet(
+                dlist_->ReserveLoadingResourceWithTimeout(resource_needed_for_loading, loaded_resource, timeout, ctx));
 
             if (!bonus_cids.empty()) {
                 // if the reservation failed, try to reserve only the essential loading resource
@@ -447,8 +454,9 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                         "essential "
                         "loading resource");
                     resource_needed_for_loading = essential_loading_resource;
-                    reservation_success = SemiInlineGet(
-                        dlist_->ReserveLoadingResourceWithTimeout(resource_needed_for_loading, timeout, ctx));
+                    loaded_resource = essential_loaded_resource;
+                    reservation_success = SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(
+                        resource_needed_for_loading, essential_loaded_resource, timeout, ctx));
                 } else {
                     // if the reservation succeeded, we can load the bonus cells
                     loading_cids.insert(loading_cids.end(), bonus_cids.begin(), bonus_cids.end());
@@ -475,9 +483,10 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             monitor::cache_cell_loading_count(cell_data_type_, storage_type_).Increment(loading_cids.size());
 
             // defer release resource_needed_for_loading
-            auto defer_release = folly::makeGuard([this, &resource_needed_for_loading, &loading_cids]() {
+            auto defer_release =
+                folly::makeGuard([this, &resource_needed_for_loading, &loaded_resource, &loading_cids]() {
                 try {
-                    dlist_->ReleaseLoadingResource(resource_needed_for_loading);
+                    dlist_->ReleaseLoadingResource(resource_needed_for_loading, loaded_resource);
                     monitor::cache_cell_loading_count(cell_data_type_, storage_type_).Decrement(loading_cids.size());
                     monitor::cache_loading_bytes(cell_data_type_, StorageType::MEMORY)
                         .Decrement(resource_needed_for_loading.memory_bytes);
