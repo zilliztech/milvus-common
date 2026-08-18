@@ -419,12 +419,13 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                 monitor::cache_load_latency_microseconds(cell_data_type_, storage_type_).Observe(latency.count());
             };
 
+            // The caller owns loading-resource admission when self reservation is disabled.
+            // Skip DList reservation here to avoid accounting the same load twice.
             if (!self_reserve_) {
                 run_load_internal();
                 return;
             }
 
-            // bonus cells should be empty if self_reserve_ is false.
             auto bonus_cids = translator_->bonus_cells_to_be_loaded(loading_cids);
 
             ResourceUsage essential_loaded_resource;
@@ -483,8 +484,8 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             monitor::cache_cell_loading_count(cell_data_type_, storage_type_).Increment(loading_cids.size());
 
             // defer release resource_needed_for_loading
-            auto defer_release =
-                folly::makeGuard([this, &resource_needed_for_loading, &loaded_resource, &loading_cids]() {
+            auto defer_release = folly::makeGuard([this, &resource_needed_for_loading, &loaded_resource,
+                                                   &loading_cids]() {
                 try {
                     dlist_->ReleaseLoadingResource(resource_needed_for_loading, loaded_resource);
                     monitor::cache_cell_loading_count(cell_data_type_, storage_type_).Decrement(loading_cids.size());

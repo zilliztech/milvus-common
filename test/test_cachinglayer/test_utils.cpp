@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <string>
 
 #include "cachinglayer/Utils.h"
@@ -23,8 +24,8 @@
 namespace fs = std::filesystem;
 using milvus::cachinglayer::internal::getContainerMemLimit;
 using milvus::cachinglayer::internal::getCurrentProcessMemoryUsage;
-using milvus::cachinglayer::internal::getMaxLoadingMemSize;
 using milvus::cachinglayer::internal::getHostTotalMemory;
+using milvus::cachinglayer::internal::getMaxLoadingMemSize;
 using milvus::cachinglayer::internal::getSystemDiskInfo;
 using milvus::cachinglayer::internal::getSystemMemoryInfo;
 using milvus::cachinglayer::internal::SystemResourceInfo;
@@ -115,6 +116,26 @@ TEST(Utils, GetMaxLoadingMemSizeFallsBackToHostMemoryWithoutCgroupLimit) {
     const auto host_memory = getHostTotalMemory();
     ASSERT_GT(host_memory, 0);
     EXPECT_EQ(getMaxLoadingMemSize(0.5), static_cast<int64_t>(host_memory * 0.5));
+#else
+    GTEST_SKIP() << "getMaxLoadingMemSize is only implemented on Linux";
+#endif
+}
+
+TEST(Utils, GetMaxLoadingMemSizeUsesCgroupWhenHostUnavailable) {
+#ifdef __linux__
+    const auto detected_host_memory = getHostTotalMemory();
+    ASSERT_GT(detected_host_memory, 0);
+    ASSERT_LT(detected_host_memory, std::numeric_limits<int64_t>::max() - 4096);
+    const auto container_limit = detected_host_memory + 4096;
+    const auto container_limit_string = std::to_string(container_limit);
+
+    EnvGuard guard_host("MCL_HOST_TOTAL_MEMORY", "0");
+    EnvGuard guard_root("MCL_CGROUP_ROOT", "/path/that/does/not/exist");
+    EnvGuard guard_proc("MCL_PROC_CGROUP", "/path/that/does/not/exist");
+    EnvGuard guard_mem("MEM_LIMIT", container_limit_string.c_str());
+
+    EXPECT_EQ(getSystemMemoryInfo().total_bytes, container_limit);
+    EXPECT_EQ(getMaxLoadingMemSize(0.5), static_cast<int64_t>(container_limit * 0.5));
 #else
     GTEST_SKIP() << "getMaxLoadingMemSize is only implemented on Linux";
 #endif

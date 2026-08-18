@@ -27,7 +27,6 @@ class TieredStorageConfig {
         bool storage_usage_tracking_enabled;
         std::chrono::milliseconds loading_timeout;
         std::chrono::milliseconds warmup_loading_timeout;
-        double max_loading_mem_ratio;
         CacheWarmupPolicies warmup_policies;
     };
 
@@ -49,8 +48,7 @@ class TieredStorageConfig {
     [[nodiscard]] Snapshot
     GetSnapshot() const {
         std::shared_lock lock(mtx_);
-        return {storage_usage_tracking_enabled_, loading_timeout_, warmup_loading_timeout_, max_loading_mem_ratio_,
-                warmup_policies_};
+        return {storage_usage_tracking_enabled_, loading_timeout_, warmup_loading_timeout_, warmup_policies_};
     }
 
     // --- Individual readers (shared lock) ---
@@ -73,12 +71,6 @@ class TieredStorageConfig {
         return warmup_loading_timeout_;
     }
 
-    [[nodiscard]] double
-    max_loading_mem_ratio() const {
-        std::shared_lock lock(mtx_);
-        return max_loading_mem_ratio_;
-    }
-
     [[nodiscard]] CacheWarmupPolicies
     warmup_policies() const {
         std::shared_lock lock(mtx_);
@@ -94,20 +86,6 @@ class TieredStorageConfig {
         storage_usage_tracking_enabled_ = storage_usage_tracking_enabled;
         loading_timeout_ = loading_timeout;
         warmup_loading_timeout_ = warmup_loading_timeout;
-        warmup_policies_ = warmup_policies;
-    }
-
-    void
-    UpdateAll(bool storage_usage_tracking_enabled, std::chrono::milliseconds loading_timeout,
-              std::chrono::milliseconds warmup_loading_timeout, CacheWarmupPolicies warmup_policies,
-              double max_loading_mem_ratio) {
-        AssertInfo(max_loading_mem_ratio >= 0 && max_loading_mem_ratio <= 1,
-                   "[MCL] max loading memory ratio must be between 0 and 1, got {}", max_loading_mem_ratio);
-        std::unique_lock lock(mtx_);
-        storage_usage_tracking_enabled_ = storage_usage_tracking_enabled;
-        loading_timeout_ = loading_timeout;
-        warmup_loading_timeout_ = warmup_loading_timeout;
-        max_loading_mem_ratio_ = max_loading_mem_ratio;
         warmup_policies_ = warmup_policies;
     }
 
@@ -132,14 +110,6 @@ class TieredStorageConfig {
     }
 
     void
-    SetMaxLoadingMemRatio(double max_loading_mem_ratio) {
-        AssertInfo(max_loading_mem_ratio >= 0 && max_loading_mem_ratio <= 1,
-                   "[MCL] max loading memory ratio must be between 0 and 1, got {}", max_loading_mem_ratio);
-        std::unique_lock lock(mtx_);
-        max_loading_mem_ratio_ = max_loading_mem_ratio;
-    }
-
-    void
     SetWarmupPolicies(CacheWarmupPolicies policies) {
         std::unique_lock lock(mtx_);
         warmup_policies_ = policies;
@@ -152,8 +122,6 @@ class TieredStorageConfig {
     bool storage_usage_tracking_enabled_{false};
     std::chrono::milliseconds loading_timeout_{100000};
     std::chrono::milliseconds warmup_loading_timeout_{0};
-    // Ratio of the effective memory limit.
-    double max_loading_mem_ratio_{1.0};
     CacheWarmupPolicies warmup_policies_{};
 };
 

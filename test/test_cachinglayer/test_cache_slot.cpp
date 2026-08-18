@@ -565,6 +565,58 @@ TEST_F(CacheSlotTest, TranslatorReturnsExtraCells) {
     EXPECT_EQ(extra_cell->cid, extra_cid);
 }
 
+TEST(CacheSlotLoadingAdmissionTest, SelfReservationDisabledSkipsLoadingAdmission) {
+    auto limit = ResourceUsage{1000, 0};
+    EvictionConfig eviction_config;
+    eviction_config.loading_resource_factor = 2.0f;
+    auto dlist = std::make_shared<DList>(false, limit, limit, limit, eviction_config, 40);
+
+    std::vector<std::pair<cid_t, int64_t>> cell_sizes = {{0, 50}};
+    std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map = {{0, 0}};
+    auto translator = std::make_unique<MockTranslator>(cell_sizes, uid_to_cid_map, "loading_cap_without_eviction",
+                                                       StorageType::MEMORY);
+    auto* translator_ptr = translator.get();
+    auto cache_slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), false, false, true,
+                                                            std::chrono::milliseconds(0));
+
+    auto op_ctx = std::make_unique<milvus::OpContext>();
+    auto accessor = cache_slot->PinCellsDirect(op_ctx.get(), {0});
+
+    ASSERT_NE(accessor, nullptr);
+    EXPECT_EQ(translator_ptr->GetCellsCallCount(), 1);
+    EXPECT_EQ(DListTestFriend::get_used_memory(*dlist), (ResourceUsage{50, 0}));
+    EXPECT_EQ(DListTestFriend::get_loading_memory(*dlist), ResourceUsage{});
+    EXPECT_EQ(DListTestFriend::get_loading_overhead_memory(*dlist), ResourceUsage{});
+}
+
+TEST(CacheSlotLoadingAdmissionTest, BonusLoadedResourceReducesLoadingOverhead) {
+    auto limit = ResourceUsage{1000, 0};
+    auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{}, 100);
+    auto existing_load = dlist->ReserveLoadingResourceWithTimeout({100, 0}, std::chrono::milliseconds(0));
+    ASSERT_TRUE(std::move(existing_load).get());
+
+    std::vector<std::pair<cid_t, int64_t>> cell_sizes = {{0, 50}, {1, 150}};
+    std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map = {{0, 0}, {1, 1}};
+    auto translator =
+        std::make_unique<MockTranslator>(cell_sizes, uid_to_cid_map, "bonus_loading_overhead", StorageType::MEMORY);
+    auto* translator_ptr = translator.get();
+    translator_ptr->SetExtraReturnCids({{0, {1}}});
+    auto cache_slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                                            std::chrono::milliseconds(0));
+
+    auto op_ctx = std::make_unique<milvus::OpContext>();
+    auto accessor = cache_slot->PinCellsDirect(op_ctx.get(), {0});
+
+    ASSERT_NE(accessor, nullptr);
+    ASSERT_EQ(translator_ptr->GetCellsCallCount(), 1);
+    ASSERT_EQ(translator_ptr->GetRequestedCids().size(), 1);
+    EXPECT_EQ(translator_ptr->GetRequestedCids().front(), (std::vector<cid_t>{0, 1}));
+    EXPECT_EQ(DListTestFriend::get_used_memory(*dlist), (ResourceUsage{200, 0}));
+    EXPECT_EQ(DListTestFriend::get_loading_overhead_memory(*dlist), (ResourceUsage{100, 0}));
+
+    dlist->ReleaseLoadingResource({100, 0});
+}
+
 TEST_F(CacheSlotTest, EvictionTest) {
     // Sizes: 0:50, 1:150, 2:100, 3:200
     ResourceUsage new_limit = ResourceUsage(300, 0);

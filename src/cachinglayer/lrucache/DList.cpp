@@ -104,15 +104,19 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, con
                     if (!self) {
                         return;  // DList already destroyed
                     }
-                    std::unique_lock<std::mutex> lock(self->list_mtx_);
-                    auto it = self->waiting_requests_map_.find(request_id);
-                    if (it != self->waiting_requests_map_.end()) {
-                        LOG_WARN(
-                            "[MCL] Reserve Request {} of size {} timed out, "
-                            "notifying failure.",
-                            request_id, it->second->required_size.ToString());
-                        it->second->promise.setValue(false);
-                        self->waiting_requests_map_.erase(it);
+                    std::vector<std::unique_ptr<WaitingRequest>> to_destroy;
+                    {
+                        std::unique_lock<std::mutex> lock(self->list_mtx_);
+                        auto it = self->waiting_requests_map_.find(request_id);
+                        if (it != self->waiting_requests_map_.end()) {
+                            LOG_WARN(
+                                "[MCL] Reserve Request {} of size {} timed out, "
+                                "notifying failure.",
+                                request_id, it->second->required_size.ToString());
+                            it->second->promise.setValue(false);
+                            self->waiting_requests_map_.erase(it);
+                            to_destroy = self->handleWaitingRequests();
+                        }
                     }
                 },
                 static_cast<uint32_t>(timeout.count()));
@@ -133,14 +137,18 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, con
                 if (!self) {
                     return;  // DList already destroyed
                 }
-                std::unique_lock<std::mutex> lock(self->list_mtx_);
-                auto it = self->waiting_requests_map_.find(request_id);
-                if (it == self->waiting_requests_map_.end()) {
-                    return;
+                std::vector<std::unique_ptr<WaitingRequest>> to_destroy;
+                {
+                    std::unique_lock<std::mutex> lock(self->list_mtx_);
+                    auto it = self->waiting_requests_map_.find(request_id);
+                    if (it == self->waiting_requests_map_.end()) {
+                        return;
+                    }
+                    LOG_WARN("[MCL] Request {} cancelled, notifying failure.", request_id);
+                    it->second->promise.setValue(false);
+                    self->waiting_requests_map_.erase(it);
+                    to_destroy = self->handleWaitingRequests();
                 }
-                LOG_WARN("[MCL] Request {} cancelled, notifying failure.", request_id);
-                it->second->promise.setValue(false);
-                self->waiting_requests_map_.erase(it);
             });
         });
     }
@@ -557,9 +565,10 @@ DList::ReleaseLoadingResource(const ResourceUsage& loading_size, const ResourceU
     ClampNonNegative(total_loading_overhead_size_, [&](const ResourceUsage& curr) {
         LOG_ERROR(
             "[MCL] total_loading_overhead_size_ became negative after release: release_scaled={}, "
-            "original_release={}, loading_resource_factor={}, current_total_loading_overhead={}",
-            scaled_overhead_size.ToString(), loaded_size.ToString(), eviction_config_.loading_resource_factor,
-            curr.ToString());
+            "original_loading_release={}, loaded_size={}, loading_resource_factor={}, "
+            "current_total_loading_overhead={}",
+            scaled_overhead_size.ToString(), loading_size.ToString(), loaded_size.ToString(),
+            eviction_config_.loading_resource_factor, curr.ToString());
     });
     // Notify waiting requests that resources are available
     std::vector<std::unique_ptr<WaitingRequest>> to_destroy;

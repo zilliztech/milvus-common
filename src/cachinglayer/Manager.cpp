@@ -20,6 +20,16 @@
 
 namespace milvus::cachinglayer {
 
+namespace {
+
+std::mutex&
+RuntimeConfigMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+}  // namespace
+
 Manager&
 Manager::GetInstance() {
     static Manager instance;
@@ -35,12 +45,13 @@ Manager::~Manager() {
 
 void
 Manager::ConfigureTieredStorage(const TieredStorageOptions& options) {
+    std::lock_guard lock(RuntimeConfigMutex());
     static std::once_flag init_once;
     std::call_once(init_once, [&]() {
+        const auto max_loading_mem_size = internal::getMaxLoadingMemSize(options.max_loading_mem_ratio);
         auto& config = TieredStorageConfig::GetInstance();
         config.UpdateAll(options.storage_usage_tracking_enabled, options.loading_timeout,
-                         options.warmup_loading_timeout, options.warmup_policies, options.max_loading_mem_ratio);
-        const auto max_loading_mem_size = internal::getMaxLoadingMemSize(options.max_loading_mem_ratio);
+                         options.warmup_loading_timeout, options.warmup_policies);
 
         Manager& manager = GetInstance();
         manager.eviction_enabled_ = options.eviction_enabled;
@@ -76,8 +87,8 @@ Manager::ConfigureTieredStorage(const TieredStorageOptions& options) {
             options.eviction_config.eviction_interval.count(),
             options.eviction_config.overloaded_memory_threshold_percentage,
             options.eviction_config.max_disk_usage_percentage, options.eviction_config.loading_resource_factor,
-            options.eviction_config.cache_cell_unaccessed_survival_time.count(),
-            options.max_loading_mem_ratio, FormatBytes(max_loading_mem_size), options.warmup_policies.ToString());
+            options.eviction_config.cache_cell_unaccessed_survival_time.count(), options.max_loading_mem_ratio,
+            FormatBytes(max_loading_mem_size), options.warmup_policies.ToString());
     });
 }
 
@@ -101,6 +112,9 @@ Manager::ConfigureTieredStorage(CacheWarmupPolicies warmup_policies, CacheLimit 
 void
 Manager::UpdateConfig(std::chrono::milliseconds loading_timeout, std::chrono::milliseconds warmup_loading_timeout,
                       bool storage_usage_tracking_enabled, CacheWarmupPolicies warmup_policies) {
+    std::lock_guard lock(RuntimeConfigMutex());
+    Manager& manager = GetInstance();
+    AssertInfo(manager.dlist_ != nullptr, "[MCL] ConfigureTieredStorage must be called before UpdateConfig");
     TieredStorageConfig::GetInstance().UpdateAll(storage_usage_tracking_enabled, loading_timeout,
                                                  warmup_loading_timeout, warmup_policies);
     LOG_INFO(
@@ -114,28 +128,28 @@ void
 Manager::UpdateConfig(std::chrono::milliseconds loading_timeout, std::chrono::milliseconds warmup_loading_timeout,
                       bool storage_usage_tracking_enabled, CacheWarmupPolicies warmup_policies,
                       double max_loading_mem_ratio) {
-    TieredStorageConfig::GetInstance().UpdateAll(storage_usage_tracking_enabled, loading_timeout,
-                                                 warmup_loading_timeout, warmup_policies, max_loading_mem_ratio);
+    std::lock_guard lock(RuntimeConfigMutex());
     const auto max_loading_mem_size = internal::getMaxLoadingMemSize(max_loading_mem_ratio);
     Manager& manager = GetInstance();
-    if (manager.dlist_) {
-        manager.dlist_->UpdateMaxLoadingMemSize(max_loading_mem_size);
-    }
+    AssertInfo(manager.dlist_ != nullptr, "[MCL] ConfigureTieredStorage must be called before UpdateConfig");
+    TieredStorageConfig::GetInstance().UpdateAll(storage_usage_tracking_enabled, loading_timeout,
+                                                 warmup_loading_timeout, warmup_policies);
+    manager.dlist_->UpdateMaxLoadingMemSize(max_loading_mem_size);
     LOG_INFO(
         "[MCL] Config updated: loading_timeout={}ms, warmup_loading_timeout={}ms, "
         "storage_usage_tracking={}, max_loading_mem_ratio={}, max_loading_mem_size={}, warmup_policies={}",
-        loading_timeout.count(), warmup_loading_timeout.count(), storage_usage_tracking_enabled,
-        max_loading_mem_ratio, FormatBytes(max_loading_mem_size), warmup_policies.ToString());
+        loading_timeout.count(), warmup_loading_timeout.count(), storage_usage_tracking_enabled, max_loading_mem_ratio,
+        FormatBytes(max_loading_mem_size), warmup_policies.ToString());
 }
 
 void
 Manager::UpdateMaxLoadingMemRatio(double max_loading_mem_ratio) {
-    TieredStorageConfig::GetInstance().SetMaxLoadingMemRatio(max_loading_mem_ratio);
+    std::lock_guard lock(RuntimeConfigMutex());
     const auto max_loading_mem_size = internal::getMaxLoadingMemSize(max_loading_mem_ratio);
     Manager& manager = GetInstance();
-    if (manager.dlist_) {
-        manager.dlist_->UpdateMaxLoadingMemSize(max_loading_mem_size);
-    }
+    AssertInfo(manager.dlist_ != nullptr,
+               "[MCL] ConfigureTieredStorage must be called before UpdateMaxLoadingMemRatio");
+    manager.dlist_->UpdateMaxLoadingMemSize(max_loading_mem_size);
 }
 
 size_t

@@ -25,8 +25,7 @@ class TieredStorageConfigTest : public ::testing::Test {
     void
     TearDown() override {
         // Reset to defaults after each test
-        config.UpdateAll(false, std::chrono::milliseconds(100000), std::chrono::milliseconds(0), CacheWarmupPolicies{},
-                         1.0);
+        config.UpdateAll(false, std::chrono::milliseconds(100000), std::chrono::milliseconds(0), CacheWarmupPolicies{});
     }
 };
 
@@ -34,7 +33,6 @@ TEST_F(TieredStorageConfigTest, DefaultValues) {
     EXPECT_FALSE(config.storage_usage_tracking_enabled());
     EXPECT_EQ(config.loading_timeout(), std::chrono::milliseconds(100000));
     EXPECT_EQ(config.warmup_loading_timeout(), std::chrono::milliseconds(0));
-    EXPECT_DOUBLE_EQ(config.max_loading_mem_ratio(), 1.0);
 }
 
 TEST_F(TieredStorageConfigTest, SetAndGetStorageUsageTracking) {
@@ -59,19 +57,6 @@ TEST_F(TieredStorageConfigTest, SetAndGetWarmupLoadingTimeout) {
     EXPECT_EQ(config.warmup_loading_timeout(), std::chrono::milliseconds(0));
 }
 
-TEST_F(TieredStorageConfigTest, SetAndGetMaxLoadingMemRatio) {
-    config.SetMaxLoadingMemRatio(0.5);
-    EXPECT_DOUBLE_EQ(config.max_loading_mem_ratio(), 0.5);
-
-    config.SetMaxLoadingMemRatio(1.0);
-    EXPECT_DOUBLE_EQ(config.max_loading_mem_ratio(), 1.0);
-}
-
-TEST_F(TieredStorageConfigTest, RejectsInvalidMaxLoadingMemRatio) {
-    EXPECT_THROW(config.SetMaxLoadingMemRatio(-0.1), milvus::SegcoreError);
-    EXPECT_THROW(config.SetMaxLoadingMemRatio(1.1), milvus::SegcoreError);
-}
-
 TEST_F(TieredStorageConfigTest, SetAndGetWarmupPolicies) {
     CacheWarmupPolicies policies(CacheWarmupPolicy::CacheWarmupPolicy_Async,
                                  CacheWarmupPolicy::CacheWarmupPolicy_Disable,
@@ -89,14 +74,12 @@ TEST_F(TieredStorageConfigTest, SnapshotReturnsConsistentView) {
     config.UpdateAll(
         true, std::chrono::milliseconds(5000), std::chrono::milliseconds(200),
         CacheWarmupPolicies(CacheWarmupPolicy::CacheWarmupPolicy_Async, CacheWarmupPolicy::CacheWarmupPolicy_Async,
-                            CacheWarmupPolicy::CacheWarmupPolicy_Async, CacheWarmupPolicy::CacheWarmupPolicy_Async),
-        0.25);
+                            CacheWarmupPolicy::CacheWarmupPolicy_Async, CacheWarmupPolicy::CacheWarmupPolicy_Async));
 
     auto snapshot = config.GetSnapshot();
     EXPECT_TRUE(snapshot.storage_usage_tracking_enabled);
     EXPECT_EQ(snapshot.loading_timeout, std::chrono::milliseconds(5000));
     EXPECT_EQ(snapshot.warmup_loading_timeout, std::chrono::milliseconds(200));
-    EXPECT_DOUBLE_EQ(snapshot.max_loading_mem_ratio, 0.25);
     EXPECT_EQ(snapshot.warmup_policies.scalarFieldCacheWarmupPolicy, CacheWarmupPolicy::CacheWarmupPolicy_Async);
 }
 
@@ -108,14 +91,13 @@ TEST_F(TieredStorageConfigTest, UpdateAllIsAtomic) {
     CacheWarmupPolicies new_policies(
         CacheWarmupPolicy::CacheWarmupPolicy_Disable, CacheWarmupPolicy::CacheWarmupPolicy_Disable,
         CacheWarmupPolicy::CacheWarmupPolicy_Disable, CacheWarmupPolicy::CacheWarmupPolicy_Disable);
-    config.UpdateAll(true, std::chrono::milliseconds(9999), std::chrono::milliseconds(42), new_policies, 0.5);
+    config.UpdateAll(true, std::chrono::milliseconds(9999), std::chrono::milliseconds(42), new_policies);
 
     // Snapshot should see all new values together
     auto snapshot = config.GetSnapshot();
     EXPECT_TRUE(snapshot.storage_usage_tracking_enabled);
     EXPECT_EQ(snapshot.loading_timeout, std::chrono::milliseconds(9999));
     EXPECT_EQ(snapshot.warmup_loading_timeout, std::chrono::milliseconds(42));
-    EXPECT_DOUBLE_EQ(snapshot.max_loading_mem_ratio, 0.5);
     EXPECT_EQ(snapshot.warmup_policies.scalarFieldCacheWarmupPolicy, CacheWarmupPolicy::CacheWarmupPolicy_Disable);
 }
 
@@ -131,7 +113,6 @@ TEST_F(TieredStorageConfigTest, ConcurrentReadsAndWrites) {
                 (void)config.loading_timeout();
                 (void)config.warmup_loading_timeout();
                 (void)config.storage_usage_tracking_enabled();
-                (void)config.max_loading_mem_ratio();
                 (void)config.warmup_policies();
             }
         });
@@ -140,7 +121,7 @@ TEST_F(TieredStorageConfigTest, ConcurrentReadsAndWrites) {
     std::thread writer([&]() {
         for (int i = 0; i < 100; ++i) {
             config.UpdateAll(i % 3 == 0, std::chrono::milliseconds(i * 100), std::chrono::milliseconds(i),
-                             CacheWarmupPolicies{}, i / 100.0);
+                             CacheWarmupPolicies{});
         }
         stop.store(true);
     });
