@@ -20,16 +20,6 @@
 
 namespace milvus::cachinglayer {
 
-namespace {
-
-std::mutex&
-RuntimeConfigMutex() {
-    static std::mutex mutex;
-    return mutex;
-}
-
-}  // namespace
-
 Manager&
 Manager::GetInstance() {
     static Manager instance;
@@ -45,7 +35,8 @@ Manager::~Manager() {
 
 void
 Manager::ConfigureTieredStorage(const TieredStorageOptions& options) {
-    std::lock_guard lock(RuntimeConfigMutex());
+    Manager& manager = GetInstance();
+    std::lock_guard lock(manager.config_update_mtx_);
     static std::once_flag init_once;
     std::call_once(init_once, [&]() {
         const auto max_loading_mem_size = internal::getMaxLoadingMemSize(options.max_loading_mem_ratio);
@@ -53,7 +44,6 @@ Manager::ConfigureTieredStorage(const TieredStorageOptions& options) {
         config.UpdateAll(options.storage_usage_tracking_enabled, options.loading_timeout,
                          options.warmup_loading_timeout, options.warmup_policies);
 
-        Manager& manager = GetInstance();
         manager.eviction_enabled_ = options.eviction_enabled;
 
         if (options.prefetch_pool_threads > 0) {
@@ -112,8 +102,8 @@ Manager::ConfigureTieredStorage(CacheWarmupPolicies warmup_policies, CacheLimit 
 void
 Manager::UpdateConfig(std::chrono::milliseconds loading_timeout, std::chrono::milliseconds warmup_loading_timeout,
                       bool storage_usage_tracking_enabled, CacheWarmupPolicies warmup_policies) {
-    std::lock_guard lock(RuntimeConfigMutex());
     Manager& manager = GetInstance();
+    std::lock_guard lock(manager.config_update_mtx_);
     AssertInfo(manager.dlist_ != nullptr, "[MCL] ConfigureTieredStorage must be called before UpdateConfig");
     TieredStorageConfig::GetInstance().UpdateAll(storage_usage_tracking_enabled, loading_timeout,
                                                  warmup_loading_timeout, warmup_policies);
@@ -128,9 +118,9 @@ void
 Manager::UpdateConfig(std::chrono::milliseconds loading_timeout, std::chrono::milliseconds warmup_loading_timeout,
                       bool storage_usage_tracking_enabled, CacheWarmupPolicies warmup_policies,
                       double max_loading_mem_ratio) {
-    std::lock_guard lock(RuntimeConfigMutex());
-    const auto max_loading_mem_size = internal::getMaxLoadingMemSize(max_loading_mem_ratio);
     Manager& manager = GetInstance();
+    std::lock_guard lock(manager.config_update_mtx_);
+    const auto max_loading_mem_size = internal::getMaxLoadingMemSize(max_loading_mem_ratio);
     AssertInfo(manager.dlist_ != nullptr, "[MCL] ConfigureTieredStorage must be called before UpdateConfig");
     TieredStorageConfig::GetInstance().UpdateAll(storage_usage_tracking_enabled, loading_timeout,
                                                  warmup_loading_timeout, warmup_policies);
@@ -144,9 +134,9 @@ Manager::UpdateConfig(std::chrono::milliseconds loading_timeout, std::chrono::mi
 
 void
 Manager::UpdateMaxLoadingMemRatio(double max_loading_mem_ratio) {
-    std::lock_guard lock(RuntimeConfigMutex());
-    const auto max_loading_mem_size = internal::getMaxLoadingMemSize(max_loading_mem_ratio);
     Manager& manager = GetInstance();
+    std::lock_guard lock(manager.config_update_mtx_);
+    const auto max_loading_mem_size = internal::getMaxLoadingMemSize(max_loading_mem_ratio);
     AssertInfo(manager.dlist_ != nullptr,
                "[MCL] ConfigureTieredStorage must be called before UpdateMaxLoadingMemRatio");
     manager.dlist_->UpdateMaxLoadingMemSize(max_loading_mem_size);

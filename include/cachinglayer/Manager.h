@@ -14,6 +14,7 @@
 #include <folly/executors/CPUThreadPoolExecutor.h>
 
 #include <memory>
+#include <mutex>
 
 #include "cachinglayer/CacheSlot.h"
 #include "cachinglayer/TieredStorageConfig.h"
@@ -167,6 +168,8 @@ class Manager {
  private:
     Manager() = default;
 
+    // Serializes updates spanning TieredStorageConfig and dlist_.
+    std::mutex config_update_mtx_;
     std::shared_ptr<internal::DList> dlist_{nullptr};
     std::shared_ptr<folly::CPUThreadPoolExecutor> prefetch_pool_{nullptr};
     bool eviction_enabled_{false};
