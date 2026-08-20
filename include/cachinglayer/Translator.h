@@ -50,16 +50,16 @@ class Translator {
     num_cells() const = 0;
     virtual cid_t
     cell_id_of(uid_t uid) const = 0;
-    // For resource reservation when a cell is about to be loaded.
-    // There are two types of resource usage for a cell: the first is the usage after it has been loaded,
-    // and the second is the usage during loading. Typically, the loading usage is greater than the loaded usage
-    // due to the preprocessing stage.
-    // If a cell is about to be pinned and loaded, and there are not enough resource for it, EvictionManager
-    // will try to evict some other cells to make space. Thus this estimation should generally be greater
-    // than or equal to the actual size. If the estimation is smaller than the actual size, with insufficient
-    // resource reserved, the load may fail.
+    // Estimate resources for loading a batch of cells. The first value estimates the total resource retained after
+    // the cells are loaded, and the second estimates the peak resource used while loading the batch. The Translator
+    // owns these estimates because it knows how many cells can be loaded concurrently. Actual loaded resource usage
+    // is reported by CellT::CellByteSize().
+    //
+    // The loading estimate should generally be greater than or equal to the loaded estimate. Underestimating either
+    // value may cause the load to fail after insufficient resources are reserved. An empty batch returns two zero
+    // ResourceUsage values.
     virtual std::pair<ResourceUsage, ResourceUsage>
-    estimated_byte_size_of_cell(cid_t cid) const = 0;
+    estimated_loading_usage(const std::vector<cid_t>& cids) const = 0;
     // must be unique to identify a CacheSlot.
     virtual const std::string&
     key() const = 0;

@@ -396,8 +396,6 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
 
     void
     RunLoad(OpContext* ctx, std::unordered_set<cid_t>&& cids, std::chrono::milliseconds timeout) {
-        ResourceUsage essential_loading_resource{};
-        ResourceUsage bonus_loading_resource{};
         std::vector<cid_t> loading_cids;
         try {
             auto start = std::chrono::steady_clock::now();
@@ -427,25 +425,18 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             }
 
             auto bonus_cids = translator_->bonus_cells_to_be_loaded(loading_cids);
+            loading_cids.insert(loading_cids.end(), bonus_cids.begin(), bonus_cids.end());
 
-            ResourceUsage essential_loaded_resource;
-            for (auto& cid : loading_cids) {
-                const auto [loaded_resource, loading_resource] = translator_->estimated_byte_size_of_cell(cid);
-                essential_loaded_resource += loaded_resource;
-                essential_loading_resource += loading_resource;
-            }
-
-            ResourceUsage bonus_loaded_resource;
-            for (auto& cid : bonus_cids) {
-                const auto [loaded_resource, loading_resource] = translator_->estimated_byte_size_of_cell(cid);
-                bonus_loaded_resource += loaded_resource;
-                bonus_loading_resource += loading_resource;
-            }
-
-            auto resource_needed_for_loading = essential_loading_resource + bonus_loading_resource;
-            auto loaded_resource = essential_loaded_resource + bonus_loaded_resource;
-            reservation_success = SemiInlineGet(
-                dlist_->ReserveLoadingResourceWithTimeout(resource_needed_for_loading, loaded_resource, timeout, ctx));
+            ResourceUsage estimated_loading_usage;
+            ResourceUsage estimated_loaded_usage;
+            auto reserve_loading_cids = [&](const std::vector<cid_t>& cids_to_load) {
+                auto estimate = translator_->estimated_loading_usage(cids_to_load);
+                estimated_loaded_usage = estimate.first;
+                estimated_loading_usage = estimate.second;
+                return SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(estimated_loading_usage,
+                                                                               estimated_loaded_usage, timeout, ctx));
+            };
+            reservation_success = reserve_loading_cids(loading_cids);
 
             if (!bonus_cids.empty()) {
                 // if the reservation failed, try to reserve only the essential loading resource
@@ -454,13 +445,8 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                         "[MCL] CacheSlot reserve loading resource with bonus cells failed, try to reserve only "
                         "essential "
                         "loading resource");
-                    resource_needed_for_loading = essential_loading_resource;
-                    loaded_resource = essential_loaded_resource;
-                    reservation_success = SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(
-                        resource_needed_for_loading, essential_loaded_resource, timeout, ctx));
-                } else {
-                    // if the reservation succeeded, we can load the bonus cells
-                    loading_cids.insert(loading_cids.end(), bonus_cids.begin(), bonus_cids.end());
+                    loading_cids.resize(loading_cids.size() - bonus_cids.size());
+                    reservation_success = reserve_loading_cids(loading_cids);
                 }
             }
 
@@ -469,30 +455,30 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                     "[MCL] CacheSlot failed to reserve resource for "
                     "cells: key={}, cell_ids=[{}], total "
                     "resource_needed_for_loading={}",
-                    translator_->key(), fmt::join(loading_cids, ","), resource_needed_for_loading.ToString());
+                    translator_->key(), fmt::join(loading_cids, ","), estimated_loading_usage.ToString());
                 ThrowInfo(ErrorCode::InsufficientResource,
                           "[MCL] CacheSlot failed to reserve resource for "
                           "cells: key={}, cell_ids=[{}], total "
                           "resource_needed_for_loading={}",
-                          translator_->key(), fmt::join(loading_cids, ","), resource_needed_for_loading.ToString());
+                          translator_->key(), fmt::join(loading_cids, ","), estimated_loading_usage.ToString());
             }
 
             monitor::cache_loading_bytes(cell_data_type_, StorageType::MEMORY)
-                .Increment(resource_needed_for_loading.memory_bytes);
+                .Increment(estimated_loading_usage.memory_bytes);
             monitor::cache_loading_bytes(cell_data_type_, StorageType::DISK)
-                .Increment(resource_needed_for_loading.file_bytes);
+                .Increment(estimated_loading_usage.file_bytes);
             monitor::cache_cell_loading_count(cell_data_type_, storage_type_).Increment(loading_cids.size());
 
-            // defer release resource_needed_for_loading
-            auto defer_release = folly::makeGuard([this, &resource_needed_for_loading, &loaded_resource,
+            // Defer releasing the estimated loading usage.
+            auto defer_release = folly::makeGuard([this, &estimated_loading_usage, &estimated_loaded_usage,
                                                    &loading_cids]() {
                 try {
-                    dlist_->ReleaseLoadingResource(resource_needed_for_loading, loaded_resource);
+                    dlist_->ReleaseLoadingResource(estimated_loading_usage, estimated_loaded_usage);
                     monitor::cache_cell_loading_count(cell_data_type_, storage_type_).Decrement(loading_cids.size());
                     monitor::cache_loading_bytes(cell_data_type_, StorageType::MEMORY)
-                        .Decrement(resource_needed_for_loading.memory_bytes);
+                        .Decrement(estimated_loading_usage.memory_bytes);
                     monitor::cache_loading_bytes(cell_data_type_, StorageType::DISK)
-                        .Decrement(resource_needed_for_loading.file_bytes);
+                        .Decrement(estimated_loading_usage.file_bytes);
                 } catch (...) {
                     auto exception = std::current_exception();
                     auto ew = folly::exception_wrapper(exception);
@@ -512,7 +498,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                 std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start)
                         .count() *
                     1.0 / 1000,
-                resource_needed_for_loading.ToString(), translator_->key());
+                estimated_loading_usage.ToString(), translator_->key());
 
             run_load_internal();
         } catch (...) {
@@ -569,7 +555,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                             "[MCL] CacheSlot Cell {} has zero size, use "
                             "estimated size from translator",
                             key());
-                        loaded_size_ = slot_->translator_->estimated_byte_size_of_cell(cid_).first;
+                        loaded_size_ = slot_->translator_->estimated_loading_usage(std::vector<cid_t>{cid_}).first;
                     }
                     slot_->dlist_->ChargeLoadedResource(loaded_size_);
                     life_start_ = std::chrono::steady_clock::now();
