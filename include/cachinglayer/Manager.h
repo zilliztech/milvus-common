@@ -14,6 +14,7 @@
 #include <folly/executors/CPUThreadPoolExecutor.h>
 
 #include <memory>
+#include <mutex>
 
 #include "cachinglayer/CacheSlot.h"
 #include "cachinglayer/TieredStorageConfig.h"
@@ -24,12 +25,29 @@
 
 namespace milvus::cachinglayer {
 
+struct TieredStorageOptions {
+    CacheWarmupPolicies warmup_policies{};
+    CacheLimit cache_limit{};
+    bool storage_usage_tracking_enabled{false};
+    bool eviction_enabled{false};
+    EvictionConfig eviction_config{};
+    std::chrono::milliseconds loading_timeout{100000};
+    std::chrono::milliseconds warmup_loading_timeout{0};
+    uint32_t prefetch_pool_threads{0};
+    // Ratio of the effective memory limit.
+    double max_loading_mem_ratio{1.0};
+};
+
 class Manager {
  public:
     static Manager&
     GetInstance();
 
     // Must be called exactly once before any CacheSlot is created.
+    static void
+    ConfigureTieredStorage(const TieredStorageOptions& options);
+
+    // Compatibility overload for existing callers. Prefer TieredStorageOptions for new fields.
     static void
     ConfigureTieredStorage(CacheWarmupPolicies warmup_policies, CacheLimit cache_limit,
                            bool storage_usage_tracking_enabled, bool eviction_enabled, EvictionConfig eviction_config,
@@ -41,6 +59,14 @@ class Manager {
     static void
     UpdateConfig(std::chrono::milliseconds loading_timeout, std::chrono::milliseconds warmup_loading_timeout,
                  bool storage_usage_tracking_enabled, CacheWarmupPolicies warmup_policies);
+
+    static void
+    UpdateConfig(std::chrono::milliseconds loading_timeout, std::chrono::milliseconds warmup_loading_timeout,
+                 bool storage_usage_tracking_enabled, CacheWarmupPolicies warmup_policies,
+                 double max_loading_mem_ratio);
+
+    static void
+    UpdateMaxLoadingMemRatio(double max_loading_mem_ratio);
 
     ~Manager();
 
@@ -142,6 +168,8 @@ class Manager {
  private:
     Manager() = default;
 
+    // Serializes updates spanning TieredStorageConfig and dlist_.
+    std::mutex config_update_mtx_;
     std::shared_ptr<internal::DList> dlist_{nullptr};
     std::shared_ptr<folly::CPUThreadPoolExecutor> prefetch_pool_{nullptr};
     bool eviction_enabled_{false};

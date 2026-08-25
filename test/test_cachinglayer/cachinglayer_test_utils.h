@@ -40,6 +40,10 @@ class DListTestFriend {
         return dlist.total_loading_size_.load();
     }
     static ResourceUsage
+    get_loading_overhead_memory(const DList& dlist) {
+        return dlist.total_loading_overhead_size_.load();
+    }
+    static ResourceUsage
     get_max_memory(const DList& dlist) {
         std::lock_guard lock(dlist.list_mtx_);
         return dlist.max_resource_limit_;

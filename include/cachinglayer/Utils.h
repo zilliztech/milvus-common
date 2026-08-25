@@ -338,6 +338,10 @@ getHostTotalMemory();
 int64_t
 getContainerMemLimit();
 
+// Returns -1 when the effective memory limit cannot be determined.
+int64_t
+getMaxLoadingMemSize(double max_loading_mem_ratio);
+
 // Returns unlimited if failed to get memory info, or if the platform is not supported.
 SystemResourceInfo
 getSystemMemoryInfo();

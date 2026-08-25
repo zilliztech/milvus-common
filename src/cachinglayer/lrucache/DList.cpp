@@ -38,9 +38,18 @@ ClampNonNegative(std::atomic<ResourceUsage>& counter, LogFn&& log_fn) {
 folly::SemiFuture<bool>
 DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std::chrono::milliseconds timeout,
                                          OpContext* ctx) {
+    return ReserveLoadingResourceWithTimeout(original_size, ResourceUsage{}, timeout, ctx);
+}
+
+folly::SemiFuture<bool>
+DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, const ResourceUsage& loaded_size,
+                                         std::chrono::milliseconds timeout, OpContext* ctx) {
     // NOTE: we can reserve more loading resources than the original request size by adjusting the
     // loading_resource_factor to avoid potential problems from bad resource estimation.
     auto size = original_size * eviction_config_.loading_resource_factor;
+    auto overhead_size = size - loaded_size;
+    overhead_size.memory_bytes = std::max<int64_t>(overhead_size.memory_bytes, 0);
+    overhead_size.file_bytes = std::max<int64_t>(overhead_size.file_bytes, 0);
 
     // Try immediate reservation; if it fails, enqueue atomically under the same lock
     // to avoid a race window where resources could be released and notified between
@@ -51,7 +60,11 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std
                   max_resource_limit_.load().ToString());
         return folly::makeSemiFuture(false);
     }
-    if (reserveResourceInternal(size)) {
+    if (overhead_size.memory_bytes > 0 && exceedMaxOverheadMemSize()) {
+        LOG_DEBUG("[MCL] Reserve size={} waits for max_loading_mem_size_={}, current loading overhead={}",
+                  size.ToString(), FormatBytes(max_loading_mem_size_.load()),
+                  total_loading_overhead_size_.load().ToString());
+    } else if (reserveResourceInternal(size, overhead_size)) {
         return folly::makeSemiFuture(true);
     }
 
@@ -66,7 +79,8 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std
 
     uint64_t request_id = next_request_id_.fetch_add(1);
 
-    auto waiting_request = std::make_unique<WaitingRequest>(size, deadline, std::move(promise), request_id);
+    auto waiting_request =
+        std::make_unique<WaitingRequest>(size, overhead_size, deadline, std::move(promise), request_id);
     WaitingRequest* request_ptr = waiting_request.get();
     waiting_requests_map_[request_id] = request_ptr;
     waiting_queue_.push(std::move(waiting_request));
@@ -90,15 +104,19 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std
                     if (!self) {
                         return;  // DList already destroyed
                     }
-                    std::unique_lock<std::mutex> lock(self->list_mtx_);
-                    auto it = self->waiting_requests_map_.find(request_id);
-                    if (it != self->waiting_requests_map_.end()) {
-                        LOG_WARN(
-                            "[MCL] Reserve Request {} of size {} timed out, "
-                            "notifying failure.",
-                            request_id, it->second->required_size.ToString());
-                        it->second->promise.setValue(false);
-                        self->waiting_requests_map_.erase(it);
+                    std::vector<std::unique_ptr<WaitingRequest>> to_destroy;
+                    {
+                        std::unique_lock<std::mutex> lock(self->list_mtx_);
+                        auto it = self->waiting_requests_map_.find(request_id);
+                        if (it != self->waiting_requests_map_.end()) {
+                            LOG_WARN(
+                                "[MCL] Reserve Request {} of size {} timed out, "
+                                "notifying failure.",
+                                request_id, it->second->required_size.ToString());
+                            it->second->promise.setValue(false);
+                            self->waiting_requests_map_.erase(it);
+                            to_destroy = self->handleWaitingRequests();
+                        }
                     }
                 },
                 static_cast<uint32_t>(timeout.count()));
@@ -119,14 +137,18 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std
                 if (!self) {
                     return;  // DList already destroyed
                 }
-                std::unique_lock<std::mutex> lock(self->list_mtx_);
-                auto it = self->waiting_requests_map_.find(request_id);
-                if (it == self->waiting_requests_map_.end()) {
-                    return;
+                std::vector<std::unique_ptr<WaitingRequest>> to_destroy;
+                {
+                    std::unique_lock<std::mutex> lock(self->list_mtx_);
+                    auto it = self->waiting_requests_map_.find(request_id);
+                    if (it == self->waiting_requests_map_.end()) {
+                        return;
+                    }
+                    LOG_WARN("[MCL] Request {} cancelled, notifying failure.", request_id);
+                    it->second->promise.setValue(false);
+                    self->waiting_requests_map_.erase(it);
+                    to_destroy = self->handleWaitingRequests();
                 }
-                LOG_WARN("[MCL] Request {} cancelled, notifying failure.", request_id);
-                it->second->promise.setValue(false);
-                self->waiting_requests_map_.erase(it);
             });
         });
     }
@@ -135,7 +157,14 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std
 }
 
 bool
-DList::reserveResourceInternal(const ResourceUsage& size) {
+DList::exceedMaxOverheadMemSize() const {
+    const auto max_loading_mem_size = max_loading_mem_size_.load();
+    const auto total_loading_overhead_size = total_loading_overhead_size_.load();
+    return max_loading_mem_size >= 0 && total_loading_overhead_size.memory_bytes >= max_loading_mem_size;
+}
+
+bool
+DList::reserveResourceInternal(const ResourceUsage& size, const ResourceUsage& overhead_size) {
     auto using_resources = total_loaded_size_.load() + total_loading_size_.load();
 
     // Combined logical and physical memory limit check
@@ -207,8 +236,12 @@ DList::reserveResourceInternal(const ResourceUsage& size) {
     }
 
     total_loading_size_ += size;
-    LOG_TRACE("[MCL] reserve resource with size={} success, total_loading_size={}, total_loaded_size={}",
-              size.ToString(), total_loading_size_.load().ToString(), total_loaded_size_.load().ToString());
+    total_loading_overhead_size_ += overhead_size;
+    LOG_TRACE(
+        "[MCL] reserve resource with size={} success, total_loading_size={}, total_loading_overhead_size={}, "
+        "total_loaded_size={}",
+        size.ToString(), total_loading_size_.load().ToString(), total_loading_overhead_size_.load().ToString(),
+        total_loaded_size_.load().ToString());
 
     return true;
 }
@@ -255,9 +288,11 @@ DList::usageInfo() const {
     constexpr double precision = 100.0;
     std::string info = fmt::format(
         "low_watermark_: {}; high_watermark_: {}; "
-        "max_resource_limit_: {}; total_loaded_size_: {}; total_loading_size_: {}; using_resources_: {} (",
+        "max_resource_limit_: {}; total_loaded_size_: {}; total_loading_size_: {}; "
+        "total_loading_overhead_size_: {}; using_resources_: {} (",
         curr_low_watermark.ToString(), curr_high_watermark.ToString(), curr_max_resource_limit.ToString(),
-        total_loaded_size_.load().ToString(), total_loading_size_.load().ToString(), using_resources.ToString());
+        total_loaded_size_.load().ToString(), total_loading_size_.load().ToString(),
+        total_loading_overhead_size_.load().ToString(), using_resources.ToString());
 
     if (using_resources.memory_bytes > 0) {
         info += fmt::format(
@@ -273,9 +308,11 @@ DList::usageInfo() const {
             static_cast<double>(using_resources.file_bytes) / curr_high_watermark.file_bytes * precision);
     }
 
-    info += fmt::format("); evictable_size_: {}; total_loaded_size_: {}; total_loading_size_: {}; ",
-                        evictable_size_.load().ToString(), total_loaded_size_.load().ToString(),
-                        total_loading_size_.load().ToString());
+    info += fmt::format(
+        "); evictable_size_: {}; total_loaded_size_: {}; total_loading_size_: {}; total_loading_overhead_size_: {}; "
+        "max_loading_mem_size_: {}; ",
+        evictable_size_.load().ToString(), total_loaded_size_.load().ToString(), total_loading_size_.load().ToString(),
+        total_loading_overhead_size_.load().ToString(), FormatBytes(max_loading_mem_size_.load()));
 
     return info;
 }
@@ -492,14 +529,46 @@ DList::UpdateHighWatermark(const ResourceUsage& new_high_watermark) {
 }
 
 void
+DList::UpdateMaxLoadingMemSize(int64_t new_max_loading_mem_size) {
+    AssertInfo(new_max_loading_mem_size >= -1,
+               "[MCL] max loading memory size must be -1 or greater. new_max_loading_mem_size: {}",
+               new_max_loading_mem_size);
+    std::vector<std::unique_ptr<WaitingRequest>> to_destroy;
+    {
+        std::unique_lock<std::mutex> lock(list_mtx_);
+        LOG_INFO("[MCL] UpdateMaxLoadingMemSize: from {} to {}", FormatBytes(max_loading_mem_size_.load()),
+                 FormatBytes(new_max_loading_mem_size));
+        max_loading_mem_size_ = new_max_loading_mem_size;
+        to_destroy = handleWaitingRequests();
+    }
+}
+
+void
 DList::ReleaseLoadingResource(const ResourceUsage& loading_size) {
+    ReleaseLoadingResource(loading_size, ResourceUsage{});
+}
+
+void
+DList::ReleaseLoadingResource(const ResourceUsage& loading_size, const ResourceUsage& loaded_size) {
     auto size = loading_size * eviction_config_.loading_resource_factor;
+    auto scaled_overhead_size = size - loaded_size;
+    scaled_overhead_size.memory_bytes = std::max<int64_t>(scaled_overhead_size.memory_bytes, 0);
+    scaled_overhead_size.file_bytes = std::max<int64_t>(scaled_overhead_size.file_bytes, 0);
     total_loading_size_ -= size;
     ClampNonNegative(total_loading_size_, [&](const ResourceUsage& curr) {
         LOG_ERROR(
             "[MCL] total_loading_size_ became negative after release: release_scaled={}, original_release={}, "
             "loading_resource_factor={}, current_total_loading={}",
             size.ToString(), loading_size.ToString(), eviction_config_.loading_resource_factor, curr.ToString());
+    });
+    total_loading_overhead_size_ -= scaled_overhead_size;
+    ClampNonNegative(total_loading_overhead_size_, [&](const ResourceUsage& curr) {
+        LOG_ERROR(
+            "[MCL] total_loading_overhead_size_ became negative after release: release_scaled={}, "
+            "original_loading_release={}, loaded_size={}, loading_resource_factor={}, "
+            "current_total_loading_overhead={}",
+            scaled_overhead_size.ToString(), loading_size.ToString(), loaded_size.ToString(),
+            eviction_config_.loading_resource_factor, curr.ToString());
     });
     // Notify waiting requests that resources are available
     std::vector<std::unique_ptr<WaitingRequest>> to_destroy;
@@ -673,7 +742,8 @@ DList::handleWaitingRequests() {
             continue;
         }
 
-        if (reserveResourceInternal(request_ptr_ref->required_size)) {
+        if ((request_ptr_ref->overhead_size.memory_bytes == 0 || !exceedMaxOverheadMemSize()) &&
+            reserveResourceInternal(request_ptr_ref->required_size, request_ptr_ref->overhead_size)) {
             auto request = std::move(request_ptr_ref);
 
             if (waiting_requests_map_.erase(request->request_id) > 0) {
@@ -687,6 +757,7 @@ DList::handleWaitingRequests() {
                     "resource.",
                     request->request_id, request->required_size.ToString());
                 total_loading_size_ -= request->required_size;
+                total_loading_overhead_size_ -= request->overhead_size;
             }
             requests_to_destroy.push_back(std::move(request));
             waiting_queue_.pop();

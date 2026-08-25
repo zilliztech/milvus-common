@@ -2,6 +2,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <future>
 #include <map>
 #include <memory>
 #include <thread>
@@ -123,6 +124,11 @@ class DListTest : public ::testing::Test {
     [[nodiscard]] ResourceUsage
     get_loading_memory() const {
         return DLF::get_loading_memory(*dlist);
+    }
+
+    [[nodiscard]] ResourceUsage
+    get_loading_overhead_memory() const {
+        return DLF::get_loading_overhead_memory(*dlist);
     }
 };
 
@@ -1196,4 +1202,254 @@ TEST_F(DListTest, ReserveWithZeroTimeoutEvictsAndSucceeds) {
     EXPECT_EQ(get_loading_memory(), reserve_size);
 
     dlist->ReleaseLoadingResource(reserve_size);
+}
+
+TEST_F(DListTest, ReserveBlockedByMaxLoadingMemSizeDoesNotEvict) {
+    MockListNode* node = add_and_load_node({30, 0}, "key1");
+    dlist->UpdateMaxLoadingMemSize(60);
+    ASSERT_TRUE(reserveLoadingMemorySync({60, 0}));
+
+    EXPECT_CALL(*node, unload()).Times(0);
+
+    auto future = dlist->ReserveLoadingResourceWithTimeout({10, 0}, std::chrono::milliseconds(0));
+    EXPECT_FALSE(std::move(future).get());
+    EXPECT_EQ(get_loading_memory(), (ResourceUsage{60, 0}));
+    EXPECT_EQ(get_used_memory(), node->loaded_size());
+    DLF::verify_list(dlist.get(), {node});
+}
+
+TEST_F(DListTest, ReserveWaitsForLoadingResourceUnderMaxLoadingMemSize) {
+    dlist->UpdateMaxLoadingMemSize(60);
+    ASSERT_TRUE(reserveLoadingMemorySync({60, 0}));
+
+    auto future = dlist->ReserveLoadingResourceWithTimeout({30, 0}, std::chrono::milliseconds(5000));
+
+    dlist->ReleaseLoadingResource({60, 0});
+
+    EXPECT_TRUE(std::move(future).get());
+    EXPECT_EQ(get_loading_memory(), (ResourceUsage{30, 0}));
+}
+
+TEST_F(DListTest, ReserveMayCrossMaxLoadingMemSizeFromBelow) {
+    dlist->UpdateMaxLoadingMemSize(60);
+    ASSERT_TRUE(reserveLoadingMemorySync({40, 0}));
+
+    auto crossing_future = dlist->ReserveLoadingResourceWithTimeout({30, 0}, std::chrono::milliseconds(0));
+    EXPECT_TRUE(std::move(crossing_future).get());
+    EXPECT_EQ(get_loading_memory(), (ResourceUsage{70, 0}));
+
+    auto blocked_future = dlist->ReserveLoadingResourceWithTimeout({10, 0}, std::chrono::milliseconds(0));
+    EXPECT_FALSE(std::move(blocked_future).get());
+
+    dlist->ReleaseLoadingResource({40, 0});
+    dlist->ReleaseLoadingResource({30, 0});
+}
+
+TEST_F(DListTest, MaxLoadingMemSizeLimitsOnlyLoadingOverhead) {
+    dlist->UpdateMaxLoadingMemSize(30);
+
+    auto first = dlist->ReserveLoadingResourceWithTimeout({80, 0}, {60, 0}, std::chrono::milliseconds(0));
+    ASSERT_TRUE(std::move(first).get());
+    EXPECT_EQ(get_loading_memory(), (ResourceUsage{80, 0}));
+    EXPECT_EQ(get_loading_overhead_memory(), (ResourceUsage{20, 0}));
+
+    auto crossing = dlist->ReserveLoadingResourceWithTimeout({10, 0}, {0, 0}, std::chrono::milliseconds(0));
+    ASSERT_TRUE(std::move(crossing).get());
+    EXPECT_EQ(get_loading_memory(), (ResourceUsage{90, 0}));
+    EXPECT_EQ(get_loading_overhead_memory(), (ResourceUsage{30, 0}));
+
+    auto blocked = dlist->ReserveLoadingResourceWithTimeout({5, 0}, {0, 0}, std::chrono::milliseconds(0));
+    EXPECT_FALSE(std::move(blocked).get());
+
+    dlist->ReleaseLoadingResource({80, 0}, {60, 0});
+    dlist->ReleaseLoadingResource({10, 0}, {0, 0});
+    EXPECT_EQ(get_loading_overhead_memory(), ResourceUsage{});
+}
+
+TEST_F(DListTest, ZeroOverheadBypassesZeroOverheadLimit) {
+    dlist->UpdateMaxLoadingMemSize(0);
+
+    auto zero_overhead = dlist->ReserveLoadingResourceWithTimeout({50, 0}, {50, 0}, std::chrono::milliseconds(0));
+    ASSERT_TRUE(std::move(zero_overhead).get());
+    EXPECT_EQ(get_loading_memory(), (ResourceUsage{50, 0}));
+    EXPECT_EQ(get_loading_overhead_memory(), ResourceUsage{});
+
+    auto positive_overhead = dlist->ReserveLoadingResourceWithTimeout({10, 0}, {9, 0}, std::chrono::milliseconds(0));
+    EXPECT_FALSE(std::move(positive_overhead).get());
+
+    dlist->ReleaseLoadingResource({50, 0}, {50, 0});
+}
+
+TEST_F(DListTest, WaitingRequestTracksLoadingOverheadSeparately) {
+    dlist->UpdateMaxLoadingMemSize(20);
+    ASSERT_TRUE(
+        std::move(dlist->ReserveLoadingResourceWithTimeout({60, 0}, {40, 0}, std::chrono::milliseconds(100))).get());
+
+    auto waiting = dlist->ReserveLoadingResourceWithTimeout({30, 0}, {20, 0}, std::chrono::milliseconds(5000));
+
+    dlist->ReleaseLoadingResource({60, 0}, {40, 0});
+
+    EXPECT_TRUE(std::move(waiting).get());
+    EXPECT_EQ(get_loading_memory(), (ResourceUsage{30, 0}));
+    EXPECT_EQ(get_loading_overhead_memory(), (ResourceUsage{10, 0}));
+
+    dlist->ReleaseLoadingResource({30, 0}, {20, 0});
+}
+
+TEST_F(DListTest, ReserveWaitsForMaxLoadingMemSizeWhenEvictionDisabled) {
+    auto no_eviction_dlist =
+        std::make_shared<DList>(false, initial_limit, low_watermark, high_watermark, eviction_config_);
+    no_eviction_dlist->UpdateMaxLoadingMemSize(60);
+    auto first_reserve = no_eviction_dlist->ReserveLoadingResourceWithTimeout({60, 0}, std::chrono::milliseconds(100));
+    ASSERT_TRUE(std::move(first_reserve).get());
+
+    auto future = no_eviction_dlist->ReserveLoadingResourceWithTimeout({30, 0}, std::chrono::milliseconds(5000));
+
+    no_eviction_dlist->ReleaseLoadingResource({60, 0});
+
+    EXPECT_TRUE(std::move(future).get());
+    EXPECT_EQ(DLF::get_loading_memory(*no_eviction_dlist), (ResourceUsage{30, 0}));
+}
+
+TEST_F(DListTest, ReserveWaitingRequestUsesDynamicMaxLoadingMemSizeUpdate) {
+    dlist->UpdateMaxLoadingMemSize(50);
+    ASSERT_TRUE(reserveLoadingMemorySync({50, 0}));
+
+    auto future = dlist->ReserveLoadingResourceWithTimeout({30, 0}, std::chrono::milliseconds(5000));
+
+    dlist->UpdateMaxLoadingMemSize(80);
+
+    EXPECT_TRUE(std::move(future).get());
+    EXPECT_EQ(get_loading_memory(), (ResourceUsage{80, 0}));
+}
+
+TEST_F(DListTest, ReserveWaitingRequestRunsAloneAfterMaxLoadingMemSizeDecrease) {
+    dlist->UpdateMaxLoadingMemSize(80);
+    ASSERT_TRUE(reserveLoadingMemorySync({80, 0}));
+
+    auto future = dlist->ReserveLoadingResourceWithTimeout({60, 0}, std::chrono::milliseconds(5000));
+
+    dlist->UpdateMaxLoadingMemSize(50);
+    dlist->ReleaseLoadingResource({80, 0});
+
+    EXPECT_TRUE(std::move(future).get());
+    EXPECT_EQ(get_loading_memory(), (ResourceUsage{60, 0}));
+    dlist->ReleaseLoadingResource({60, 0});
+}
+
+TEST_F(DListTest, ReserveAllowsSingleRequestToExceedMaxLoadingMemSize) {
+    dlist->UpdateMaxLoadingMemSize(40);
+
+    auto first_future = dlist->ReserveLoadingResourceWithTimeout({50, 0}, std::chrono::milliseconds(0));
+    EXPECT_TRUE(std::move(first_future).get());
+    EXPECT_EQ(get_loading_memory(), (ResourceUsage{50, 0}));
+
+    auto second_future = dlist->ReserveLoadingResourceWithTimeout({10, 0}, std::chrono::milliseconds(0));
+    EXPECT_FALSE(std::move(second_future).get());
+    EXPECT_EQ(get_loading_memory(), (ResourceUsage{50, 0}));
+
+    dlist->ReleaseLoadingResource({50, 0});
+}
+
+TEST_F(DListTest, ReserveWaitsForOversizedRequestToFinish) {
+    dlist->UpdateMaxLoadingMemSize(40);
+
+    auto first_future = dlist->ReserveLoadingResourceWithTimeout({50, 0}, std::chrono::milliseconds(0));
+    ASSERT_TRUE(std::move(first_future).get());
+
+    auto second_future = dlist->ReserveLoadingResourceWithTimeout({10, 0}, std::chrono::milliseconds(5000));
+    dlist->ReleaseLoadingResource({50, 0});
+
+    EXPECT_TRUE(std::move(second_future).get());
+    EXPECT_EQ(get_loading_memory(), (ResourceUsage{10, 0}));
+    dlist->ReleaseLoadingResource({10, 0});
+}
+
+TEST_F(DListTest, TimedOutHeadWakesFittingFollower) {
+    auto capacity = ResourceUsage{100, 0};
+    auto no_eviction_dlist = std::make_shared<DList>(false, capacity, capacity, capacity, eviction_config_);
+    ASSERT_TRUE(
+        std::move(no_eviction_dlist->ReserveLoadingResourceWithTimeout({100, 0}, std::chrono::milliseconds(100)))
+            .get());
+
+    auto head = no_eviction_dlist->ReserveLoadingResourceWithTimeout({30, 0}, std::chrono::milliseconds(50));
+    auto follower = no_eviction_dlist->ReserveLoadingResourceWithTimeout({20, 0}, std::chrono::milliseconds(5000));
+
+    no_eviction_dlist->ReleaseLoadingResource({20, 0});
+    EXPECT_FALSE(std::move(head).get());
+
+    auto follower_result =
+        std::async(std::launch::async, [future = std::move(follower)]() mutable { return std::move(future).get(); });
+    auto status = follower_result.wait_for(std::chrono::milliseconds(500));
+    EXPECT_EQ(status, std::future_status::ready);
+    if (status != std::future_status::ready) {
+        no_eviction_dlist->ReleaseLoadingResource({80, 0});
+    }
+    EXPECT_TRUE(follower_result.get());
+
+    if (status == std::future_status::ready) {
+        no_eviction_dlist->ReleaseLoadingResource({80, 0});
+    }
+    no_eviction_dlist->ReleaseLoadingResource({20, 0});
+}
+
+TEST_F(DListTest, CancelledHeadWakesFittingFollower) {
+    auto capacity = ResourceUsage{100, 0};
+    auto no_eviction_dlist = std::make_shared<DList>(false, capacity, capacity, capacity, eviction_config_);
+    ASSERT_TRUE(
+        std::move(no_eviction_dlist->ReserveLoadingResourceWithTimeout({100, 0}, std::chrono::milliseconds(100)))
+            .get());
+
+    folly::CancellationSource cancel_source;
+    auto op_ctx = std::make_unique<milvus::OpContext>(cancel_source.getToken());
+    auto head =
+        no_eviction_dlist->ReserveLoadingResourceWithTimeout({30, 0}, std::chrono::milliseconds(5000), op_ctx.get());
+    auto follower = no_eviction_dlist->ReserveLoadingResourceWithTimeout({20, 0}, std::chrono::milliseconds(5000));
+
+    no_eviction_dlist->ReleaseLoadingResource({20, 0});
+    cancel_source.requestCancellation();
+    EXPECT_FALSE(std::move(head).get());
+
+    auto follower_result =
+        std::async(std::launch::async, [future = std::move(follower)]() mutable { return std::move(future).get(); });
+    auto status = follower_result.wait_for(std::chrono::milliseconds(500));
+    EXPECT_EQ(status, std::future_status::ready);
+    if (status != std::future_status::ready) {
+        no_eviction_dlist->ReleaseLoadingResource({80, 0});
+    }
+    EXPECT_TRUE(follower_result.get());
+
+    if (status == std::future_status::ready) {
+        no_eviction_dlist->ReleaseLoadingResource({80, 0});
+    }
+    no_eviction_dlist->ReleaseLoadingResource({20, 0});
+}
+
+TEST_F(DListTest, MaxLoadingMemSizeDoesNotLimitDiskLoading) {
+    dlist->UpdateMaxLoadingMemSize(1);
+
+    auto first_future = dlist->ReserveLoadingResourceWithTimeout({0, 30}, std::chrono::milliseconds(0));
+    ASSERT_TRUE(std::move(first_future).get());
+
+    auto second_future = dlist->ReserveLoadingResourceWithTimeout({0, 20}, std::chrono::milliseconds(0));
+    EXPECT_TRUE(std::move(second_future).get());
+    EXPECT_EQ(get_loading_memory(), (ResourceUsage{0, 50}));
+
+    dlist->ReleaseLoadingResource({0, 30});
+    dlist->ReleaseLoadingResource({0, 20});
+}
+
+TEST_F(DListTest, MaxLoadingMemSizeMinusOneMeansUnlimited) {
+    dlist->UpdateMaxLoadingMemSize(-1);
+
+    ASSERT_TRUE(reserveLoadingMemorySync({50, 0}));
+    ASSERT_TRUE(reserveLoadingMemorySync({30, 0}));
+    EXPECT_EQ(get_loading_memory(), (ResourceUsage{80, 0}));
+
+    dlist->ReleaseLoadingResource({50, 0});
+    dlist->ReleaseLoadingResource({30, 0});
+}
+
+TEST_F(DListTest, MaxLoadingMemSizeRejectsValuesBelowMinusOne) {
+    EXPECT_THROW(dlist->UpdateMaxLoadingMemSize(-2), milvus::SegcoreError);
 }

@@ -52,6 +52,7 @@ class MockTranslator : public Translator<TestCell> {
           key_(key),
           meta_(storage_type, CellIdMappingMode::CUSTOMIZED, CellDataType::OTHER,
                 CacheWarmupPolicy::CacheWarmupPolicy_Disable, true),
+          max_loading_concurrency_(cell_sizes.size()),
           for_concurrent_test_(for_concurrent_test) {
         cid_set_.reserve(cell_sizes.size());
         cell_sizes_.reserve(cell_sizes.size());
@@ -81,12 +82,15 @@ class MockTranslator : public Translator<TestCell> {
     }
 
     std::pair<ResourceUsage, ResourceUsage>
-    estimated_byte_size_of_cell(cid_t cid) const override {
-        auto it = cell_sizes_.find(cid);
-        if (it != cell_sizes_.end()) {
-            return {{it->second, 0}, {it->second, 0}};
+    estimated_loading_usage(const std::vector<cid_t>& cids) const override {
+        ResourceUsage estimated_loaded_usage;
+        for (const auto cid : cids) {
+            estimated_loaded_usage += estimated_cell_usage(cid);
         }
-        return {{1, 0}, {1, 0}};
+        const auto concurrent_cells = std::min(cids.size(), max_loading_concurrency_);
+        auto estimated_loading_usage = estimated_loaded_usage;
+        estimated_loading_usage.memory_bytes += static_cast<int64_t>(concurrent_cells) * loading_overhead_per_cell_;
+        return {estimated_loaded_usage, estimated_loading_usage};
     }
 
     int64_t
@@ -100,7 +104,7 @@ class MockTranslator : public Translator<TestCell> {
         int64_t total_bytes = 0;
         // make the storage size equal to the loaded memory size in test
         for (const auto& cid : cids) {
-            total_bytes += estimated_byte_size_of_cell(cid).first.memory_bytes;
+            total_bytes += estimated_cell_usage(cid).memory_bytes;
         }
         return total_bytes;
     }
@@ -153,8 +157,8 @@ class MockTranslator : public Translator<TestCell> {
                 throw std::runtime_error("Operation cancelled, stop loading cache cells");
             }
 
-            result.emplace_back(cid, std::make_unique<TestCell>(static_cast<int>(cid * 10), cid,
-                                                                estimated_byte_size_of_cell(cid).first));
+            result.emplace_back(cid,
+                                std::make_unique<TestCell>(static_cast<int>(cid * 10), cid, estimated_cell_usage(cid)));
         }
         return result;
     }
@@ -179,6 +183,11 @@ class MockTranslator : public Translator<TestCell> {
     SetExtraReturnCids(std::unordered_map<cid_t, std::vector<cid_t>> extra_cids) {
         extra_cids_ = extra_cids;
     }
+    void
+    SetLoadingUsageEstimate(int64_t overhead_per_cell, size_t max_concurrency) {
+        loading_overhead_per_cell_ = overhead_per_cell;
+        max_loading_concurrency_ = max_concurrency;
+    }
     int
     GetCellsCallCount() const {
         EXPECT_FALSE(for_concurrent_test_);
@@ -197,6 +206,12 @@ class MockTranslator : public Translator<TestCell> {
     }
 
  private:
+    ResourceUsage
+    estimated_cell_usage(cid_t cid) const {
+        auto it = cell_sizes_.find(cid);
+        return it != cell_sizes_.end() ? ResourceUsage{it->second, 0} : ResourceUsage{1, 0};
+    }
+
     std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map_;
     std::unordered_map<cid_t, int64_t> cell_sizes_;
     std::unordered_set<cid_t> cid_set_;
@@ -205,6 +220,8 @@ class MockTranslator : public Translator<TestCell> {
     Meta meta_;
 
     std::unordered_map<cid_t, int> cid_load_delay_ms_;
+    int64_t loading_overhead_per_cell_ = 0;
+    size_t max_loading_concurrency_ = 0;
     bool load_should_throw_ = false;
     int cells_storage_bytes_throw_on_cid_ = -1;  // -1 means no throw
     std::unordered_map<cid_t, std::vector<cid_t>> extra_cids_;
@@ -259,7 +276,7 @@ TEST_F(CacheSlotTest, Initialization) {
 TEST_F(CacheSlotTest, PinSingleCellSuccess) {
     cl_uid_t target_uid = 30;
     cid_t expected_cid = 2;
-    ResourceUsage expected_size = translator_->estimated_byte_size_of_cell(expected_cid).first;
+    ResourceUsage expected_size = translator_->estimated_loading_usage({expected_cid}).first;
 
     translator_->ResetCounters();
     auto op_ctx = std::make_unique<milvus::OpContext>();
@@ -288,10 +305,7 @@ TEST_F(CacheSlotTest, PinMultipleCellsSuccess) {
     std::vector<cl_uid_t> target_uids = {10, 40, 51};
     std::vector<cid_t> expected_cids = {0, 3, 4};
     std::sort(expected_cids.begin(), expected_cids.end());
-    ResourceUsage expected_total_size;
-    for (cid_t cid : expected_cids) {
-        expected_total_size += translator_->estimated_byte_size_of_cell(cid).first;
-    }
+    ResourceUsage expected_total_size = translator_->estimated_loading_usage(expected_cids).first;
 
     translator_->ResetCounters();
     auto op_ctx = std::make_unique<milvus::OpContext>();
@@ -322,10 +336,7 @@ TEST_F(CacheSlotTest, PinMultipleUidsMappingToSameCid) {
     std::vector<cl_uid_t> target_uids = {30, 50, 31, 51, 32};
     std::vector<cid_t> expected_unique_cids = {2, 4};
     std::sort(expected_unique_cids.begin(), expected_unique_cids.end());
-    ResourceUsage expected_total_size;
-    for (cid_t cid : expected_unique_cids) {
-        expected_total_size += translator_->estimated_byte_size_of_cell(cid).first;
-    }
+    ResourceUsage expected_total_size = translator_->estimated_loading_usage(expected_unique_cids).first;
 
     translator_->ResetCounters();
     auto op_ctx = std::make_unique<milvus::OpContext>();
@@ -416,7 +427,7 @@ TEST_F(CacheSlotTest, LoadFailure) {
 
     // recover the translator and try again
     translator_->SetShouldThrow(false);
-    auto expected_size = translator_->estimated_byte_size_of_cell(expected_cid).first;
+    auto expected_size = translator_->estimated_loading_usage({expected_cid}).first;
     auto future2 = cache_slot_->PinCells(op_ctx.get(), {target_uid});
     auto accessor = SemiInlineGet(std::move(future2));
     ASSERT_NE(accessor, nullptr);
@@ -430,7 +441,7 @@ TEST_F(CacheSlotTest, LoadFailure) {
 TEST_F(CacheSlotTest, PinAlreadyLoadedCell) {
     cl_uid_t target_uid = 40;
     cid_t expected_cid = 3;
-    ResourceUsage expected_size = translator_->estimated_byte_size_of_cell(expected_cid).first;
+    ResourceUsage expected_size = translator_->estimated_loading_usage({expected_cid}).first;
 
     translator_->ResetCounters();
 
@@ -473,7 +484,7 @@ TEST_F(CacheSlotTest, PinAlreadyLoadedCellViaDifferentUid) {
     cl_uid_t uid1 = 30;
     cl_uid_t uid2 = 31;
     cid_t expected_cid = 2;
-    ResourceUsage expected_size = translator_->estimated_byte_size_of_cell(expected_cid).first;
+    ResourceUsage expected_size = translator_->estimated_loading_usage({expected_cid}).first;
 
     translator_->ResetCounters();
 
@@ -522,8 +533,8 @@ TEST_F(CacheSlotTest, TranslatorReturnsExtraCells) {
     cid_t extra_cid = 1;
     cl_uid_t extra_uid = 20;
 
-    ResourceUsage requested_size = translator_->estimated_byte_size_of_cell(requested_cid).first;
-    ResourceUsage extra_size = translator_->estimated_byte_size_of_cell(extra_cid).first;
+    ResourceUsage requested_size = translator_->estimated_loading_usage({requested_cid}).first;
+    ResourceUsage extra_size = translator_->estimated_loading_usage({extra_cid}).first;
     ResourceUsage expected_size = requested_size + extra_size;
 
     translator_->ResetCounters();
@@ -565,6 +576,77 @@ TEST_F(CacheSlotTest, TranslatorReturnsExtraCells) {
     EXPECT_EQ(extra_cell->cid, extra_cid);
 }
 
+TEST(CacheSlotLoadingAdmissionTest, SelfReservationDisabledSkipsLoadingAdmission) {
+    auto limit = ResourceUsage{1000, 0};
+    EvictionConfig eviction_config;
+    eviction_config.loading_resource_factor = 2.0f;
+    auto dlist = std::make_shared<DList>(false, limit, limit, limit, eviction_config, 40);
+
+    std::vector<std::pair<cid_t, int64_t>> cell_sizes = {{0, 50}};
+    std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map = {{0, 0}};
+    auto translator = std::make_unique<MockTranslator>(cell_sizes, uid_to_cid_map, "loading_cap_without_eviction",
+                                                       StorageType::MEMORY);
+    auto* translator_ptr = translator.get();
+    auto cache_slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), false, false, true,
+                                                            std::chrono::milliseconds(0));
+
+    auto op_ctx = std::make_unique<milvus::OpContext>();
+    auto accessor = cache_slot->PinCellsDirect(op_ctx.get(), {0});
+
+    ASSERT_NE(accessor, nullptr);
+    EXPECT_EQ(translator_ptr->GetCellsCallCount(), 1);
+    EXPECT_EQ(DListTestFriend::get_used_memory(*dlist), (ResourceUsage{50, 0}));
+    EXPECT_EQ(DListTestFriend::get_loading_memory(*dlist), ResourceUsage{});
+    EXPECT_EQ(DListTestFriend::get_loading_overhead_memory(*dlist), ResourceUsage{});
+}
+
+TEST(CacheSlotLoadingAdmissionTest, UsesBatchLoadingUsageEstimate) {
+    auto limit = ResourceUsage{160, 0};
+    auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{});
+
+    std::vector<std::pair<cid_t, int64_t>> cell_sizes = {{0, 50}, {1, 50}};
+    std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map = {{0, 0}, {1, 1}};
+    auto translator =
+        std::make_unique<MockTranslator>(cell_sizes, uid_to_cid_map, "batch_loading_usage", StorageType::MEMORY);
+    translator->SetLoadingUsageEstimate(50, 1);
+    auto cache_slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                                            std::chrono::milliseconds(0));
+
+    auto op_ctx = std::make_unique<milvus::OpContext>();
+    auto accessor = cache_slot->PinCellsDirect(op_ctx.get(), {0, 1});
+
+    ASSERT_NE(accessor, nullptr);
+    EXPECT_EQ(DListTestFriend::get_used_memory(*dlist), (ResourceUsage{100, 0}));
+}
+
+TEST(CacheSlotLoadingAdmissionTest, BonusLoadedResourceReducesLoadingOverhead) {
+    auto limit = ResourceUsage{1000, 0};
+    auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{}, 100);
+    auto existing_load = dlist->ReserveLoadingResourceWithTimeout({100, 0}, std::chrono::milliseconds(0));
+    ASSERT_TRUE(std::move(existing_load).get());
+
+    std::vector<std::pair<cid_t, int64_t>> cell_sizes = {{0, 50}, {1, 150}};
+    std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map = {{0, 0}, {1, 1}};
+    auto translator =
+        std::make_unique<MockTranslator>(cell_sizes, uid_to_cid_map, "bonus_loading_overhead", StorageType::MEMORY);
+    auto* translator_ptr = translator.get();
+    translator_ptr->SetExtraReturnCids({{0, {1}}});
+    auto cache_slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                                            std::chrono::milliseconds(0));
+
+    auto op_ctx = std::make_unique<milvus::OpContext>();
+    auto accessor = cache_slot->PinCellsDirect(op_ctx.get(), {0});
+
+    ASSERT_NE(accessor, nullptr);
+    ASSERT_EQ(translator_ptr->GetCellsCallCount(), 1);
+    ASSERT_EQ(translator_ptr->GetRequestedCids().size(), 1);
+    EXPECT_EQ(translator_ptr->GetRequestedCids().front(), (std::vector<cid_t>{0, 1}));
+    EXPECT_EQ(DListTestFriend::get_used_memory(*dlist), (ResourceUsage{200, 0}));
+    EXPECT_EQ(DListTestFriend::get_loading_overhead_memory(*dlist), (ResourceUsage{100, 0}));
+
+    dlist->ReleaseLoadingResource({100, 0});
+}
+
 TEST_F(CacheSlotTest, EvictionTest) {
     // Sizes: 0:50, 1:150, 2:100, 3:200
     ResourceUsage new_limit = ResourceUsage(300, 0);
@@ -577,9 +659,7 @@ TEST_F(CacheSlotTest, EvictionTest) {
 
     std::vector<cl_uid_t> uids_012 = {10, 20, 30};
     std::vector<cid_t> cids_012 = {0, 1, 2};
-    ResourceUsage size_012 = translator_->estimated_byte_size_of_cell(0).first +
-                             translator_->estimated_byte_size_of_cell(1).first +
-                             translator_->estimated_byte_size_of_cell(2).first;
+    ResourceUsage size_012 = translator_->estimated_loading_usage(cids_012).first;
     ASSERT_EQ(size_012, ResourceUsage(50 + 150 + 100, 0));
 
     auto op_ctx = std::make_unique<milvus::OpContext>();
@@ -605,7 +685,7 @@ TEST_F(CacheSlotTest, EvictionTest) {
     // 3. Load cell 3 (size 200), requires eviction
     cl_uid_t uid_3 = 40;
     cid_t cid_3 = 3;
-    ResourceUsage size_3 = translator_->estimated_byte_size_of_cell(cid_3).first;
+    ResourceUsage size_3 = translator_->estimated_loading_usage({cid_3}).first;
     ASSERT_EQ(size_3, ResourceUsage(200, 0));
 
     translator_->ResetCounters();
@@ -1019,21 +1099,18 @@ class MockTranslatorWithWarmup : public Translator<TestCell> {
     }
 
     std::pair<ResourceUsage, ResourceUsage>
-    estimated_byte_size_of_cell(cid_t cid) const override {
-        auto it = cell_sizes_.find(cid);
-        if (it != cell_sizes_.end()) {
-            return {{it->second, 0}, {it->second, 0}};
+    estimated_loading_usage(const std::vector<cid_t>& cids) const override {
+        ResourceUsage total_size;
+        for (const auto cid : cids) {
+            auto it = cell_sizes_.find(cid);
+            total_size += it != cell_sizes_.end() ? ResourceUsage{it->second, 0} : ResourceUsage{1, 0};
         }
-        return {{1, 0}, {1, 0}};
+        return {total_size, total_size};
     }
 
     int64_t
     cells_storage_bytes(const std::vector<cid_t>& cids) const override {
-        int64_t total_bytes = 0;
-        for (const auto& cid : cids) {
-            total_bytes += estimated_byte_size_of_cell(cid).first.memory_bytes;
-        }
-        return total_bytes;
+        return estimated_loading_usage(cids).first.memory_bytes;
     }
 
     const std::string&
@@ -1076,8 +1153,8 @@ class MockTranslatorWithWarmup : public Translator<TestCell> {
                 throw std::runtime_error("Operation cancelled, stop loading cache cells");
             }
 
-            result.emplace_back(cid, std::make_unique<TestCell>(static_cast<int>(cid * 10), cid,
-                                                                estimated_byte_size_of_cell(cid).first));
+            result.emplace_back(
+                cid, std::make_unique<TestCell>(static_cast<int>(cid * 10), cid, estimated_loading_usage({cid}).first));
         }
 
         // Signal that loading has completed

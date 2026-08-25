@@ -12,6 +12,7 @@
 #include "cachinglayer/Utils.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -34,6 +35,15 @@ namespace milvus::cachinglayer::internal {
 // Returns 0 if failed to get memory info, or if the platform is not supported.
 int64_t
 getHostTotalMemory() {
+#ifdef MCL_ENABLE_TEST_CGROUP_OVERRIDE
+    if (const char* host_memory_env = std::getenv("MCL_HOST_TOTAL_MEMORY")) {
+        try {
+            return std::max<int64_t>(std::stoll(host_memory_env), 0);
+        } catch (...) {
+            LOG_WARN("[MCL] Invalid MCL_HOST_TOTAL_MEMORY environment variable: {}", host_memory_env);
+        }
+    }
+#endif
     static int64_t cached_total_memory = []() -> int64_t {
 #ifdef __linux__
         std::ifstream meminfo("/proc/meminfo");
@@ -225,6 +235,19 @@ getContainerMemLimit() {
     return 0;
 }
 
+int64_t
+getMaxLoadingMemSize(double max_loading_mem_ratio) {
+    AssertInfo(max_loading_mem_ratio >= 0 && max_loading_mem_ratio <= 1,
+               "[MCL] max loading memory ratio must be between 0 and 1, got {}", max_loading_mem_ratio);
+
+    const auto total_memory = getSystemMemoryInfo().total_bytes;
+    if (total_memory <= 0 || total_memory == std::numeric_limits<int64_t>::max()) {
+        LOG_WARN("[MCL] Cannot determine effective memory limit; max loading memory remains unlimited");
+        return -1;
+    }
+    return static_cast<int64_t>(total_memory * max_loading_mem_ratio);
+}
+
 SystemResourceInfo
 getSystemMemoryInfo() {
     SystemResourceInfo info;
@@ -240,16 +263,18 @@ getSystemMemoryInfo() {
         return info;
     }
 
-    if (container_limit > 0 && container_limit < host_memory) {
+    if (host_memory <= 0) {
+        info.total_bytes = container_limit;
+    } else if (container_limit <= 0) {
+        info.total_bytes = host_memory;
+    } else if (container_limit < host_memory) {
         info.total_bytes = container_limit;
     } else {
         info.total_bytes = host_memory;
-        if (container_limit > host_memory) {
-            LOG_WARN(
-                "[MCL] Container limit ({}) exceeds host memory ({}), using "
-                "host memory",
-                FormatBytes(container_limit), FormatBytes(host_memory));
-        }
+        LOG_WARN(
+            "[MCL] Container limit ({}) exceeds host memory ({}), using "
+            "host memory",
+            FormatBytes(container_limit), FormatBytes(host_memory));
     }
 
     // Get current process memory usage (RSS - Shared)
