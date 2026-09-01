@@ -147,13 +147,38 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         });
     }
 
+    // Borrows a resident cell without taking shared ownership. Returns nullptr when the slot still
+    // requires pinning, in which case the caller must go through one of the Pin*() entry points.
+    //
+    // Lifetime: skip_pin_ is only ever assigned !evictable_, evictable_ is a const member fixed at
+    // construction, and skip_pin_ never transitions back to false. So once this returns non-null,
+    // the cell is permanently resident and the pointer stays valid for as long as this CacheSlot
+    // is alive - which callers already guarantee, since they reach the slot through a shared_ptr.
+    //
+    // This exists because the skip_pin_ fast path is not free: it still builds a CellAccessor that
+    // holds no pin at all, which costs a shared_from_this() refcount bump on a control block shared
+    // by every thread touching this slot, plus the allocations for the accessor and for the
+    // SemiFuture wrapping it. Callers that only need the cell for the duration of an already-pinned
+    // scope should borrow instead.
+    //
+    // Deliberately records no metrics: see RecordAccessEvent() for why a per-access prometheus
+    // counter cannot live on this path. Accesses through this method are therefore invisible to
+    // internal_cache_access_event_total - as accesses through the skip_pin_ fast path already were.
+    CellT*
+    TryBorrowCell(uid_t uid) {
+        if (!skip_pin_.load(std::memory_order_acquire)) {
+            return nullptr;
+        }
+        return cells_[cell_id_of(uid)]->cell();
+    }
+
     folly::SemiFuture<std::shared_ptr<CellAccessor<CellT>>>
     PinCells(OpContext* ctx, const std::vector<uid_t>& uids) {
         if (skip_pin_.load(std::memory_order_acquire)) {
             return std::make_shared<CellAccessor<CellT>>(this->shared_from_this(),
                                                          std::vector<internal::ListNode::NodePin>());
         }
-        monitor::cache_access_event_total(cell_data_type_, storage_type_).Increment();
+        RecordAccessEvent();
         return folly::makeSemiFuture().deferValue(
             [this, uids = std::vector<uid_t>(uids), ctx](auto&&) -> std::shared_ptr<CellAccessor<CellT>> {
                 auto count = std::min(uids.size(), cells_.size());
@@ -380,6 +405,30 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         }
 
         return std::make_shared<CellAccessor<CellT>>(this->shared_from_this(), std::move(all_pins));
+    }
+
+    // Counts one cell-access request.
+    //
+    // Read this before trusting internal_cache_access_event_total: it does NOT count every cell
+    // access, and it cannot be made to without a cheaper counter first.
+    //
+    //   - It is only reached from PinCells(), so PinAllCells(), PinOneCellDirect(),
+    //     PinCellsDirect() and TryBorrowCell() accesses are not counted at all.
+    //   - It sits below the skip_pin_ early return. skip_pin_ is assigned !evictable_ after warmup
+    //     and never cleared, so for a non-evictable (permanently resident) slot this counter reads
+    //     zero for the lifetime of the process - and resident slots are the common case for loaded
+    //     sealed segments. The same is true of cache_cell_access_hit/miss_bytes_total and of
+    //     OpContext::storage_usage.scanned_*_bytes, which are further down the pinning path.
+    //
+    // The tempting fix - hoist this above the skip_pin_ check and call it from every entry point -
+    // is wrong: prometheus::Counter::Increment() is a compare-exchange loop on a single
+    // std::atomic<double> shared by every thread using the same (CellDataType, StorageType) pair,
+    // so it would put a contended CAS on the hottest path in the engine, which is exactly the class
+    // of cost TryBorrowCell() exists to remove. Making the access rate observable needs a sharded
+    // or thread-local counter that is flushed periodically; tracked separately.
+    void
+    RecordAccessEvent() const {
+        monitor::cache_access_event_total(cell_data_type_, storage_type_).Increment();
     }
 
     [[nodiscard]] cid_t

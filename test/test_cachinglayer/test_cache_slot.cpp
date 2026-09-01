@@ -1748,3 +1748,40 @@ TEST(WarmupTimeoutTest, SyncWarmupBestEffortResourceAvailable) {
         EXPECT_EQ(cell->cid, cid);
     }
 }
+
+// TryBorrowCell() must refuse to hand out a cell while the slot still needs pinning. The fixture
+// slot is evictable, so skip_pin_ is false and every borrow attempt has to fall back to Pin*().
+TEST_F(CacheSlotTest, TryBorrowCellReturnsNullWhileSlotNeedsPinning) {
+    for (cl_uid_t uid : {10, 20, 30, 40, 50}) {
+        EXPECT_EQ(cache_slot_->TryBorrowCell(uid), nullptr);
+    }
+}
+
+// A non-evictable slot sets skip_pin_ once warmup completes, after which its cells are permanently
+// resident and can be borrowed without taking shared ownership. The borrowed pointer must be the
+// same cell the pinning path hands out.
+TEST(CacheSlotBorrowTest, TryBorrowCellReturnsResidentCellAfterWarmup) {
+    auto limit = ResourceUsage{10000, 0};
+    auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
+
+    std::vector<std::pair<cid_t, int64_t>> cell_sizes = {{0, 100}, {1, 100}};
+    std::unordered_map<cl_uid_t, cid_t> uid_to_cid_map = {{0, 0}, {1, 1}};
+    auto translator = std::make_unique<MockTranslatorWithWarmup>(
+        cell_sizes, uid_to_cid_map, "borrow_slot", StorageType::MEMORY, CacheWarmupPolicy::CacheWarmupPolicy_Sync);
+
+    // evictable = false, so warmup flips skip_pin_ to true.
+    auto cache_slot =
+        std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), /*evictable=*/false, true, true,
+                                              std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
+
+    EXPECT_EQ(cache_slot->TryBorrowCell(0), nullptr) << "must not borrow before warmup sets skip_pin_";
+
+    cache_slot->Warmup(nullptr);
+
+    for (cl_uid_t uid : {0, 1}) {
+        auto* borrowed = cache_slot->TryBorrowCell(uid);
+        ASSERT_NE(borrowed, nullptr);
+        auto accessor = cache_slot->PinOneCellDirect(nullptr, uid);
+        EXPECT_EQ(borrowed, accessor->get_cell_of(uid));
+    }
+}
