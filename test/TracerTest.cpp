@@ -493,6 +493,36 @@ TEST(Tracer, AutoSpanGetSpanReturnsRealSpanWhenEnabled) {
     }
 }
 
+TEST(Tracer, AutoSpanSetAttributeNoopWhenDisabled) {
+    auto config = std::make_shared<TraceConfig>();
+    config->exporter = "noop";
+    config->nodeID = 1;
+    initTelemetry(*config);
+    ASSERT_FALSE(IsTraceEnabled());
+
+    // When tracing is disabled, SetAttribute short-circuits on the nullptr span_
+    // and must be a safe no-op for any value type.
+    AutoSpan span("test_auto_span", nullptr, false);
+    span.SetAttribute("data_type", 1);
+    span.SetAttribute("key", std::string("value"));
+    span.SetAttribute("ratio", 0.5);
+    span.SetAttribute("is_root", true);
+}
+
+TEST(Tracer, AutoSpanSetAttributeWhenEnabled) {
+    auto config = std::make_shared<TraceConfig>();
+    config->exporter = "stdout";
+    config->nodeID = 1;
+    initTelemetry(*config);
+    ASSERT_TRUE(IsTraceEnabled());
+
+    AutoSpan span("test_enabled_auto_span", nullptr, false);
+    span.SetAttribute("data_type", 1);
+    span.SetAttribute("key", std::string("value"));
+    span.SetAttribute("ratio", 0.5);
+    span.SetAttribute("is_root", true);
+}
+
 TEST(Tracer, NoopSpanMethodsAreSafe) {
     // Disable tracing
     auto config = std::make_shared<TraceConfig>();
