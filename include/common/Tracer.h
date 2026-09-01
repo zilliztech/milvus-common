@@ -271,20 +271,40 @@ struct AutoSpan {
     // when this AutoSpan is destroyed.
     explicit AutoSpan(const std::string& name, const std::shared_ptr<trace::Span>& span, bool set_as_temp_root = false);
 
+    // const char* overloads. Call sites pass string literals, and most of the span names used on
+    // the segcore expression path exceed libstdc++'s 15-char SSO buffer (e.g.
+    // "PhyConjunctFilterExpr::Eval" is 27 chars), so the std::string temporary is heap-allocated
+    // by the caller before the constructor can early-return on IsTraceEnabled(). These overloads
+    // forward to the const char* StartSpan() variants added in #103 and keep the disabled path
+    // allocation-free.
+    explicit AutoSpan(const char* name, TraceContext* ctx = nullptr, bool is_root_span = false);
+    explicit AutoSpan(const char* name, const std::shared_ptr<trace::Span>& span, bool set_as_temp_root = false);
+
     // Sets an attribute on the underlying span.
     // When tracing is disabled, span_ is always nullptr (the constructor returns early),
     // so this short-circuits to a strict no-op: a single branch, fully inlined, with no
-    // shared_ptr refcount traffic and no virtual call. This avoids the atomic LDADD hotspot
-    // caused by GetSpan() copying the global noop_span on every call.
+    // shared_ptr refcount traffic and no virtual call.
+    //
+    // key is nostd::string_view rather than const std::string&: call sites pass string literals,
+    // and the argument is materialised before the span_ check, so a std::string parameter charges
+    // a heap allocation to the disabled path for any key past the 15-char SSO buffer -
+    // "json_filter_expr_type" (21 chars) is already one of them. nostd::string_view is what
+    // Span::SetAttribute() takes anyway, and is constructible from both const char* and
+    // std::string, so no call site has to change.
     template <typename T>
     void
-    SetAttribute(const std::string& key, const T& value) {
+    SetAttribute(opentelemetry::nostd::string_view key, const T& value) {
         if (span_ != nullptr) {
             span_->SetAttribute(key, value);
         }
     }
 
-    std::shared_ptr<trace::Span>
+    // Returns by const reference. When tracing is disabled span_ is null and this returns the
+    // process-global noop_span; returning it by value made every call copy that one shared_ptr,
+    // i.e. an atomic increment and decrement on a single control block shared by every thread.
+    // Callers use the result as `span.GetSpan()->...` within the full-expression, so a reference
+    // is sufficient: noop_span is a file-static and span_ outlives the call as a member.
+    const std::shared_ptr<trace::Span>&
     GetSpan();
 
     ~AutoSpan();

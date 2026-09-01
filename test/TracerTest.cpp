@@ -1,6 +1,12 @@
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
 #include <memory>
+#include <thread>
+#include <vector>
 
 #include "common/EasyAssert.h"
 #include "common/OpContext.h"
@@ -595,4 +601,116 @@ TEST(Tracer, NestedSpanGuardRestoresPreviousSpan) {
         ASSERT_EQ(local_span, second);
     }
     ASSERT_EQ(local_span, first);
+}
+
+TEST(Tracer, AutoSpanCStringOverloadDisabled) {
+    auto config = std::make_shared<TraceConfig>();
+    config->exporter = "noop";
+    config->nodeID = 1;
+    initTelemetry(*config);
+    ASSERT_FALSE(IsTraceEnabled());
+
+    // The const char* overloads must behave exactly like the std::string ones: no span is
+    // started while tracing is off, and GetSpan() still hands back the noop span so that
+    // `span.GetSpan()->...` stays safe.
+    AutoSpan ctx_span("PhyConjunctFilterExpr::Eval", nullptr, false);
+    ASSERT_NE(ctx_span.GetSpan(), nullptr);
+
+    AutoSpan child_span("PhyBinaryArithOpEvalRangeExpr::Eval", GetRootSpan(), true);
+    ASSERT_NE(child_span.GetSpan(), nullptr);
+}
+
+TEST(Tracer, AutoSpanCStringOverloadEnabled) {
+    auto config = std::make_shared<TraceConfig>();
+    config->exporter = "stdout";
+    config->nodeID = 1;
+    initTelemetry(*config);
+    ASSERT_TRUE(IsTraceEnabled());
+
+    AutoSpan ctx_span("PhyConjunctFilterExpr::Eval", nullptr, false);
+    ASSERT_NE(ctx_span.GetSpan(), nullptr);
+    ASSERT_TRUE(ctx_span.GetSpan()->IsRecording());
+
+    AutoSpan child_span("PhyBinaryArithOpEvalRangeExpr::Eval", ctx_span.GetSpan(), true);
+    ASSERT_NE(child_span.GetSpan(), nullptr);
+    ASSERT_TRUE(child_span.GetSpan()->IsRecording());
+}
+
+namespace {
+
+std::atomic<std::uintptr_t> bench_sink{0};
+
+// Returns the mean per-op latency in nanoseconds observed by one thread.
+double
+RunDisabledPathBench(int num_threads, int iters_per_thread, bool force_copy) {
+    std::atomic<bool> go{false};
+    std::atomic<int> ready{0};
+    std::vector<std::thread> workers;
+    workers.reserve(num_threads);
+
+    for (int t = 0; t < num_threads; ++t) {
+        workers.emplace_back([&] {
+            std::uintptr_t sink = 0;
+            ready.fetch_add(1, std::memory_order_release);
+            while (!go.load(std::memory_order_acquire)) {
+            }
+            for (int i = 0; i < iters_per_thread; ++i) {
+                AutoSpan span("PhyConjunctFilterExpr::Eval", GetRootSpan(), true);
+                if (force_copy) {
+                    auto copied = span.GetSpan();
+                    sink += reinterpret_cast<std::uintptr_t>(copied.get());
+                } else {
+                    sink += reinterpret_cast<std::uintptr_t>(span.GetSpan().get());
+                }
+            }
+            bench_sink.fetch_add(sink, std::memory_order_relaxed);
+        });
+    }
+
+    while (ready.load(std::memory_order_acquire) < num_threads) {
+    }
+    auto start = std::chrono::steady_clock::now();
+    go.store(true, std::memory_order_release);
+    for (auto& worker : workers) {
+        worker.join();
+    }
+    auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+    return static_cast<double>(ns) / iters_per_thread;
+}
+
+}  // namespace
+
+// Measures the cost of reaching an AutoSpan's span while tracing is disabled — the production
+// default — as the thread count grows. This is a measurement, not an assertion, so it is
+// DISABLED by default. Run it explicitly with:
+//
+//   ./<test-binary> --gtest_also_run_disabled_tests \
+//                   --gtest_filter='Tracer.DISABLED_AutoSpanDisabledPathContention'
+//
+// Two variants are timed per thread count:
+//   copy   - `auto s = span.GetSpan();` forces a shared_ptr copy, i.e. an atomic increment and
+//            decrement on the single process-global noop_span control block. This is what every
+//            `span.GetSpan()->SetAttribute(...)` call site did before this change.
+//   borrow - `span.GetSpan()->...` with GetSpan() returning by const reference, which touches no
+//            refcount at all.
+//
+// The gap between the two columns is the contention removed here, and it should widen
+// superlinearly with the thread count. On a build without this change both columns copy, so they
+// converge - which is itself a useful control.
+TEST(Tracer, DISABLED_AutoSpanDisabledPathContention) {
+    auto config = std::make_shared<TraceConfig>();
+    config->exporter = "noop";
+    config->nodeID = 1;
+    initTelemetry(*config);
+    ASSERT_FALSE(IsTraceEnabled());
+
+    constexpr int kIters = 200000;
+    std::printf("%8s %14s %14s %10s\n", "threads", "copy ns/op", "borrow ns/op", "ratio");
+    for (int threads : {1, 2, 4, 8, 16, 24, 48}) {
+        auto copy_ns = RunDisabledPathBench(threads, kIters, /*force_copy=*/true);
+        auto borrow_ns = RunDisabledPathBench(threads, kIters, /*force_copy=*/false);
+        std::printf("%8d %14.1f %14.1f %10.1fx\n", threads, copy_ns, borrow_ns,
+                    borrow_ns > 0 ? copy_ns / borrow_ns : 0.0);
+    }
+    SUCCEED();
 }
