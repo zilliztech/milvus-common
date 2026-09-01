@@ -97,6 +97,19 @@ struct AutoSpan {
     // when this AutoSpan is destroyed.
     explicit AutoSpan(const std::string& name, const std::shared_ptr<trace::Span>& span, bool set_as_temp_root = false);
 
+    // Sets an attribute on the underlying span.
+    // When tracing is disabled, span_ is always nullptr (the constructor returns early),
+    // so this short-circuits to a strict no-op: a single branch, fully inlined, with no
+    // shared_ptr refcount traffic and no virtual call. This avoids the atomic LDADD hotspot
+    // caused by GetSpan() copying the global noop_span on every call.
+    template <typename T>
+    void
+    SetAttribute(const std::string& key, const T& value) {
+        if (span_ != nullptr) {
+            span_->SetAttribute(key, value);
+        }
+    }
+
     std::shared_ptr<trace::Span>
     GetSpan();
 
