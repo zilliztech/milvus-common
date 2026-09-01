@@ -343,7 +343,31 @@ AutoSpan::AutoSpan(const std::string& name, const std::shared_ptr<trace::Span>& 
     }
 }
 
-std::shared_ptr<trace::Span>
+AutoSpan::AutoSpan(const char* name, TraceContext* ctx, bool is_root_span)
+    : span_(nullptr), is_root_span_(is_root_span) {
+    if (!IsTraceEnabled()) {
+        return;
+    }
+    span_ = StartSpan(name, ctx);
+    if (is_root_span) {
+        SetRootSpan(span_);
+    }
+}
+
+AutoSpan::AutoSpan(const char* name, const std::shared_ptr<trace::Span>& parent, bool set_as_temp_root)
+    : span_(nullptr), is_root_span_(false), set_as_temp_root_(false) {
+    if (!IsTraceEnabled()) {
+        return;
+    }
+    set_as_temp_root_ = set_as_temp_root;
+    span_ = StartSpan(name, parent);
+    if (set_as_temp_root_) {
+        previous_root_ = GetRootSpan();
+        SetRootSpan(span_);
+    }
+}
+
+const std::shared_ptr<trace::Span>&
 AutoSpan::GetSpan() {
     if (span_ == nullptr) {
         return noop_span;
