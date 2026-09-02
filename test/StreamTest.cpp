@@ -1,3 +1,4 @@
+#include <folly/executors/InlineExecutor.h>
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -207,6 +208,32 @@ TEST_F(StreamTest, LocalInputStream_ReadAt) {
 
     EXPECT_EQ(bytes_read, 10u);
     EXPECT_TRUE(std::equal(read_data.begin(), read_data.end(), data.begin() + 50));
+}
+
+TEST_F(StreamTest, LocalInputStream_ReadAtAsyncDefersRead) {
+    const std::vector<uint8_t> data = {1, 2, 3, 4, 5, 6};
+    WriteTestFile(data);
+
+    LocalInputStream in(temp_file_);
+    std::vector<uint8_t> read_data(3, 0);
+
+    auto future = in.ReadAtAsync(read_data.data(), 2, read_data.size());
+    EXPECT_EQ(read_data, std::vector<uint8_t>({0, 0, 0}));
+
+    auto bytes_read = std::move(future).via(&folly::InlineExecutor::instance()).get();
+    EXPECT_EQ(bytes_read, read_data.size());
+    EXPECT_EQ(read_data, std::vector<uint8_t>({3, 4, 5}));
+}
+
+TEST_F(StreamTest, LocalInputStream_ReadAtAsyncPropagatesError) {
+    const std::vector<uint8_t> data = {1, 2, 3, 4};
+    WriteTestFile(data);
+
+    LocalInputStream in(temp_file_);
+    std::vector<uint8_t> read_data(3);
+
+    auto future = in.ReadAtAsync(read_data.data(), 2, read_data.size());
+    EXPECT_THROW(std::move(future).via(&folly::InlineExecutor::instance()).get(), std::runtime_error);
 }
 
 TEST_F(StreamTest, LocalInputStream_ReadAtConcurrent) {
