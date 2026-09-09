@@ -302,9 +302,10 @@ namespace {
 
 std::optional<double>
 ScalarFieldShardDiskUsage(const std::string& shard) {
-    const auto stats = monitor::collect_cache_shard_usage_stats(StorageType::DISK);
+    const auto stats = monitor::collect_cache_shard_usage_stats();
     for (const auto& stat : stats) {
-        if (stat.cell_data_type == CellDataType::SCALAR_FIELD && stat.shard == shard) {
+        if (stat.cell_data_type == CellDataType::SCALAR_FIELD && stat.shard == shard &&
+            stat.storage_type == StorageType::DISK) {
             return stat.usage_bytes;
         }
     }
@@ -313,9 +314,10 @@ ScalarFieldShardDiskUsage(const std::string& shard) {
 
 std::optional<double>
 ScalarFieldShardMemoryUsage(const std::string& shard) {
-    const auto stats = monitor::collect_cache_shard_usage_stats(StorageType::MEMORY);
+    const auto stats = monitor::collect_cache_shard_usage_stats();
     for (const auto& stat : stats) {
-        if (stat.cell_data_type == CellDataType::SCALAR_FIELD && stat.shard == shard) {
+        if (stat.cell_data_type == CellDataType::SCALAR_FIELD && stat.shard == shard &&
+            stat.storage_type == StorageType::MEMORY) {
             return stat.usage_bytes;
         }
     }
@@ -562,12 +564,14 @@ TEST(CacheSlotShardMemoryUsageTest, HandlesShareMemoryWithoutChangingDiskUsage) 
     EXPECT_EQ(second->Value(), 384);
     EXPECT_EQ(ScalarFieldShardMemoryUsage(kShard), 384);
     EXPECT_EQ(ScalarFieldShardDiskUsage(kShard), 512);
+    const auto stats = monitor::collect_cache_shard_usage_stats();
     for (auto storage_type : {StorageType::DISK, StorageType::MEMORY}) {
-        const auto stats = monitor::collect_cache_shard_usage_stats(storage_type);
-        ASSERT_FALSE(stats.empty());
-        for (const auto& stat : stats) {
-            EXPECT_EQ(stat.storage_type, storage_type);
-        }
+        auto it = std::find_if(stats.begin(), stats.end(), [&](const auto& stat) {
+            return stat.cell_data_type == CellDataType::SCALAR_FIELD && stat.shard == kShard &&
+                   stat.storage_type == storage_type;
+        });
+        ASSERT_NE(it, stats.end());
+        EXPECT_EQ(it->usage_bytes, storage_type == StorageType::DISK ? 512 : 384);
         EXPECT_EQ(monitor::cache_shard_usage_bytes_value(CellDataType::SCALAR_FIELD, kShard, storage_type),
                   storage_type == StorageType::DISK ? 512 : 384);
     }

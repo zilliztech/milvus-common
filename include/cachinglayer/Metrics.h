@@ -246,6 +246,7 @@ DECLARE_PROMETHEUS_GAUGE_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_loadi
 DECLARE_PROMETHEUS_GAUGE_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_cell_loading_count);
 DECLARE_PROMETHEUS_GAUGE_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_cell_loaded_count);
 DECLARE_PROMETHEUS_GAUGE_FAMILY(internal_cache_shard_disk_usage_bytes);
+DECLARE_PROMETHEUS_GAUGE_FAMILY(internal_cache_shard_memory_usage_bytes);
 
 /* Metrics for Cache Cell Access */
 DECLARE_PROMETHEUS_COUNTER_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_access_event_total);
@@ -311,17 +312,42 @@ class CacheShardUsageMetricHandle {
     std::shared_ptr<CacheShardUsageMetricEntry> entry_;
 };
 
-// Returns nullptr for an empty shard. Storage type must be MEMORY or DISK.
+// Returns nullptr for an empty shard or a storage type other than MEMORY or DISK, leaving the slot unattributed.
 std::unique_ptr<CacheShardUsageMetricHandle>
 create_cache_shard_usage_metric_handle(CellDataType type, const std::string& shard, StorageType storage_type);
 
-// Returns live shard usage stats and lazily removes expired series for the selected type.
+// Returns live shard disk and memory usage stats and lazily removes expired metric series.
 std::vector<CacheShardUsageStats>
-collect_cache_shard_usage_stats(StorageType storage_type);
+collect_cache_shard_usage_stats();
 
-// Returns nullopt without creating a series.
+// Returns nullopt for an empty shard, a storage type other than MEMORY or DISK, or an absent series.
 std::optional<double>
 cache_shard_usage_bytes_value(CellDataType type, const std::string& shard, StorageType storage_type);
+
+// Compatibility interfaces for disk-only callers.
+using CacheShardDiskUsageMetricHandle = CacheShardUsageMetricHandle;
+
+struct CacheShardDiskUsageStats {
+    CellDataType cell_data_type;
+    std::string shard;
+    double disk_bytes;
+};
+
+[[deprecated("Use create_cache_shard_usage_metric_handle with StorageType::DISK")]]
+inline std::unique_ptr<CacheShardDiskUsageMetricHandle>
+create_cache_shard_disk_usage_metric_handle(CellDataType type, const std::string& shard) {
+    return create_cache_shard_usage_metric_handle(type, shard, StorageType::DISK);
+}
+
+[[deprecated("Use collect_cache_shard_usage_stats")]]
+std::vector<CacheShardDiskUsageStats>
+collect_cache_shard_disk_usage_stats();
+
+[[deprecated("Use cache_shard_usage_bytes_value with StorageType::DISK")]]
+inline std::optional<double>
+cache_shard_disk_usage_bytes_value(CellDataType type, const std::string& shard) {
+    return cache_shard_usage_bytes_value(type, shard, StorageType::DISK);
+}
 
 DEFINE_METRIC_HELPER_WITH_DATA_TYPE_AND_LOCATION(prometheus::Counter, cache_access_event_total);
 // ignore cache_access_cells_total since we can parse it from the sum of cache_access_hit/miss_bytes_total

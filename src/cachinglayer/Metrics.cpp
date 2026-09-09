@@ -46,7 +46,7 @@ DEFINE_PROMETHEUS_GAUGE_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_cell_l
 DEFINE_PROMETHEUS_GAUGE_FAMILY(internal_cache_shard_disk_usage_bytes,
                                "[cpp]attributed cache-slot loaded disk usage bytes by shard");
 DEFINE_PROMETHEUS_GAUGE_FAMILY(internal_cache_shard_memory_usage_bytes,
-                               "[cpp]attributed cache loaded memory usage bytes by shard");
+                               "[cpp]attributed cache-slot loaded memory usage bytes by shard");
 
 /* Metrics for Cache Cell Access */
 DEFINE_PROMETHEUS_COUNTER_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_access_event_total,
@@ -121,15 +121,15 @@ MakeShardUsageLabels(const ShardUsageMetricKey& key) {
     return {{"data_type", CellDataTypeLabel(key.cell_data_type)}, {"shard", key.shard}};
 }
 
-prometheus::Family<prometheus::Gauge>&
+prometheus::Family<prometheus::Gauge>*
 GetShardUsageMetricFamily(StorageType storage_type) {
     if (storage_type == StorageType::MEMORY) {
-        return internal_cache_shard_memory_usage_bytes_family;
+        return &internal_cache_shard_memory_usage_bytes_family;
     }
     if (storage_type == StorageType::DISK) {
-        return internal_cache_shard_disk_usage_bytes_family;
+        return &internal_cache_shard_disk_usage_bytes_family;
     }
-    ThrowInfo(ErrorCode::UnexpectedError, "Shard usage metrics require MEMORY or DISK storage type");
+    return nullptr;
 }
 
 }  // namespace
@@ -172,11 +172,11 @@ CacheShardUsageMetricHandle::Value() const {
 
 std::unique_ptr<CacheShardUsageMetricHandle>
 create_cache_shard_usage_metric_handle(CellDataType type, const std::string& shard, StorageType storage_type) {
-    if (shard.empty()) {
+    auto* family = GetShardUsageMetricFamily(storage_type);
+    if (shard.empty() || family == nullptr) {
         return nullptr;
     }
     auto key = MakeShardUsageMetricKey(type, shard);
-    auto& family = GetShardUsageMetricFamily(storage_type);
 
     std::lock_guard<std::mutex> lock(shard_usage_mutex);
     auto& metrics = shard_usage_metrics[storage_type];
@@ -185,48 +185,45 @@ create_cache_shard_usage_metric_handle(CellDataType type, const std::string& sha
         if (auto entry = it->second.entry.lock()) {
             return std::unique_ptr<CacheShardUsageMetricHandle>(new CacheShardUsageMetricHandle(entry));
         }
-        family.Remove(it->second.gauge);
+        family->Remove(it->second.gauge);
         metrics.erase(it);
     }
 
-    auto& gauge = family.Add(MakeShardUsageLabels(key));
+    auto& gauge = family->Add(MakeShardUsageLabels(key));
     auto entry = std::make_shared<CacheShardUsageMetricEntry>(CacheShardUsageMetricEntry{key, &gauge});
     metrics.emplace(std::move(key), ShardUsageMetricValue{entry, &gauge});
     return std::unique_ptr<CacheShardUsageMetricHandle>(new CacheShardUsageMetricHandle(std::move(entry)));
 }
 
 std::vector<CacheShardUsageStats>
-collect_cache_shard_usage_stats(StorageType storage_type) {
-    auto& family = GetShardUsageMetricFamily(storage_type);
+collect_cache_shard_usage_stats() {
     std::lock_guard<std::mutex> lock(shard_usage_mutex);
 
     std::vector<CacheShardUsageStats> stats;
-    auto bucket = shard_usage_metrics.find(storage_type);
-    if (bucket == shard_usage_metrics.end()) {
-        return stats;
-    }
-    auto& metrics = bucket->second;
-    for (auto it = metrics.begin(); it != metrics.end();) {
-        auto entry = it->second.entry.lock();
-        if (entry == nullptr) {
-            family.Remove(it->second.gauge);
-            it = metrics.erase(it);
-            continue;
+    for (auto& [storage_type, metrics] : shard_usage_metrics) {
+        auto* family = GetShardUsageMetricFamily(storage_type);
+        for (auto it = metrics.begin(); it != metrics.end();) {
+            auto entry = it->second.entry.lock();
+            if (entry == nullptr) {
+                family->Remove(it->second.gauge);
+                it = metrics.erase(it);
+                continue;
+            }
+            stats.push_back(
+                CacheShardUsageStats{entry->key.cell_data_type, entry->key.shard, storage_type, entry->gauge->Value()});
+            ++it;
         }
-        stats.push_back(
-            CacheShardUsageStats{entry->key.cell_data_type, entry->key.shard, storage_type, entry->gauge->Value()});
-        ++it;
     }
     return stats;
 }
 
 std::optional<double>
 cache_shard_usage_bytes_value(CellDataType type, const std::string& shard, StorageType storage_type) {
-    if (shard.empty()) {
+    auto* family = GetShardUsageMetricFamily(storage_type);
+    if (shard.empty() || family == nullptr) {
         return std::nullopt;
     }
     auto key = MakeShardUsageMetricKey(type, shard);
-    auto& family = GetShardUsageMetricFamily(storage_type);
     std::lock_guard<std::mutex> lock(shard_usage_mutex);
     auto bucket = shard_usage_metrics.find(storage_type);
     if (bucket == shard_usage_metrics.end()) {
@@ -238,11 +235,24 @@ cache_shard_usage_bytes_value(CellDataType type, const std::string& shard, Stora
         return std::nullopt;
     }
     if (it->second.entry.expired()) {
-        family.Remove(it->second.gauge);
+        family->Remove(it->second.gauge);
         metrics.erase(it);
         return std::nullopt;
     }
     return it->second.gauge->Value();
+}
+
+std::vector<CacheShardDiskUsageStats>
+collect_cache_shard_disk_usage_stats() {
+    auto usage_stats = collect_cache_shard_usage_stats();
+    std::vector<CacheShardDiskUsageStats> stats;
+    stats.reserve(usage_stats.size());
+    for (auto& usage : usage_stats) {
+        if (usage.storage_type == StorageType::DISK) {
+            stats.push_back(CacheShardDiskUsageStats{usage.cell_data_type, std::move(usage.shard), usage.usage_bytes});
+        }
+    }
+    return stats;
 }
 
 }  // namespace milvus::cachinglayer::monitor
