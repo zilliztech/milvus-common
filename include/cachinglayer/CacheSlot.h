@@ -72,8 +72,10 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
           loading_overhead_config_(translator_->meta()->loading_overhead_config) {
         if (const auto& metric_attribution = translator_->meta()->metric_attribution;
             metric_attribution && !metric_attribution->shard.empty()) {
-            shard_disk_usage_metric_ =
-                monitor::create_cache_shard_disk_usage_metric_handle(cell_data_type_, metric_attribution->shard);
+            shard_disk_usage_metric_ = monitor::create_cache_shard_usage_metric_handle(
+                cell_data_type_, metric_attribution->shard, StorageType::DISK);
+            shard_memory_usage_metric_ = monitor::create_cache_shard_usage_metric_handle(
+                cell_data_type_, metric_attribution->shard, StorageType::MEMORY);
         }
         cells_.reserve(translator_->num_cells());
         for (cid_t i = 0; i < static_cast<cid_t>(translator_->num_cells()); ++i) {
@@ -714,6 +716,9 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                     if (slot_->shard_disk_usage_metric_ != nullptr && loaded_size_.file_bytes > 0) {
                         slot_->shard_disk_usage_metric_->Increment(loaded_size_.file_bytes);
                     }
+                    if (slot_->shard_memory_usage_metric_ != nullptr && loaded_size_.memory_bytes > 0) {
+                        slot_->shard_memory_usage_metric_->Increment(loaded_size_.memory_bytes);
+                    }
                     monitor::cache_cell_loaded_count(slot_->cell_data_type_, slot_->storage_type_).Increment();
                 },
                 requesting_thread);
@@ -753,6 +758,9 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                 if (slot_->shard_disk_usage_metric_ != nullptr && loaded_size_.file_bytes > 0) {
                     slot_->shard_disk_usage_metric_->Decrement(loaded_size_.file_bytes);
                 }
+                if (slot_->shard_memory_usage_metric_ != nullptr && loaded_size_.memory_bytes > 0) {
+                    slot_->shard_memory_usage_metric_->Decrement(loaded_size_.memory_bytes);
+                }
                 LOG_TRACE("[MCL] CacheSlot Cell unloaded: key={}, size={}", key(), loaded_size_.ToString());
                 loaded_size_ = {0, 0};  // reset loaded_size_ to 0,0 to avoid double refund from dlist_
             }
@@ -772,7 +780,8 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     };
 
     const std::unique_ptr<Translator<CellT>> translator_;
-    std::unique_ptr<monitor::CacheShardDiskUsageMetricHandle> shard_disk_usage_metric_;
+    std::unique_ptr<monitor::CacheShardUsageMetricHandle> shard_disk_usage_metric_;
+    std::unique_ptr<monitor::CacheShardUsageMetricHandle> shard_memory_usage_metric_;
     folly::CancellationSource warmup_cancel_source_;
     // Each CacheCell's cid_t is its index in vector.
     // Using unique_ptr because CacheCell is non-movable (inherits from ListNode).
