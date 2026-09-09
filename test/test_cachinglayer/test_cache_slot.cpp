@@ -302,10 +302,23 @@ namespace {
 
 std::optional<double>
 ScalarFieldShardDiskUsage(const std::string& shard) {
-    const auto stats = monitor::collect_cache_shard_disk_usage_stats();
+    const auto stats = monitor::collect_cache_shard_usage_stats();
     for (const auto& stat : stats) {
-        if (stat.cell_data_type == CellDataType::SCALAR_FIELD && stat.shard == shard) {
-            return stat.disk_bytes;
+        if (stat.cell_data_type == CellDataType::SCALAR_FIELD && stat.shard == shard &&
+            stat.storage_type == StorageType::DISK) {
+            return stat.usage_bytes;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<double>
+ScalarFieldShardMemoryUsage(const std::string& shard) {
+    const auto stats = monitor::collect_cache_shard_usage_stats();
+    for (const auto& stat : stats) {
+        if (stat.cell_data_type == CellDataType::SCALAR_FIELD && stat.shard == shard &&
+            stat.storage_type == StorageType::MEMORY) {
+            return stat.usage_bytes;
         }
     }
     return std::nullopt;
@@ -466,6 +479,36 @@ TEST(CacheSlotShardDiskUsageTest, RecordsLoadedDiskBytesByShard) {
     EXPECT_EQ(ScalarFieldShardDiskUsage(kShard), before);
 }
 
+TEST(CacheSlotShardMemoryUsageTest, RecordsLoadedMemoryBytesByShard) {
+    constexpr auto kShard = "cache-slot-shard-memory-usage-test";
+    auto limit = ResourceUsage{1024, 0};
+    auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
+    auto translator = std::make_unique<MockTranslator>(std::vector<std::pair<cid_t, int64_t>>{{0, 128}, {1, 256}},
+                                                       std::unordered_map<cl_uid_t, cid_t>{{0, 0}, {1, 1}}, kShard,
+                                                       StorageType::MEMORY);
+    translator->meta()->cell_data_type = CellDataType::SCALAR_FIELD;
+    translator->meta()->metric_attribution = MetricAttribution{.shard = kShard};
+    auto cache_slot =
+        std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                              std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
+    {
+        milvus::OpContext op_ctx;
+        auto accessor = cache_slot->PinCellsDirect(&op_ctx, {0, 1});
+        ASSERT_NE(accessor, nullptr);
+        EXPECT_EQ(ScalarFieldShardMemoryUsage(kShard), 384);
+    }
+    ASSERT_TRUE(cache_slot->ManualEvictAll());
+    EXPECT_EQ(ScalarFieldShardMemoryUsage(kShard), 0);
+    {
+        milvus::OpContext op_ctx;
+        auto accessor = cache_slot->PinCellsDirect(&op_ctx, {0});
+        ASSERT_NE(accessor, nullptr);
+        EXPECT_EQ(ScalarFieldShardMemoryUsage(kShard), 128);
+    }
+    cache_slot.reset();
+    EXPECT_EQ(ScalarFieldShardMemoryUsage(kShard), std::nullopt);
+}
+
 TEST(CacheSlotShardDiskUsageTest, RemovingOneOfTwoSlotsKeepsSharedShardUsage) {
     constexpr auto kShard = "cache-slot-shard-disk-usage-shared-test";
     EXPECT_EQ(ScalarFieldShardDiskUsage(kShard), std::nullopt);
@@ -501,6 +544,59 @@ TEST(CacheSlotShardDiskUsageTest, RemovingOneOfTwoSlotsKeepsSharedShardUsage) {
     EXPECT_EQ(ScalarFieldShardDiskUsage(kShard), std::nullopt);
 }
 
+TEST(CacheSlotShardMemoryUsageTest, HandlesShareMemoryWithoutChangingDiskUsage) {
+    constexpr auto kShard = "cache-slot-shard-memory-usage-shared-test";
+    EXPECT_EQ(monitor::create_cache_shard_usage_metric_handle(CellDataType::SCALAR_FIELD, "", StorageType::MEMORY),
+              nullptr);
+    auto first =
+        monitor::create_cache_shard_usage_metric_handle(CellDataType::SCALAR_FIELD, kShard, StorageType::MEMORY);
+    EXPECT_EQ(ScalarFieldShardDiskUsage(kShard), std::nullopt);
+    auto second =
+        monitor::create_cache_shard_usage_metric_handle(CellDataType::SCALAR_FIELD, kShard, StorageType::MEMORY);
+    auto disk = monitor::create_cache_shard_usage_metric_handle(CellDataType::SCALAR_FIELD, kShard, StorageType::DISK);
+    disk->Increment(512);
+    EXPECT_EQ(
+        monitor::create_cache_shard_usage_metric_handle(CellDataType::SCALAR_FIELD, kShard, StorageType::DISK)->Value(),
+        512);
+    first->Increment(128);
+    second->Increment(256);
+    EXPECT_EQ(first->Value(), 384);
+    EXPECT_EQ(second->Value(), 384);
+    EXPECT_EQ(ScalarFieldShardMemoryUsage(kShard), 384);
+    EXPECT_EQ(ScalarFieldShardDiskUsage(kShard), 512);
+    const auto stats = monitor::collect_cache_shard_usage_stats();
+    for (auto storage_type : {StorageType::DISK, StorageType::MEMORY}) {
+        auto it = std::find_if(stats.begin(), stats.end(), [&](const auto& stat) {
+            return stat.cell_data_type == CellDataType::SCALAR_FIELD && stat.shard == kShard &&
+                   stat.storage_type == storage_type;
+        });
+        ASSERT_NE(it, stats.end());
+        EXPECT_EQ(it->usage_bytes, storage_type == StorageType::DISK ? 512 : 384);
+        EXPECT_EQ(monitor::cache_shard_usage_bytes_value(CellDataType::SCALAR_FIELD, kShard, storage_type),
+                  storage_type == StorageType::DISK ? 512 : 384);
+    }
+
+    first->Decrement(128);
+    first.reset();
+    EXPECT_EQ(ScalarFieldShardMemoryUsage(kShard), 256);
+    second.reset();
+    EXPECT_EQ(ScalarFieldShardMemoryUsage(kShard), std::nullopt);
+    EXPECT_EQ(ScalarFieldShardDiskUsage(kShard), 512);
+
+    first = monitor::create_cache_shard_usage_metric_handle(CellDataType::SCALAR_FIELD, kShard, StorageType::MEMORY);
+    first->Increment(64);
+    first.reset();
+    first = monitor::create_cache_shard_usage_metric_handle(CellDataType::SCALAR_FIELD, kShard, StorageType::MEMORY);
+    EXPECT_EQ(first->Value(), 0);
+    first->Increment(64);
+    disk->Decrement(512);
+    disk.reset();
+    EXPECT_EQ(ScalarFieldShardDiskUsage(kShard), std::nullopt);
+    EXPECT_EQ(ScalarFieldShardMemoryUsage(kShard), 64);
+    first.reset();
+    EXPECT_EQ(ScalarFieldShardMemoryUsage(kShard), std::nullopt);
+}
+
 TEST(CacheSlotShardDiskUsageTest, DestroyingLoadedSlotRefundsAndRemovesShardUsage) {
     constexpr auto kShard = "cache-slot-shard-disk-usage-destroy-test";
     EXPECT_EQ(ScalarFieldShardDiskUsage(kShard), std::nullopt);
@@ -528,8 +624,8 @@ TEST(CacheSlotShardDiskUsageTest, DestroyingLoadedSlotRefundsAndRemovesShardUsag
 TEST(CacheSlotShardDiskUsageTest, RejectsUnknownCellDataType) {
     EXPECT_THROW(
         {
-            static_cast<void>(monitor::create_cache_shard_disk_usage_metric_handle(
-                static_cast<CellDataType>(-1), "cache-slot-shard-disk-usage-unknown-type-test"));
+            static_cast<void>(monitor::create_cache_shard_usage_metric_handle(
+                static_cast<CellDataType>(-1), "cache-slot-shard-disk-usage-unknown-type-test", StorageType::DISK));
         },
         milvus::SegcoreError);
 }
