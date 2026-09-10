@@ -16,6 +16,7 @@ set(CACHINGLAYER_TEST_FILES
     ../init_gtest.cpp
     test_dlist.cpp
     test_cache_slot.cpp
+    test_cache_shard_metrics.cpp
     test_tiered_storage_config.cpp
     test_loading_overhead_policy.cpp
     test_loading_overhead_group.cpp
@@ -38,5 +39,9 @@ if(NOT APPLE)
 endif()
 
 add_test(NAME cachinglayer_test COMMAND cachinglayer_test)
+add_test(NAME cachinglayer_aggregate_metrics_test COMMAND cachinglayer_test
+    --gtest_filter=CacheShardDiskUsageMetricTest.*:CacheSlotShardDiskUsageTest.*)
+set_tests_properties(cachinglayer_aggregate_metrics_test PROPERTIES
+    ENVIRONMENT "MCL_TEST_AGGREGATE_SHARD_METRICS=1")
 
 install(TARGETS cachinglayer_test DESTINATION unittest)

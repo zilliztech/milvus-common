@@ -279,8 +279,9 @@ struct CacheShardDiskUsageStats {
 
 class CacheShardDiskUsageMetricEntry;
 
-// RAII handle for one {data_type, shard} cache-slot disk usage series.
-// The collector removes the dynamic Prometheus time series after the last handle is gone.
+// RAII handle for one {data_type, shard} business statistic. Aggregate mode
+// shares a process-lifetime Prometheus Gauge across all shards of a data type.
+// Full mode lazily removes the series after the last handle is gone.
 class CacheShardDiskUsageMetricHandle {
  public:
     ~CacheShardDiskUsageMetricHandle();
@@ -310,11 +311,21 @@ class CacheShardDiskUsageMetricHandle {
     std::shared_ptr<CacheShardDiskUsageMetricEntry> entry_;
 };
 
+// Configure once, before creating the first attributed cache slot. Repeating
+// the same mode succeeds; changing a configured or already-used mode fails.
+// Native callers that do not configure a mode retain full metrics.
+bool
+set_cache_shard_disk_usage_metrics_mode(bool aggregate);
+
+bool
+cache_shard_disk_usage_metrics_aggregate();
+
 // Returns nullptr for an empty shard, leaving the slot unattributed.
 std::unique_ptr<CacheShardDiskUsageMetricHandle>
 create_cache_shard_disk_usage_metric_handle(CellDataType type, const std::string& shard);
 
-// Returns live shard disk usage stats and lazily removes expired metric series.
+// Returns real shard disk usage in either mode. In full mode, also lazily
+// removes expired metric series. Aggregate scrapes must not call this function.
 std::vector<CacheShardDiskUsageStats>
 collect_cache_shard_disk_usage_stats();
 
