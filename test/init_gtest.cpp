@@ -11,8 +11,16 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdlib>
+
+#include "cachinglayer/Metrics.h"
+
 int
 main(int argc, char** argv) {
+    if (std::getenv("MCL_TEST_AGGREGATE_SHARD_METRICS") != nullptr &&
+        !milvus::cachinglayer::monitor::set_cache_shard_disk_usage_metrics_mode(true)) {
+        return EXIT_FAILURE;
+    }
     testing::InitGoogleTest(&argc, argv);
 
     return RUN_ALL_TESTS();

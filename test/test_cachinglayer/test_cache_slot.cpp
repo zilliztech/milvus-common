@@ -311,6 +311,28 @@ ScalarFieldShardDiskUsage(const std::string& shard) {
     return std::nullopt;
 }
 
+std::optional<double>
+ExportedScalarFieldShardDiskUsage(const std::string& shard) {
+    const auto expected_shard = monitor::cache_shard_disk_usage_metrics_aggregate() ? "all" : shard;
+    for (const auto& family : milvus::monitor::getPrometheusClient().GetRegistry().Collect()) {
+        if (family.name != "internal_cache_shard_disk_usage_bytes") {
+            continue;
+        }
+        for (const auto& metric : family.metric) {
+            bool matches_type = false;
+            bool matches_shard = false;
+            for (const auto& label : metric.label) {
+                matches_type |= label.name == "data_type" && label.value == "scalar_field";
+                matches_shard |= label.name == "shard" && label.value == expected_shard;
+            }
+            if (matches_type && matches_shard) {
+                return metric.gauge.value;
+            }
+        }
+    }
+    return std::nullopt;
+}
+
 }  // namespace
 
 class CacheSlotTest : public ::testing::Test {
@@ -523,6 +545,46 @@ TEST(CacheSlotShardDiskUsageTest, DestroyingLoadedSlotRefundsAndRemovesShardUsag
 
     cache_slot.reset();
     EXPECT_EQ(ScalarFieldShardDiskUsage(kShard), std::nullopt);
+}
+
+TEST(CacheSlotShardDiskUsageTest, ReleasingOneShardPreservesOtherShardsGauge) {
+    constexpr auto kFirst = "cache-slot-first-shard";
+    constexpr auto kSecond = "cache-slot-second-shard";
+    const auto limit = ResourceUsage{0, 1024};
+    auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
+    auto make_slot = [&](const std::string& shard, int64_t bytes) {
+        return std::make_shared<CacheSlot<TestCell>>(
+            std::make_unique<DiskShardTranslator>(shard, shard, std::vector<ResourceUsage>{{0, bytes}}), dlist.get(),
+            true, true, true, std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
+    };
+    auto first = make_slot(kFirst, 128);
+    auto second = make_slot(kSecond, 256);
+    {
+        milvus::OpContext op_ctx;
+        auto first_access = first->PinCellsDirect(&op_ctx, {0});
+        auto second_access = second->PinCellsDirect(&op_ctx, {0});
+        ASSERT_NE(first_access->get_ith_cell(0), nullptr);
+        ASSERT_NE(second_access->get_ith_cell(0), nullptr);
+    }
+    EXPECT_EQ(ScalarFieldShardDiskUsage(kFirst), 128);
+    EXPECT_EQ(ScalarFieldShardDiskUsage(kSecond), 256);
+    EXPECT_EQ(ExportedScalarFieldShardDiskUsage(kSecond),
+              monitor::cache_shard_disk_usage_metrics_aggregate() ? 384 : 256);
+
+    // Real CacheCell destruction refunds only this shard, without any scrape.
+    first.reset();
+    EXPECT_EQ(ExportedScalarFieldShardDiskUsage(kSecond), 256);
+    EXPECT_EQ(ScalarFieldShardDiskUsage(kFirst), std::nullopt);
+    EXPECT_EQ(ScalarFieldShardDiskUsage(kSecond), 256);
+    second.reset();
+    if (monitor::cache_shard_disk_usage_metrics_aggregate()) {
+        // Check presence as well as zero: a missing time series is not zero.
+        EXPECT_EQ(ExportedScalarFieldShardDiskUsage(kSecond), 0);
+    }
+    EXPECT_EQ(ScalarFieldShardDiskUsage(kSecond), std::nullopt);
+    if (!monitor::cache_shard_disk_usage_metrics_aggregate()) {
+        EXPECT_EQ(ExportedScalarFieldShardDiskUsage(kSecond), std::nullopt);
+    }
 }
 
 TEST(CacheSlotShardDiskUsageTest, RejectsUnknownCellDataType) {
