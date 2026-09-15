@@ -14,7 +14,6 @@
 #include <memory>
 #include <optional>
 #include <string>
-#include <utility>
 
 #include "filemanager/InputStream.h"
 #include "filemanager/OutputStream.h"
@@ -101,19 +100,17 @@ class FileManager {
     /**
      * @brief Open a fully initialized input stream without blocking the calling worker on IO.
      *
-     * The default immediately submits OpenInputStream to the supplied non-null,
-     * non-inline blocking-IO executor, copying filename. Native async managers
-     * should override it. Choose an executor separate from orchestration workers.
-     * The result and exceptions follow OpenInputStream; Size() is available
-     * when the future succeeds. The manager must outlive completion, even if
-     * the caller discards or interrupts the future; neither cancels the IO.
+     * The default returns a completed future holding SegcoreError(Unsupported),
+     * without calling OpenInputStream or accessing storage. Managers supporting
+     * async IO must override it. On success, the stream is ready for use and Size()
+     * performs no IO; failures travel in the future. Implementations must copy
+     * filename if needed after this call. The manager must outlive completion,
+     * even if the caller discards or interrupts the future; neither cancels the IO.
      */
     [[nodiscard]] virtual folly::SemiFuture<std::shared_ptr<InputStream>>
-    OpenInputStreamAsync(const std::string& filename, folly::Executor::KeepAlive<> io_executor) {
-        return folly::makeSemiFuture()
-            .via(std::move(io_executor))
-            .thenValue([this, filename](folly::Unit) { return OpenInputStream(filename); })
-            .semi();
+    OpenInputStreamAsync(const std::string& /*filename*/) {
+        return folly::makeSemiFuture<std::shared_ptr<InputStream>>(
+            SegcoreError(ErrorCode::Unsupported, "FileManager::OpenInputStreamAsync is not supported"));
     }
 };
 

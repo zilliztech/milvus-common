@@ -1,17 +1,13 @@
-#include <folly/ScopeGuard.h>
-#include <folly/coro/Task.h>
-#include <folly/executors/CPUThreadPoolExecutor.h>
-#include <folly/synchronization/Baton.h>
 #include <gtest/gtest.h>
 
 #include <algorithm>
-#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <random>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "filemanager/impl/LocalFileManager.h"
@@ -215,100 +211,65 @@ TEST_F(StreamTest, LocalInputStream_ReadAt) {
     EXPECT_TRUE(std::equal(read_data.begin(), read_data.end(), data.begin() + 50));
 }
 
-TEST_F(StreamTest, ReadAtAsyncReleasesAwaitingWorker) {
-    class BlockingStream : public LocalInputStream {
+TEST_F(StreamTest, DefaultReadAtAsyncIsUnsupported) {
+    class ObservedStream : public LocalInputStream {
      public:
         using LocalInputStream::LocalInputStream;
-        folly::Baton<> entered;
-        folly::Baton<> release;
+        size_t read_calls = 0;
 
         size_t
         ReadAt(void* ptr, size_t offset, size_t size) override {
-            entered.post();
-            release.wait();
+            ++read_calls;
             return LocalInputStream::ReadAt(ptr, offset, size);
         }
     };
-    const std::vector<uint8_t> data = {1, 2, 3, 4, 5};
+    const std::vector<uint8_t> data = {1, 2, 3, 4};
     WriteTestFile(data);
-    BlockingStream stream(temp_file_);
+    ObservedStream stream(temp_file_);
     InputStream& input = stream;
-    std::vector<uint8_t> buffer(3);
-    folly::Baton<> heartbeat;
-    folly::CPUThreadPoolExecutor io_worker(1);
-    folly::CPUThreadPoolExecutor worker(1);
-    const auto unblock = folly::makeGuard([&] { stream.release.post(); });
-    auto read = [&]() -> folly::coro::Task<size_t> {
-        co_return co_await input.ReadAtAsync(buffer.data(), 1, buffer.size(), &io_worker);
-    };
-    auto pending = folly::coro::co_withExecutor(&worker, read()).start();
-    const bool entered = stream.entered.try_wait_for(std::chrono::seconds(5));
-    worker.add([&] { heartbeat.post(); });
-    const bool worker_available = heartbeat.try_wait_for(std::chrono::seconds(5));
-    const bool still_reading = !pending.isReady();
-    stream.release.post();
-    EXPECT_EQ(std::move(pending).get(), buffer.size());
-    EXPECT_TRUE(entered);
-    EXPECT_TRUE(worker_available);
-    EXPECT_TRUE(still_reading);
-    EXPECT_EQ(buffer, std::vector<uint8_t>({2, 3, 4}));
-    worker.join();
+    std::vector<uint8_t> buffer(2, 0);
+    auto read = input.ReadAtAsync(buffer.data(), 1, buffer.size());
+    ASSERT_TRUE(read.isReady());
+    const auto result = std::move(read).getTry();
+    ASSERT_TRUE(result.hasException());
+    const auto* error = result.exception().get_exception<SegcoreError>();
+    ASSERT_NE(error, nullptr);
+    EXPECT_EQ(error->get_error_code(), ErrorCode::Unsupported);
+    EXPECT_EQ(stream.read_calls, 0);
+    EXPECT_EQ(buffer, std::vector<uint8_t>({0, 0}));
+
+    EXPECT_EQ(input.ReadAt(buffer.data(), 1, buffer.size()), buffer.size());
+    EXPECT_EQ(stream.read_calls, 1);
+    EXPECT_EQ(buffer, std::vector<uint8_t>({2, 3}));
 }
 
-TEST_F(StreamTest, OpenInputStreamAsyncReleasesAwaitingWorker) {
-    class BlockingManager : public LocalFileManager {
+TEST_F(StreamTest, DefaultOpenInputStreamAsyncIsUnsupported) {
+    class ObservedManager : public LocalFileManager {
      public:
-        folly::Baton<> entered;
-        folly::Baton<> release;
+        size_t open_calls = 0;
 
         std::shared_ptr<InputStream>
         OpenInputStream(const std::string& filename) override {
-            entered.post();
-            release.wait();
+            ++open_calls;
             return LocalFileManager::OpenInputStream(filename);
         }
     };
     const std::vector<uint8_t> data = {1, 2, 3};
     WriteTestFile(data);
-    BlockingManager manager;
+    ObservedManager manager;
     FileManager& file_manager = manager;
-    folly::Baton<> heartbeat;
-    folly::CPUThreadPoolExecutor io_worker(1);
-    folly::CPUThreadPoolExecutor worker(1);
-    const auto unblock = folly::makeGuard([&] { manager.release.post(); });
-    auto open = [&]() -> folly::coro::Task<std::shared_ptr<InputStream>> {
-        // The filename temporary dies before the IO operation is released.
-        auto pending = file_manager.OpenInputStreamAsync(std::string(temp_file_), &io_worker);
-        co_return co_await std::move(pending);
-    };
-    auto pending = folly::coro::co_withExecutor(&worker, open()).start();
-    const bool entered = manager.entered.try_wait_for(std::chrono::seconds(5));
-    worker.add([&] { heartbeat.post(); });
-    const bool worker_available = heartbeat.try_wait_for(std::chrono::seconds(5));
-    const bool still_opening = !pending.isReady();
-    manager.release.post();
-    auto input = std::move(pending).get();
-    EXPECT_TRUE(entered);
-    EXPECT_TRUE(worker_available);
-    EXPECT_TRUE(still_opening);
-    EXPECT_EQ(input->Size(), data.size());
-    std::vector<uint8_t> buffer(data.size());
-    EXPECT_EQ(input->ReadAtAsync(buffer.data(), 0, buffer.size(), &io_worker).get(), buffer.size());
-    EXPECT_EQ(buffer, data);
-    worker.join();
-}
+    auto open = file_manager.OpenInputStreamAsync(temp_file_);
+    ASSERT_TRUE(open.isReady());
+    const auto result = std::move(open).getTry();
+    ASSERT_TRUE(result.hasException());
+    const auto* error = result.exception().get_exception<SegcoreError>();
+    ASSERT_NE(error, nullptr);
+    EXPECT_EQ(error->get_error_code(), ErrorCode::Unsupported);
+    EXPECT_EQ(manager.open_calls, 0);
 
-TEST_F(StreamTest, AsyncStreamErrorsReachFuture) {
-    const std::vector<uint8_t> data = {1, 2, 3};
-    WriteTestFile(data);
-    LocalFileManager manager;
-    folly::CPUThreadPoolExecutor io_worker(1);
-    auto input = manager.OpenInputStreamAsync(temp_file_, &io_worker).get();
-    std::vector<uint8_t> buffer(2);
-    auto read = input->ReadAtAsync(buffer.data(), 2, buffer.size(), &io_worker);
-    EXPECT_THROW(std::move(read).get(), std::runtime_error);
-    auto open = manager.OpenInputStreamAsync(temp_file_ + ".missing", &io_worker);
-    EXPECT_THROW(std::move(open).get(), std::runtime_error);
+    auto input = file_manager.OpenInputStream(temp_file_);
+    EXPECT_EQ(manager.open_calls, 1);
+    EXPECT_EQ(input->Size(), data.size());
 }
 
 TEST_F(StreamTest, MemoryInputStreamReadAtAsyncIsReady) {
@@ -316,28 +277,34 @@ TEST_F(StreamTest, MemoryInputStreamReadAtAsyncIsReady) {
     MemoryInputStream stream(data.data(), data.size());
     InputStream& input = stream;
     std::vector<uint8_t> buffer(2);
-    auto read = input.ReadAtAsync(buffer.data(), 1, buffer.size(), {});
+    auto read = input.ReadAtAsync(buffer.data(), 1, buffer.size());
     EXPECT_TRUE(read.isReady());
     EXPECT_EQ(std::move(read).get(), buffer.size());
     EXPECT_EQ(buffer, std::vector<uint8_t>({2, 3}));
-    EXPECT_EQ(input.ReadAtAsync(buffer.data(), data.size(), 0, {}).get(), 0);
+    EXPECT_EQ(input.ReadAtAsync(buffer.data(), data.size(), 0).get(), 0);
 }
 
-TEST_F(StreamTest, ReadAtAsyncConcurrentRanges) {
-    const auto data = GenerateTestData(1000);
-    WriteTestFile(data);
-    LocalInputStream input(temp_file_);
-    folly::CPUThreadPoolExecutor io_worker(2);
-    std::vector<std::vector<uint8_t>> buffers(10, std::vector<uint8_t>(100));
-    std::vector<folly::SemiFuture<size_t>> reads;
-    reads.reserve(buffers.size());
-    for (size_t i = 0; i < buffers.size(); ++i) {
-        reads.push_back(input.ReadAtAsync(buffers[i].data(), i * 100, buffers[i].size(), &io_worker));
-    }
-    for (size_t i = 0; i < reads.size(); ++i) {
-        EXPECT_EQ(std::move(reads[i]).get(), buffers[i].size());
-        EXPECT_TRUE(std::equal(buffers[i].begin(), buffers[i].end(), data.begin() + i * 100));
-    }
+TEST_F(StreamTest, OpenInputStreamAsyncOverrideCompletesThroughFuture) {
+    class AsyncManager : public LocalFileManager {
+     public:
+        folly::Promise<std::shared_ptr<InputStream>> completion;
+
+        folly::SemiFuture<std::shared_ptr<InputStream>>
+        OpenInputStreamAsync(const std::string& /*filename*/) override {
+            return completion.getSemiFuture();
+        }
+    };
+    const std::vector<uint8_t> data = {1, 2, 3};
+    AsyncManager manager;
+    FileManager& file_manager = manager;
+    auto open = file_manager.OpenInputStreamAsync("memory");
+    EXPECT_FALSE(open.isReady());
+    manager.completion.setValue(std::make_shared<MemoryInputStream>(data.data(), data.size()));
+    auto input = std::move(open).get();
+    EXPECT_EQ(input->Size(), data.size());
+    std::vector<uint8_t> buffer(data.size());
+    EXPECT_EQ(input->ReadAtAsync(buffer.data(), 0, buffer.size()).get(), buffer.size());
+    EXPECT_EQ(buffer, data);
 }
 
 TEST_F(StreamTest, LocalInputStream_ReadAtConcurrent) {

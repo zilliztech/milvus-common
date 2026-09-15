@@ -85,7 +85,7 @@ class MemoryInputStream : public InputStream {
 
     // Memory reads need no IO executor; return the completed result or exception.
     [[nodiscard]] folly::SemiFuture<size_t>
-    ReadAtAsync(void* buffer, size_t offset, size_t size, folly::Executor::KeepAlive<> /*io_executor*/) override {
+    ReadAtAsync(void* buffer, size_t offset, size_t size) override {
         return folly::makeSemiFutureWith([this, buffer, offset, size] { return ReadAt(buffer, offset, size); });
     }
 
