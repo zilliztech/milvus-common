@@ -83,6 +83,12 @@ class MemoryInputStream : public InputStream {
         return static_cast<size_t>(ret);
     }
 
+    // Memory reads need no IO executor; return the completed result or exception.
+    [[nodiscard]] folly::SemiFuture<size_t>
+    ReadAtAsync(void* buffer, size_t offset, size_t size, folly::Executor::KeepAlive<> /*io_executor*/) override {
+        return folly::makeSemiFutureWith([this, buffer, offset, size] { return ReadAt(buffer, offset, size); });
+    }
+
     [[nodiscard]] boost::span<const uint8_t>
     GetData() const {
         return {data_, size_};

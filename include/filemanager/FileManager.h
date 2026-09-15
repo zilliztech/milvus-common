@@ -14,6 +14,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 
 #include "filemanager/InputStream.h"
 #include "filemanager/OutputStream.h"
@@ -96,6 +97,24 @@ class FileManager {
      */
     virtual std::shared_ptr<OutputStream>
     OpenOutputStream(const std::string& filename) = 0;
+
+    /**
+     * @brief Open a fully initialized input stream without blocking the calling worker on IO.
+     *
+     * The default immediately submits OpenInputStream to the supplied non-null,
+     * non-inline blocking-IO executor, copying filename. Native async managers
+     * should override it. Choose an executor separate from orchestration workers.
+     * The result and exceptions follow OpenInputStream; Size() is available
+     * when the future succeeds. The manager must outlive completion, even if
+     * the caller discards or interrupts the future; neither cancels the IO.
+     */
+    [[nodiscard]] virtual folly::SemiFuture<std::shared_ptr<InputStream>>
+    OpenInputStreamAsync(const std::string& filename, folly::Executor::KeepAlive<> io_executor) {
+        return folly::makeSemiFuture()
+            .via(std::move(io_executor))
+            .thenValue([this, filename](folly::Unit) { return OpenInputStream(filename); })
+            .semi();
+    }
 };
 
 }  // namespace milvus
