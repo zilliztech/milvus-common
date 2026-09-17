@@ -1,5 +1,6 @@
 #include "cachinglayer/Metrics.h"
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -90,6 +91,10 @@ struct ShardDiskUsageMetricValue {
 
 std::mutex shard_disk_usage_mutex;
 std::map<ShardDiskUsageMetricKey, ShardDiskUsageMetricValue> shard_disk_usage_metrics;
+std::map<CellDataType, prometheus::Gauge*> aggregate_shard_disk_usage_gauges;
+std::atomic<bool> aggregate_shard_disk_usage{false};
+// Protected by shard_disk_usage_mutex; the first handle also freezes the mode.
+bool shard_disk_usage_mode_initialized = false;
 
 const char*
 CellDataTypeLabel(CellDataType type) {
@@ -122,39 +127,74 @@ MakeShardDiskUsageLabels(const ShardDiskUsageMetricKey& key) {
 }  // namespace
 
 struct CacheShardDiskUsageMetricEntry {
+    CacheShardDiskUsageMetricEntry(ShardDiskUsageMetricKey key, prometheus::Gauge* gauge, bool aggregate)
+        : key(std::move(key)), gauge(gauge), aggregate(aggregate) {
+    }
+
     ShardDiskUsageMetricKey key;
     prometheus::Gauge* gauge{nullptr};
+    const bool aggregate;
+    std::atomic<double> bytes{0};
+    // Aggregate business ownership must not include temporary snapshot refs.
+    // Protected by shard_disk_usage_mutex.
+    size_t handles{0};
 };
 
 CacheShardDiskUsageMetricHandle::CacheShardDiskUsageMetricHandle(std::shared_ptr<CacheShardDiskUsageMetricEntry> entry)
     : entry_(std::move(entry)) {
+    if (entry_->aggregate) {
+        ++entry_->handles;
+    }
 }
 
-CacheShardDiskUsageMetricHandle::~CacheShardDiskUsageMetricHandle() = default;
+CacheShardDiskUsageMetricHandle::~CacheShardDiskUsageMetricHandle() {
+    if (!entry_->aggregate) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(shard_disk_usage_mutex);
+    if (--entry_->handles != 0) {
+        return;
+    }
+    // CacheCell normally refunds all bytes before its handle is destroyed.
+    // Retire any remaining contribution without resetting the shared Gauge.
+    entry_->gauge->Decrement(entry_->bytes.exchange(0, std::memory_order_relaxed));
+    const auto it = shard_disk_usage_metrics.find(entry_->key);
+    if (it != shard_disk_usage_metrics.end() && it->second.entry.lock() == entry_) {
+        shard_disk_usage_metrics.erase(it);
+    }
+}
 
 void
 CacheShardDiskUsageMetricHandle::Increment(double value) {
-    std::lock_guard<std::mutex> lock(shard_disk_usage_mutex);
-    if (entry_->gauge != nullptr) {
-        entry_->gauge->Increment(value);
-    }
+    entry_->bytes.fetch_add(value, std::memory_order_relaxed);
+    entry_->gauge->Increment(value);
 }
 
 void
 CacheShardDiskUsageMetricHandle::Decrement(double value) {
-    std::lock_guard<std::mutex> lock(shard_disk_usage_mutex);
-    if (entry_->gauge != nullptr) {
-        entry_->gauge->Decrement(value);
-    }
+    entry_->bytes.fetch_sub(value, std::memory_order_relaxed);
+    entry_->gauge->Decrement(value);
 }
 
 double
 CacheShardDiskUsageMetricHandle::Value() const {
+    return entry_->bytes.load(std::memory_order_relaxed);
+}
+
+bool
+set_cache_shard_disk_usage_metrics_mode(bool aggregate) {
     std::lock_guard<std::mutex> lock(shard_disk_usage_mutex);
-    if (entry_->gauge == nullptr) {
-        return 0;
+    if (shard_disk_usage_mode_initialized && aggregate_shard_disk_usage.load() != aggregate) {
+        return false;
     }
-    return entry_->gauge->Value();
+    aggregate_shard_disk_usage.store(aggregate);
+    shard_disk_usage_mode_initialized = true;
+    return true;
+}
+
+bool
+cache_shard_disk_usage_metrics_aggregate() {
+    return aggregate_shard_disk_usage.load();
 }
 
 std::unique_ptr<CacheShardDiskUsageMetricHandle>
@@ -165,18 +205,32 @@ create_cache_shard_disk_usage_metric_handle(CellDataType type, const std::string
     auto key = MakeShardDiskUsageMetricKey(type, shard);
 
     std::lock_guard<std::mutex> lock(shard_disk_usage_mutex);
+    shard_disk_usage_mode_initialized = true;
+    const bool aggregate = aggregate_shard_disk_usage.load();
     auto it = shard_disk_usage_metrics.find(key);
     if (it != shard_disk_usage_metrics.end()) {
         if (auto entry = it->second.entry.lock()) {
             return std::unique_ptr<CacheShardDiskUsageMetricHandle>(new CacheShardDiskUsageMetricHandle(entry));
         }
-        internal_cache_shard_disk_usage_bytes_family.Remove(it->second.gauge);
+        if (!aggregate) {
+            internal_cache_shard_disk_usage_bytes_family.Remove(it->second.gauge);
+        }
         shard_disk_usage_metrics.erase(it);
     }
 
-    auto& gauge = internal_cache_shard_disk_usage_bytes_family.Add(MakeShardDiskUsageLabels(key));
-    auto entry = std::make_shared<CacheShardDiskUsageMetricEntry>(CacheShardDiskUsageMetricEntry{key, &gauge});
-    shard_disk_usage_metrics.emplace(std::move(key), ShardDiskUsageMetricValue{entry, &gauge});
+    prometheus::Gauge* gauge;
+    if (aggregate) {
+        auto& shared_gauge = aggregate_shard_disk_usage_gauges[type];
+        if (shared_gauge == nullptr) {
+            shared_gauge = &internal_cache_shard_disk_usage_bytes_family.Add(
+                {{"data_type", CellDataTypeLabel(type)}, {"shard", "all"}});
+        }
+        gauge = shared_gauge;
+    } else {
+        gauge = &internal_cache_shard_disk_usage_bytes_family.Add(MakeShardDiskUsageLabels(key));
+    }
+    auto entry = std::make_shared<CacheShardDiskUsageMetricEntry>(key, gauge, aggregate);
+    shard_disk_usage_metrics.emplace(std::move(key), ShardDiskUsageMetricValue{entry, gauge});
     return std::unique_ptr<CacheShardDiskUsageMetricHandle>(new CacheShardDiskUsageMetricHandle(std::move(entry)));
 }
 
@@ -185,14 +239,18 @@ collect_cache_shard_disk_usage_stats() {
     std::lock_guard<std::mutex> lock(shard_disk_usage_mutex);
 
     std::vector<CacheShardDiskUsageStats> stats;
+    stats.reserve(shard_disk_usage_metrics.size());
     for (auto it = shard_disk_usage_metrics.begin(); it != shard_disk_usage_metrics.end();) {
         auto entry = it->second.entry.lock();
         if (entry == nullptr) {
-            internal_cache_shard_disk_usage_bytes_family.Remove(it->second.gauge);
+            if (!aggregate_shard_disk_usage.load()) {
+                internal_cache_shard_disk_usage_bytes_family.Remove(it->second.gauge);
+            }
             it = shard_disk_usage_metrics.erase(it);
             continue;
         }
-        stats.push_back(CacheShardDiskUsageStats{entry->key.cell_data_type, entry->key.shard, entry->gauge->Value()});
+        stats.push_back(CacheShardDiskUsageStats{entry->key.cell_data_type, entry->key.shard,
+                                                 entry->bytes.load(std::memory_order_relaxed)});
         ++it;
     }
     return stats;
@@ -209,12 +267,15 @@ cache_shard_disk_usage_bytes_value(CellDataType type, const std::string& shard) 
     if (it == shard_disk_usage_metrics.end()) {
         return std::nullopt;
     }
-    if (it->second.entry.expired()) {
-        internal_cache_shard_disk_usage_bytes_family.Remove(it->second.gauge);
+    auto entry = it->second.entry.lock();
+    if (entry == nullptr) {
+        if (!aggregate_shard_disk_usage.load()) {
+            internal_cache_shard_disk_usage_bytes_family.Remove(it->second.gauge);
+        }
         shard_disk_usage_metrics.erase(it);
         return std::nullopt;
     }
-    return it->second.gauge->Value();
+    return entry->bytes.load(std::memory_order_relaxed);
 }
 
 }  // namespace milvus::cachinglayer::monitor
