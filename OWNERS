@@ -1,0 +1,13 @@
+filters:
+  ".*":
+    reviewers:
+      - czs007
+      - xiaofan-luan
+      - zhengbuqian
+      - sparknack
+    approvers:
+      - czs007
+      - yhmo
+      - xiaofan-luan
+      - zhengbuqian
+      - sparknack
