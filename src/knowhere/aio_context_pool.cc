@@ -1,7 +1,7 @@
 #include "knowhere/aio_context_pool.h"
 
 #include <algorithm>
-#include <stdexcept>
+#include <exception>
 
 #include "log/Log.h"
 
@@ -46,59 +46,14 @@ AioContextPool::GetGlobalAioPool() {
     return pool;
 }
 
-AioContextPool::AioContextPool(size_t num_ctx, size_t max_events)
-    : ctx_bak_(num_ctx, nullptr), max_events_(max_events) {
-    ctx_q_.reserve(num_ctx);
-    for (size_t i = 0; i < num_ctx; ++i) {
-        io_context_t ctx = nullptr;
-        int ret = -1;
-        for (int retry = 0; (ret = io_setup(max_events, &ctx)) != 0 && retry < 5; ++retry) {
-            if (ret != -EAGAIN) {
-                LOG_ERROR("io_setup failed: {}", -ret);
-            }
-        }
-        if (ret != 0) {
-            LOG_ERROR("io_setup failed; omitting AIO slot: {}", -ret);
-        } else {
-            ctx_bak_[i] = ctx;
-            ctx_q_.push_back(ctx);
-            ++num_ctx_;
-        }
-    }
-}
-
 void
-AioContextPool::push(io_context_t ctx) {
-    {
-        std::scoped_lock lock(ctx_mtx_);
-        ctx_q_.push_back(ctx);
-    }
-    ctx_cv_.notify_one();
-}
-
-io_context_t
-AioContextPool::pop() {
-    std::unique_lock lock(ctx_mtx_);
-    ctx_cv_.wait(lock, [this] { return stop_ || !ctx_q_.empty() || num_ctx_ == 0; });
-    if (stop_) {
-        return nullptr;
-    }
-    if (num_ctx_ == 0) {
-        throw std::runtime_error("No usable AIO contexts remain");
-    }
-    auto ctx = ctx_q_.back();
-    ctx_q_.pop_back();
-    return ctx;
-}
-
-void
-AioContextPool::DestroyAndRecreate(io_context_t& ctx) noexcept {
+AioContextPool::DestroyAndRecreate(io_context_t& ctx) {
     size_t slot;
     {
         std::scoped_lock lock(ctx_mtx_);
         const auto it = std::find(ctx_bak_.begin(), ctx_bak_.end(), ctx);
-        if (ctx == nullptr || it == ctx_bak_.end() || std::find(ctx_q_.begin(), ctx_q_.end(), ctx) != ctx_q_.end()) {
-            LOG_ERROR("Cannot retire an AIO context that is not exclusively borrowed: {}", (void*)ctx);
+        if (ctx == nullptr || it == ctx_bak_.end()) {
+            LOG_ERROR("Cannot retire an unknown AIO context: {}", (void*)ctx);
             return;
         }
         slot = it - ctx_bak_.begin();
@@ -110,39 +65,44 @@ AioContextPool::DestroyAndRecreate(io_context_t& ctx) noexcept {
     const auto retired = ctx;
     ctx = nullptr;
     const int destroy_ret = io_destroy(retired);
-    if (destroy_ret != 0) {
-        LOG_ERROR("io_destroy failed; abandoning AIO context {}, error: {}", (void*)retired, -destroy_ret);
-    }
-
     io_context_t replacement = nullptr;
     const int setup_ret = io_setup(max_events_, &replacement);
+    std::exception_ptr enqueue_error;
+    bool exhausted;
     {
         std::scoped_lock lock(ctx_mtx_);
         if (setup_ret == 0) {
-            ctx_bak_[slot] = replacement;
-            ctx_q_.push_back(replacement);
-        } else {
+            try {
+                ctx_q_.push(replacement);
+                ctx_bak_[slot] = replacement;
+            } catch (...) {
+                enqueue_error = std::current_exception();
+            }
+        }
+        if (setup_ret != 0 || enqueue_error) {
             --num_ctx_;
         }
+        exhausted = num_ctx_ == 0;
+    }
+    if (exhausted) {
+        ctx_cv_.notify_all();
+    } else if (setup_ret == 0 && !enqueue_error) {
+        ctx_cv_.notify_one();
+    }
+    if (enqueue_error) {
+        const int cleanup_ret = io_destroy(replacement);
+        if (cleanup_ret != 0) {
+            LOG_ERROR("io_destroy failed for an unqueued AIO context {}, error: {}", (void*)replacement, -cleanup_ret);
+        }
+    }
+    // Log after the pool state is consistent: formatting can also throw.
+    if (destroy_ret != 0) {
+        LOG_ERROR("io_destroy failed; abandoning AIO context {}, error: {}", (void*)retired, -destroy_ret);
     }
     if (setup_ret != 0) {
         LOG_ERROR("io_setup failed; AIO pool capacity reduced, error: {}", -setup_ret);
-        // Wake every waiter if the last usable context has been lost.
-        ctx_cv_.notify_all();
-    } else {
-        ctx_cv_.notify_one();
     }
-}
-
-AioContextPool::~AioContextPool() {
-    {
-        std::scoped_lock lock(ctx_mtx_);
-        stop_ = true;
-    }
-    ctx_cv_.notify_all();
-    for (auto ctx : ctx_bak_) {
-        if (ctx != nullptr) {
-            io_destroy(ctx);
-        }
+    if (enqueue_error) {
+        std::rethrow_exception(enqueue_error);
     }
 }
