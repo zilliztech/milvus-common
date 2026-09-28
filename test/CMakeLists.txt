@@ -40,3 +40,13 @@ endif()
 add_test(NAME all_tests COMMAND all_tests)
 
 install(TARGETS all_tests DESTINATION unittest)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND LIBAIO_LIBRARY)
+    # Interpose the libaio C entry points in this executable only. Exercise
+    # the real shared-library pool without duplicating its singleton state.
+    add_executable(test_aio_context_pool AioContextPoolTest.cpp)
+    target_link_libraries(test_aio_context_pool PRIVATE GTest::gtest milvus-common
+        Threads::Threads atomic ${CMAKE_DL_LIBS})
+    add_test(NAME test_aio_context_pool COMMAND test_aio_context_pool)
+    set_tests_properties(test_aio_context_pool PROPERTIES TIMEOUT 30)
+endif()
