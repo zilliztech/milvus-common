@@ -1,7 +1,7 @@
 #include "knowhere/aio_context_pool.h"
 
 #include <algorithm>
-#include <system_error>
+#include <stdexcept>
 
 #include "log/Log.h"
 
@@ -47,9 +47,8 @@ AioContextPool::GetGlobalAioPool() {
 }
 
 AioContextPool::AioContextPool(size_t num_ctx, size_t max_events)
-    : ctx_bak_(num_ctx, nullptr), num_ctx_(num_ctx), max_events_(max_events) {
+    : ctx_bak_(num_ctx, nullptr), max_events_(max_events) {
     ctx_q_.reserve(num_ctx);
-    pending_recreation_.reserve(num_ctx);
     for (size_t i = 0; i < num_ctx; ++i) {
         io_context_t ctx = nullptr;
         int ret = -1;
@@ -59,11 +58,11 @@ AioContextPool::AioContextPool(size_t num_ctx, size_t max_events)
             }
         }
         if (ret != 0) {
-            LOG_ERROR("io_setup failed; retaining AIO slot for recreation: {}", -ret);
-            pending_recreation_.push_back(i);
+            LOG_ERROR("io_setup failed; omitting AIO slot: {}", -ret);
         } else {
             ctx_bak_[i] = ctx;
             ctx_q_.push_back(ctx);
+            ++num_ctx_;
         }
     }
 }
@@ -80,40 +79,27 @@ AioContextPool::push(io_context_t ctx) {
 io_context_t
 AioContextPool::pop() {
     std::unique_lock lock(ctx_mtx_);
-    ctx_cv_.wait(lock, [this] { return stop_ || !ctx_q_.empty() || !pending_recreation_.empty(); });
+    ctx_cv_.wait(lock, [this] { return stop_ || !ctx_q_.empty() || num_ctx_ == 0; });
     if (stop_) {
         return nullptr;
     }
-    if (!ctx_q_.empty()) {
-        auto ctx = ctx_q_.back();
-        ctx_q_.pop_back();
-        return ctx;
+    if (num_ctx_ == 0) {
+        throw std::runtime_error("No usable AIO contexts remain");
     }
-
-    const auto slot = pending_recreation_.back();
-    pending_recreation_.pop_back();
-    lock.unlock();
-    io_context_t ctx = nullptr;
-    const int ret = io_setup(max_events_, &ctx);
-    lock.lock();
-    if (ret != 0) {
-        pending_recreation_.push_back(slot);
-        lock.unlock();
-        ctx_cv_.notify_one();
-        throw std::system_error(-ret, std::generic_category(), "Could not recreate AIO context");
-    }
-    ctx_bak_[slot] = ctx;
+    auto ctx = ctx_q_.back();
+    ctx_q_.pop_back();
     return ctx;
 }
 
-int
+void
 AioContextPool::DestroyAndRecreate(io_context_t& ctx) noexcept {
     size_t slot;
     {
         std::scoped_lock lock(ctx_mtx_);
         const auto it = std::find(ctx_bak_.begin(), ctx_bak_.end(), ctx);
         if (ctx == nullptr || it == ctx_bak_.end() || std::find(ctx_q_.begin(), ctx_q_.end(), ctx) != ctx_q_.end()) {
-            return -EINVAL;
+            LOG_ERROR("Cannot retire an AIO context that is not exclusively borrowed: {}", (void*)ctx);
+            return;
         }
         slot = it - ctx_bak_.begin();
         // Reserve the registry entry before destruction. Kernel handle
@@ -121,13 +107,12 @@ AioContextPool::DestroyAndRecreate(io_context_t& ctx) noexcept {
         ctx_bak_[slot] = nullptr;
     }
 
-    const int destroy_ret = io_destroy(ctx);
-    if (destroy_ret != 0) {
-        std::scoped_lock lock(ctx_mtx_);
-        ctx_bak_[slot] = ctx;
-        return destroy_ret;
-    }
+    const auto retired = ctx;
     ctx = nullptr;
+    const int destroy_ret = io_destroy(retired);
+    if (destroy_ret != 0) {
+        LOG_ERROR("io_destroy failed; abandoning AIO context {}, error: {}", (void*)retired, -destroy_ret);
+    }
 
     io_context_t replacement = nullptr;
     const int setup_ret = io_setup(max_events_, &replacement);
@@ -137,11 +122,16 @@ AioContextPool::DestroyAndRecreate(io_context_t& ctx) noexcept {
             ctx_bak_[slot] = replacement;
             ctx_q_.push_back(replacement);
         } else {
-            pending_recreation_.push_back(slot);
+            --num_ctx_;
         }
     }
-    ctx_cv_.notify_one();
-    return setup_ret;
+    if (setup_ret != 0) {
+        LOG_ERROR("io_setup failed; AIO pool capacity reduced, error: {}", -setup_ret);
+        // Wake every waiter if the last usable context has been lost.
+        ctx_cv_.notify_all();
+    } else {
+        ctx_cv_.notify_one();
+    }
 }
 
 AioContextPool::~AioContextPool() {
