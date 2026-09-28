@@ -23,6 +23,7 @@ constexpr size_t kMaxEvents = 8;
 std::atomic<int> setup_error{0};
 std::atomic<int> destroy_error{0};
 std::atomic<size_t> destroy_calls{0};
+std::atomic<size_t> setup_calls{0};
 std::function<void()> before_destroy;
 std::mutex live_mutex;
 std::set<io_context_t> live_contexts;
@@ -107,6 +108,7 @@ class AioContextPoolTest : public ::testing::Test {
 
 extern "C" int
 io_setup(int count, io_context_t* ctx) {
+    ++setup_calls;
     if (int error = setup_error.exchange(0); error != 0)
         return error;
     static auto real_setup = reinterpret_cast<int (*)(int, io_context_t*)>(dlsym(RTLD_NEXT, "io_setup"));
@@ -145,40 +147,72 @@ TEST_F(AioContextPoolTest, ReplacesContextWithUnreapedReads) {
     iocb* cb = &input.cb;
     ASSERT_EQ(io_submit(ctx, 1, &cb), 1);
     const auto calls = destroy_calls.load();
-    const int ret = pool->DestroyAndRecreate(ctx);
+    pool->DestroyAndRecreate(ctx);
     if (ctx != nullptr) {
         io_event event{};
         ASSERT_EQ(io_getevents(ctx, 1, 1, &event, nullptr), 1);
     }
-    ASSERT_EQ(ret, 0);
     ASSERT_EQ(ctx, nullptr);
     EXPECT_EQ(destroy_calls, calls + 1);
     ctx = pool->pop();
     ReadPage(ctx);
 }
 
-TEST_F(AioContextPoolTest, FailedSetupPreservesSlotAcrossFailedAcquisition) {
-    setup_error = -ENOMEM;
-    EXPECT_EQ(pool->DestroyAndRecreate(ctx), -ENOMEM);
-    ASSERT_EQ(ctx, nullptr);
-    setup_error = -EAGAIN;
-    EXPECT_THROW(ctx = pool->pop(), std::system_error);
-    EXPECT_EQ(ctx, nullptr);
-    ctx = pool->pop();
-    ReadPage(ctx);
+TEST_F(AioContextPoolTest, FailedSetupReducesCapacityWithoutRetry) {
+    // Run permanent capacity loss in a fresh process so other tests retain
+    // their two-context singleton pool, including with shuffled test order.
+    EXPECT_EXIT(([&] {
+                    const auto verify = [&] {
+                        const auto calls = setup_calls.load();
+                        setup_error = -ENOMEM;
+                        pool->DestroyAndRecreate(ctx);
+                        ASSERT_EQ(ctx, nullptr);
+                        EXPECT_EQ(setup_calls, calls + 1);
+                        std::promise<void> entered;
+                        auto waiter = std::async(std::launch::async, [&] {
+                            entered.set_value();
+                            return pool->pop();
+                        });
+                        entered.get_future().wait();
+                        EXPECT_EQ(waiter.wait_for(std::chrono::milliseconds(20)), std::future_status::timeout);
+                        EXPECT_EQ(setup_calls, calls + 1);
+                        const auto available = held;
+                        pool->push(held);
+                        held = nullptr;
+                        ctx = waiter.get();
+                        EXPECT_EQ(ctx, available);
+                        EXPECT_EQ(setup_calls, calls + 1);
+                        ReadPage(ctx);
+                    };
+                    verify();
+                    pool.reset();
+                    std::exit(::testing::Test::HasFailure() ? 1 : 0);
+                }()),
+                ::testing::ExitedWithCode(0), "");
 }
 
-TEST_F(AioContextPoolTest, FailedDestroyKeepsCallerOwnership) {
-    const auto original = ctx;
+TEST_F(AioContextPoolTest, FailedDestroyAbandonsOldContextAndTriesReplacement) {
+    const auto abandoned = ctx;
+    const auto calls = setup_calls.load();
     destroy_error = -EINVAL;
-    EXPECT_EQ(pool->DestroyAndRecreate(ctx), -EINVAL);
-    EXPECT_EQ(ctx, original);
+    pool->DestroyAndRecreate(ctx);
+    EXPECT_EQ(ctx, nullptr);
+    EXPECT_EQ(setup_calls, calls + 1);
+    {
+        std::lock_guard lock(live_mutex);
+        EXPECT_EQ(live_contexts.count(abandoned), 1);
+    }
+    ctx = pool->pop();
+    EXPECT_NE(ctx, abandoned);
     ReadPage(ctx);
+    // The production pool intentionally forgets this handle. The test owns
+    // cleanup so its real kernel resource does not survive the test case.
+    EXPECT_EQ(io_destroy(abandoned), 0);
 }
 
 TEST_F(AioContextPoolTest, RepeatedReplacementPreservesCapacity) {
     for (int i = 0; i < 16; ++i) {
-        ASSERT_EQ(pool->DestroyAndRecreate(ctx), 0);
+        pool->DestroyAndRecreate(ctx);
         ASSERT_EQ(ctx, nullptr);
         ctx = pool->pop();
         ReadPage(ctx);
@@ -193,25 +227,54 @@ TEST_F(AioContextPoolTest, WakesWaiterAfterReplacement) {
     });
     entered.get_future().wait();
     ASSERT_EQ(waiter.wait_for(std::chrono::milliseconds(20)), std::future_status::timeout);
-    ASSERT_EQ(pool->DestroyAndRecreate(ctx), 0);
+    pool->DestroyAndRecreate(ctx);
     ASSERT_EQ(waiter.wait_for(std::chrono::seconds(2)), std::future_status::ready);
     ctx = waiter.get();
     ReadPage(ctx);
 }
 
-TEST_F(AioContextPoolTest, WakesWaiterWhenReplacementNeedsRecreation) {
-    std::promise<void> entered;
-    auto waiter = std::async(std::launch::async, [&] {
-        entered.set_value();
-        return pool->pop();
-    });
-    entered.get_future().wait();
-    ASSERT_EQ(waiter.wait_for(std::chrono::milliseconds(20)), std::future_status::timeout);
-    setup_error = -ENOMEM;
-    ASSERT_EQ(pool->DestroyAndRecreate(ctx), -ENOMEM);
-    ASSERT_EQ(waiter.wait_for(std::chrono::seconds(2)), std::future_status::ready);
-    ctx = waiter.get();
-    ReadPage(ctx);
+TEST_F(AioContextPoolTest, ExhaustedPoolWakesAllWaitersWithoutRetry) {
+    EXPECT_EXIT(([&] {
+                    const auto verify = [&] {
+                        // Keep one context borrowed while the other slot is lost.
+                        setup_error = -ENOMEM;
+                        pool->DestroyAndRecreate(ctx);
+                        std::promise<void> first_entered;
+                        std::promise<void> second_entered;
+                        const auto wait = [&](std::promise<void>& entered) {
+                            entered.set_value();
+                            try {
+                                pool->pop();
+                                return false;
+                            } catch (const std::runtime_error&) {
+                                return true;
+                            }
+                        };
+                        auto first = std::async(std::launch::async, [&] { return wait(first_entered); });
+                        auto second = std::async(std::launch::async, [&] { return wait(second_entered); });
+                        first_entered.get_future().wait();
+                        second_entered.get_future().wait();
+                        EXPECT_EQ(first.wait_for(std::chrono::milliseconds(20)), std::future_status::timeout);
+                        EXPECT_EQ(second.wait_for(std::chrono::milliseconds(20)), std::future_status::timeout);
+                        const auto calls = setup_calls.load();
+                        setup_error = -ENOMEM;
+                        pool->DestroyAndRecreate(held);
+                        EXPECT_EQ(ctx, nullptr);
+                        EXPECT_EQ(held, nullptr);
+                        if (first.wait_for(std::chrono::seconds(2)) != std::future_status::ready ||
+                            second.wait_for(std::chrono::seconds(2)) != std::future_status::ready) {
+                            std::_Exit(2);
+                        }
+                        EXPECT_TRUE(first.get());
+                        EXPECT_TRUE(second.get());
+                        EXPECT_THROW(pool->pop(), std::runtime_error);
+                        EXPECT_EQ(setup_calls, calls + 1);
+                    };
+                    verify();
+                    pool.reset();
+                    std::exit(::testing::Test::HasFailure() ? 1 : 0);
+                }()),
+                ::testing::ExitedWithCode(0), "");
 }
 
 TEST_F(AioContextPoolTest, DoesNotHoldPoolLockDuringDestroy) {
@@ -231,7 +294,7 @@ TEST_F(AioContextPoolTest, DoesNotHoldPoolLockDuringDestroy) {
     const auto status = other.wait_for(std::chrono::seconds(2));
     resume.set_value();
     EXPECT_EQ(status, std::future_status::ready);
-    EXPECT_EQ(recovery.get(), 0);
+    recovery.get();
     other.get();
     before_destroy = {};
     ctx = pool->pop();
@@ -241,7 +304,8 @@ TEST_F(AioContextPoolTest, DoesNotHoldPoolLockDuringDestroy) {
 TEST_F(AioContextPoolTest, ConcurrentReplacementKeepsDistinctBorrowedContexts) {
     const auto replace = [&](io_context_t& borrowed) {
         for (int i = 0; i < 8; ++i) {
-            if (pool->DestroyAndRecreate(borrowed) != 0) {
+            pool->DestroyAndRecreate(borrowed);
+            if (borrowed != nullptr) {
                 throw std::runtime_error("Context replacement failed");
             }
             borrowed = pool->pop();
@@ -258,6 +322,7 @@ TEST_F(AioContextPoolTest, ConcurrentReplacementKeepsDistinctBorrowedContexts) {
 int
 main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
     std::atexit(CheckAllContextsDestroyed);
     AioContextPool::InitGlobalAioPool(2, kMaxEvents);
     return RUN_ALL_TESTS();

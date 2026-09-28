@@ -33,19 +33,16 @@ class AioContextPool {
     void
     push(io_context_t ctx);
 
-    // May throw std::system_error if a retired slot cannot be recreated.
+    // Throws std::runtime_error if no usable contexts remain.
     io_context_t
     pop();
 
-    // Consume an exclusively borrowed context after synchronously destroying
-    // its pending I/O, then return a replacement to the pool. The caller must
-    // keep its I/O buffers alive until this operation completes.
-    //
-    // Returns 0 on success, or a negative libaio error. A null ctx means the
-    // old I/O is safely destroyed; if setup failed, the pool retains the slot
-    // and pop() will try to recreate it. A non-null ctx on error means destroy
-    // did not succeed and the caller still owns the context and its buffers.
-    [[nodiscard]] int
+    // Retire an exclusively borrowed context and try to replace it once.
+    // The handle is consumed even if destruction fails: log the error and
+    // abandon that context without returning it to the pool. Failed setup
+    // reduces pool capacity; pop() does not retry it. This best-effort cleanup
+    // cannot guarantee that pending I/O has stopped if destruction fails.
+    void
     DestroyAndRecreate(io_context_t& ctx) noexcept;
 
     static bool
@@ -58,14 +55,14 @@ class AioContextPool {
 
  private:
     std::vector<io_context_t> ctx_bak_;
-    // These vectors reserve the configured capacity up front, so returning
+    // Reserve the configured capacity up front, so returning
     // or retiring a borrowed context does not allocate while unwinding.
     std::vector<io_context_t> ctx_q_;
-    std::vector<size_t> pending_recreation_;
     std::mutex ctx_mtx_;
     std::condition_variable ctx_cv_;
     bool stop_ = false;
-    size_t num_ctx_;
+    // Usable contexts, including borrowed contexts and replacements in progress.
+    size_t num_ctx_ = 0;
     size_t max_events_;
     static size_t global_aio_pool_size;
     static size_t global_aio_max_events;
