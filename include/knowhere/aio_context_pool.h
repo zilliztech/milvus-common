@@ -3,8 +3,11 @@
 #include <libaio.h>
 
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <queue>
+#include <stdexcept>
+#include <vector>
 
 #include "log/Log.h"
 
@@ -44,14 +47,24 @@ class AioContextPool {
         if (stop_) {
             return nullptr;
         }
-        ctx_cv_.wait(lk, [this] { return ctx_q_.size(); });
+        ctx_cv_.wait(lk, [this] { return stop_ || !ctx_q_.empty() || num_ctx_ == 0; });
         if (stop_) {
             return nullptr;
+        }
+        if (num_ctx_ == 0) {
+            throw std::runtime_error("No usable AIO contexts remain");
         }
         auto ret = ctx_q_.front();
         ctx_q_.pop();
         return ret;
     }
+
+    // Retire an exclusively borrowed context and try to replace it once.
+    // The handle is consumed even if destruction fails; only successful
+    // destruction guarantees that pending I/O has stopped. Failed setup or
+    // enqueue reduces usable capacity. C++ exceptions may propagate.
+    void
+    DestroyAndRecreate(io_context_t& ctx);
 
     static bool
     InitGlobalAioPool(size_t num_ctx, size_t max_events);
@@ -62,7 +75,9 @@ class AioContextPool {
     ~AioContextPool() {
         stop_ = true;
         for (auto ctx : ctx_bak_) {
-            io_destroy(ctx);
+            if (ctx != nullptr) {
+                io_destroy(ctx);
+            }
         }
         ctx_cv_.notify_all();
     }
@@ -73,14 +88,15 @@ class AioContextPool {
     std::mutex ctx_mtx_;
     std::condition_variable ctx_cv_;
     bool stop_ = false;
+    // Usable contexts, including borrowed contexts and replacements in progress.
     size_t num_ctx_;
     size_t max_events_;
     static size_t global_aio_pool_size;
     static size_t global_aio_max_events;
     static std::mutex global_aio_pool_mut;
 
-    AioContextPool(size_t num_ctx, size_t max_events) : num_ctx_(num_ctx), max_events_(max_events) {
-        for (size_t i = 0; i < num_ctx_; ++i) {
+    AioContextPool(size_t num_ctx, size_t max_events) : num_ctx_(0), max_events_(max_events) {
+        for (size_t i = 0; i < num_ctx; ++i) {
             io_context_t ctx = 0;
             int ret = -1;
             for (int retry = 0; (ret = io_setup(max_events, &ctx)) != 0 && retry < 5; ++retry) {
@@ -94,6 +110,7 @@ class AioContextPool {
                 LOG_DEBUG("allocating ctx: %p", (void*)ctx);
                 ctx_q_.push(ctx);
                 ctx_bak_.push_back(ctx);
+                ++num_ctx_;
             }
         }
     }
