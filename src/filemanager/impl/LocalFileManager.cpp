@@ -39,7 +39,7 @@ LocalFileManager::OpenInputStream(const std::string& filename) {
 }
 
 std::shared_ptr<OutputStream>
-LocalFileManager::OpenOutputStream(const std::string& filename) {
+LocalFileManager::OpenOutputStream(const std::string& filename, size_t /*file_size*/) {
     return std::make_shared<LocalOutputStream>(filename);
 }
 
