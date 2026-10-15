@@ -92,10 +92,11 @@ class FileManager {
      * @brief Open a file as an output stream.
      *
      * @param filename
+     * @param file_size Expected file size in bytes; 0 means unknown. Implementations may use it to reserve storage.
      * @return a shared pointer to the output stream.
      */
     virtual std::shared_ptr<OutputStream>
-    OpenOutputStream(const std::string& filename) = 0;
+    OpenOutputStream(const std::string& filename, size_t file_size = 0) = 0;
 
     /**
      * @brief Open a fully initialized input stream without blocking the calling worker on IO.

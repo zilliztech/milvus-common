@@ -30,6 +30,9 @@ namespace milvus {
  * to be passed through operation call chains to maintain context and enable observability.
  */
 struct OpContext {
+    // Build task identifier for correlating build and serialization logs.
+    int64_t build_id = 0;
+
     // Storage Usage tracking
     struct {
         std::atomic<int64_t> scanned_cold_bytes{0};
