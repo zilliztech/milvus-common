@@ -28,6 +28,13 @@ class LocalInputStream : public InputStream {
     size_t
     ReadAt(void* ptr, size_t offset, size_t size) override;
 
+    // For local validation only; this is not a performance-critical path.
+    // Performs blocking IO inline and returns a ready future containing the result or exception.
+    [[nodiscard]] folly::SemiFuture<size_t>
+    ReadAtAsync(void* ptr, size_t offset, size_t size) override {
+        return folly::makeSemiFutureWith([this, ptr, offset, size] { return ReadAt(ptr, offset, size); });
+    }
+
     template <typename T>
     size_t
     Read(T& value) {
