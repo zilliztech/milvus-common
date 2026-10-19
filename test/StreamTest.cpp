@@ -228,7 +228,7 @@ TEST_F(StreamTest, DefaultReadAtAsyncIsUnsupported) {
     ObservedStream stream(temp_file_);
     InputStream& input = stream;
     std::vector<uint8_t> buffer(2, 0);
-    auto read = input.ReadAtAsync(buffer.data(), 1, buffer.size());
+    auto read = input.InputStream::ReadAtAsync(buffer.data(), 1, buffer.size());
     ASSERT_TRUE(read.isReady());
     const auto result = std::move(read).getTry();
     ASSERT_TRUE(result.hasException());
@@ -305,6 +305,32 @@ TEST_F(StreamTest, OpenInputStreamAsyncOverrideCompletesThroughFuture) {
     std::vector<uint8_t> buffer(data.size());
     EXPECT_EQ(input->ReadAtAsync(buffer.data(), 0, buffer.size()).get(), buffer.size());
     EXPECT_EQ(buffer, data);
+}
+
+TEST_F(StreamTest, LocalInputStream_ReadAtAsyncIsReady) {
+    const auto data = GenerateTestData(100);
+    WriteTestFile(data);
+    LocalInputStream stream(temp_file_);
+    InputStream& input = stream;
+
+    std::vector<uint8_t> buffer(10);
+    auto read = input.ReadAtAsync(buffer.data(), 50, buffer.size());
+    EXPECT_TRUE(read.isReady());
+    EXPECT_EQ(std::move(read).get(), buffer.size());
+    EXPECT_TRUE(std::equal(buffer.begin(), buffer.end(), data.begin() + 50));
+    EXPECT_EQ(input.ReadAtAsync(buffer.data(), data.size(), 0).get(), 0);
+}
+
+TEST_F(StreamTest, LocalInputStream_ReadAtAsyncErrorsInFuture) {
+    const std::vector<uint8_t> data = {1, 2, 3, 4};
+    WriteTestFile(data);
+    LocalInputStream stream(temp_file_);
+    std::vector<uint8_t> buffer(2, 0);
+    auto read = folly::SemiFuture<size_t>::makeEmpty();
+    ASSERT_NO_THROW(read = stream.ReadAtAsync(buffer.data(), 3, buffer.size()));
+    EXPECT_TRUE(read.isReady());
+    EXPECT_THROW(std::move(read).get(), std::runtime_error);
+    EXPECT_EQ(buffer, std::vector<uint8_t>({0, 0}));
 }
 
 TEST_F(StreamTest, LocalInputStream_ReadAtConcurrent) {
