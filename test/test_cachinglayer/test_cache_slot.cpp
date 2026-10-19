@@ -1,4 +1,7 @@
 #include <folly/CancellationToken.h>
+#include <folly/coro/Baton.h>
+#include <folly/coro/BlockingWait.h>
+#include <folly/coro/Task.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/executors/InlineExecutor.h>
 #include <folly/futures/Future.h>
@@ -28,6 +31,23 @@
 #include "cachinglayer_test_utils.h"
 #include "common/OpContext.h"
 #include "common/Tracer.h"
+
+#ifdef __linux__
+namespace {
+thread_local int coroutine_allocations_until_failure = 0;
+}
+
+extern "C" void*
+__real_folly_coro_async_malloc(std::size_t size);
+
+extern "C" void*
+__wrap_folly_coro_async_malloc(std::size_t size) {
+    if (coroutine_allocations_until_failure > 0 && --coroutine_allocations_until_failure == 0) {
+        throw std::bad_alloc();
+    }
+    return __real_folly_coro_async_malloc(size);
+}
+#endif
 
 using namespace milvus::cachinglayer;
 using namespace milvus::cachinglayer::internal;
@@ -136,7 +156,7 @@ class MockTranslator : public Translator<TestCell> {
         return {total_bonus_cids_set.begin(), total_bonus_cids_set.end()};
     }
 
-    std::vector<std::pair<cid_t, std::unique_ptr<TestCell>>>
+    folly::coro::Task<std::vector<std::pair<cid_t, std::unique_ptr<TestCell>>>>
     get_cells(milvus::OpContext* ctx, const std::vector<cid_t>& cids) override {
         if (!for_concurrent_test_) {
             get_cells_call_count_++;
@@ -165,7 +185,7 @@ class MockTranslator : public Translator<TestCell> {
             result.emplace_back(cid, std::make_unique<TestCell>(static_cast<int>(cid * 10), cid,
                                                                 estimated_byte_size_of_cell(cid).first));
         }
-        return result;
+        co_return result;
     }
 
     void
@@ -282,14 +302,14 @@ class DiskShardTranslator : public Translator<TestCell> {
         return &meta_;
     }
 
-    std::vector<std::pair<cid_t, std::unique_ptr<TestCell>>>
+    folly::coro::Task<std::vector<std::pair<cid_t, std::unique_ptr<TestCell>>>>
     get_cells(milvus::OpContext*, const std::vector<cid_t>& cids) override {
         std::vector<std::pair<cid_t, std::unique_ptr<TestCell>>> result;
         result.reserve(cids.size());
         for (const auto& cid : cids) {
             result.emplace_back(cid, std::make_unique<TestCell>(static_cast<int>(cid), cid, cell_sizes_.at(cid)));
         }
-        return result;
+        co_return result;
     }
 
  private:
@@ -368,6 +388,315 @@ TEST_F(CacheSlotTest, Initialization) {
     ASSERT_EQ(cache_slot_->num_cells(), NUM_UNIQUE_CIDS);
 }
 
+#ifdef __linux__
+TEST_F(CacheSlotTest, LoadTaskAllocationFailureAllowsRetry) {
+    // Sweep coroutine-frame failures in both entry points, including blockingWait.
+    for (bool direct : {true, false}) {
+        SCOPED_TRACE(direct);
+        for (int allocation = 1;; ++allocation) {
+            SCOPED_TRACE(allocation);
+            coroutine_allocations_until_failure = allocation;
+            auto reset = folly::makeGuard([] { coroutine_allocations_until_failure = 0; });
+            bool failed = false;
+            try {
+                if (direct) {
+                    cache_slot_->PinOneCellDirect(nullptr, 10);
+                } else {
+                    folly::coro::blockingWait(cache_slot_->PinCells(nullptr, {10}));
+                }
+            } catch (const std::bad_alloc&) {
+                failed = true;
+            }
+            const bool injected = coroutine_allocations_until_failure == 0;
+            coroutine_allocations_until_failure = 0;
+            EXPECT_EQ(failed, injected);
+            EXPECT_EQ(DListTestFriend::get_loading_memory(*dlist_), ResourceUsage{});
+
+            auto retry = folly::coro::co_withExecutor(folly::getKeepAliveToken(&folly::InlineExecutor::instance()),
+                                                      cache_slot_->PinCells(nullptr, {10}))
+                             .start();
+            ASSERT_TRUE(retry.isReady());
+            EXPECT_NE(std::move(retry).get()->get_cell_of(10), nullptr);
+            EXPECT_TRUE(cache_slot_->ManualEvict(0));
+            if (!injected) {
+                break;
+            }
+        }
+    }
+}
+#endif
+
+namespace {
+
+struct CacheLoadGate {
+    std::promise<void> entered;
+    std::shared_future<void> started = entered.get_future().share();
+    folly::coro::Baton finish;
+    std::atomic<int> calls{0};
+    bool fail = false;
+};
+
+class GatedTranslator : public MockTranslator {
+ public:
+    explicit GatedTranslator(std::shared_ptr<CacheLoadGate> gate,
+                             CacheWarmupPolicy policy = CacheWarmupPolicy::CacheWarmupPolicy_Disable)
+        : MockTranslator({{0, 100}}, {{0, 0}}, "coroutine_slot", StorageType::MEMORY), gate_(std::move(gate)) {
+        meta()->cache_warmup_policy = policy;
+    }
+
+    folly::coro::Task<std::vector<std::pair<cid_t, std::unique_ptr<TestCell>>>>
+    get_cells(milvus::OpContext* ctx, const std::vector<cid_t>& cids) override {
+        if (gate_->calls.fetch_add(1) == 0) {
+            gate_->entered.set_value();
+        }
+        co_await gate_->finish;
+        if (ctx && ctx->cancellation_token.isCancellationRequested()) {
+            ThrowInfo(milvus::ErrorCode::FollyCancel, "cancelled gated cache load");
+        }
+        if (gate_->fail) {
+            throw std::runtime_error("gated cache load failed");
+        }
+        co_return co_await MockTranslator::get_cells(ctx, cids);
+    }
+
+ private:
+    std::shared_ptr<CacheLoadGate> gate_;
+};
+
+void
+ExpectExecutorProgress(folly::CPUThreadPoolExecutor& executor) {
+    auto signal = std::make_shared<std::promise<void>>();
+    auto completed = signal->get_future();
+    executor.add([signal] { signal->set_value(); });
+    EXPECT_EQ(completed.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+}
+
+class CoroutineCacheTest : public ::testing::Test {
+ protected:
+    std::shared_ptr<DList> dlist = std::make_shared<DList>(true, ResourceUsage{4096, 0}, ResourceUsage{4096, 0},
+                                                           ResourceUsage{4096, 0}, EvictionConfig{0, false, 600});
+
+    std::shared_ptr<CacheSlot<TestCell>>
+    MakeSlot(const std::shared_ptr<CacheLoadGate>& gate,
+             CacheWarmupPolicy policy = CacheWarmupPolicy::CacheWarmupPolicy_Disable) {
+        return std::make_shared<CacheSlot<TestCell>>(std::make_unique<GatedTranslator>(gate, policy), dlist.get(), true,
+                                                     true, true, std::chrono::seconds(5), std::chrono::seconds(5));
+    }
+};
+
+TEST_F(CoroutineCacheTest, SuspendedLoadAndSharedWaitLeaveWorkerAvailable) {
+    auto gate = std::make_shared<CacheLoadGate>();
+    auto slot = MakeSlot(gate);
+    folly::CPUThreadPoolExecutor executor(1);
+    auto unblock = folly::makeGuard([gate] { gate->finish.post(); });
+    auto first =
+        folly::coro::co_withExecutor(folly::getKeepAliveToken(&executor), slot->PinCells(nullptr, {0})).start();
+    ASSERT_EQ(gate->started.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    auto second =
+        folly::coro::co_withExecutor(folly::getKeepAliveToken(&executor), slot->PinCells(nullptr, {0})).start();
+    ExpectExecutorProgress(executor);
+    EXPECT_EQ(gate->calls, 1);
+    EXPECT_FALSE(slot->ManualEvict(0));
+    gate->finish.post();
+    auto first_pin = std::move(first).get();
+    auto second_pin = std::move(second).get();
+    EXPECT_EQ(first_pin->get_cell_of(0), second_pin->get_cell_of(0));
+    first_pin.reset();
+    EXPECT_FALSE(slot->ManualEvict(0));
+    second_pin.reset();
+    EXPECT_TRUE(slot->ManualEvict(0));
+    EXPECT_NE(folly::coro::blockingWait(slot->PinAllCells(nullptr)), nullptr);
+    EXPECT_EQ(gate->calls, 2);
+    EXPECT_EQ(DListTestFriend::get_loading_memory(*dlist), ResourceUsage{});
+}
+
+TEST_F(CoroutineCacheTest, SharedFailureReleasesResourcesAndAllowsRetry) {
+    auto gate = std::make_shared<CacheLoadGate>();
+    gate->fail = true;
+    auto slot = MakeSlot(gate);
+    folly::CPUThreadPoolExecutor executor(1);
+    auto unblock = folly::makeGuard([gate] { gate->finish.post(); });
+    auto first =
+        folly::coro::co_withExecutor(folly::getKeepAliveToken(&executor), slot->PinCells(nullptr, {0})).start();
+    ASSERT_EQ(gate->started.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    auto second =
+        folly::coro::co_withExecutor(folly::getKeepAliveToken(&executor), slot->PinCells(nullptr, {0})).start();
+    ExpectExecutorProgress(executor);
+    gate->finish.post();
+    EXPECT_THROW(std::move(first).get(), std::runtime_error);
+    EXPECT_THROW(std::move(second).get(), std::runtime_error);
+    EXPECT_EQ(gate->calls, 1);
+    EXPECT_EQ(DListTestFriend::get_loading_memory(*dlist), ResourceUsage{});
+    EXPECT_FALSE(slot->IsCached(0));
+    gate->fail = false;
+    EXPECT_NE(folly::coro::blockingWait(slot->PinCells(nullptr, {0})), nullptr);
+    EXPECT_EQ(gate->calls, 2);
+}
+
+TEST_F(CoroutineCacheTest, TaskOwnsSlotAndIdsBeforeStarting) {
+    auto gate = std::make_shared<CacheLoadGate>();
+    gate->finish.post();
+    auto slot = MakeSlot(gate);
+    std::weak_ptr<CacheSlot<TestCell>> weak = slot;
+    std::vector<cl_uid_t> ids{0};
+    auto pin = slot->PinCells(nullptr, ids);
+    ids[0] = 999;
+    slot.reset();
+    EXPECT_FALSE(weak.expired());
+    EXPECT_EQ(gate->calls, 0);
+    auto accessor = folly::coro::blockingWait(std::move(pin));
+    EXPECT_NE(accessor->get_cell_of(0), nullptr);
+    EXPECT_FALSE(weak.expired());
+    accessor.reset();
+    EXPECT_TRUE(weak.expired());
+}
+
+TEST_F(CoroutineCacheTest, CancelledLoadDrainsBeforeReleasingReservation) {
+    auto gate = std::make_shared<CacheLoadGate>();
+    auto slot = MakeSlot(gate);
+    folly::CancellationSource cancellation;
+    milvus::OpContext ctx(cancellation.getToken());
+    folly::CPUThreadPoolExecutor executor(1);
+    auto unblock = folly::makeGuard([gate] { gate->finish.post(); });
+    auto pending = folly::coro::co_withExecutor(folly::getKeepAliveToken(&executor), slot->PinCells(&ctx, {0})).start();
+    ASSERT_EQ(gate->started.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    cancellation.requestCancellation();
+    ExpectExecutorProgress(executor);
+    EXPECT_FALSE(pending.isReady());
+    EXPECT_GT(DListTestFriend::get_loading_memory(*dlist).memory_bytes, 0);
+    gate->finish.post();
+    try {
+        std::move(pending).get();
+        FAIL() << "cancelled load succeeded";
+    } catch (const milvus::SegcoreError& error) {
+        EXPECT_EQ(error.get_error_code(), milvus::ErrorCode::FollyCancel);
+    }
+    EXPECT_EQ(DListTestFriend::get_loading_memory(*dlist), ResourceUsage{});
+    EXPECT_NE(folly::coro::blockingWait(slot->PinCells(nullptr, {0})), nullptr);
+}
+
+TEST_F(CoroutineCacheTest, ResourceWaitCancellationLeavesNoClaim) {
+    const ResourceUsage held{4096, 0};
+    ASSERT_TRUE(SemiInlineGet(dlist->ReserveLoadingResourceWithTimeout(held, std::chrono::milliseconds(0))));
+    auto gate = std::make_shared<CacheLoadGate>();
+    auto slot = MakeSlot(gate);
+    folly::CancellationSource cancellation;
+    milvus::OpContext ctx(cancellation.getToken());
+    folly::CPUThreadPoolExecutor executor(1);
+    auto release = folly::makeGuard([&] {
+        gate->finish.post();
+        dlist->ReleaseLoadingResource(held);
+    });
+    auto pending = folly::coro::co_withExecutor(folly::getKeepAliveToken(&executor), slot->PinCells(&ctx, {0})).start();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (DListTestFriend::get_waiting_request_count(*dlist) == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_EQ(DListTestFriend::get_waiting_request_count(*dlist), 1);
+    cancellation.requestCancellation();
+    EXPECT_THROW(std::move(pending).get(), milvus::SegcoreError);
+    EXPECT_EQ(DListTestFriend::get_waiting_request_count(*dlist), 0);
+    EXPECT_EQ(DListTestFriend::get_loading_memory(*dlist), held);
+    EXPECT_EQ(gate->calls, 0);
+    gate->finish.post();
+    dlist->ReleaseLoadingResource(held);
+    release.dismiss();
+    EXPECT_NE(folly::coro::blockingWait(slot->PinCells(nullptr, {0})), nullptr);
+    EXPECT_EQ(gate->calls, 1);
+}
+
+TEST_F(CoroutineCacheTest, ForegroundWarmupSuspends) {
+    auto gate = std::make_shared<CacheLoadGate>();
+    auto slot = MakeSlot(gate, CacheWarmupPolicy::CacheWarmupPolicy_Sync);
+    folly::CPUThreadPoolExecutor executor(1);
+    auto unblock = folly::makeGuard([gate] { gate->finish.post(); });
+    auto warmup = folly::coro::co_withExecutor(folly::getKeepAliveToken(&executor), slot->Warmup(nullptr)).start();
+    ASSERT_EQ(gate->started.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    ExpectExecutorProgress(executor);
+    EXPECT_FALSE(warmup.isReady());
+    gate->finish.post();
+    std::move(warmup).get();
+    EXPECT_TRUE(slot->IsCached(0));
+}
+
+TEST_F(CoroutineCacheTest, BackgroundWarmupSuspendsAndSharesDemandLoad) {
+    auto gate = std::make_shared<CacheLoadGate>();
+    auto slot = MakeSlot(gate, CacheWarmupPolicy::CacheWarmupPolicy_Async);
+    auto executor = std::make_shared<folly::CPUThreadPoolExecutor>(1);
+    auto unblock = folly::makeGuard([gate] { gate->finish.post(); });
+    folly::coro::blockingWait(slot->Warmup(nullptr, executor));
+    ASSERT_EQ(gate->started.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    auto pending =
+        folly::coro::co_withExecutor(folly::getKeepAliveToken(executor.get()), slot->PinCells(nullptr, {0})).start();
+    ExpectExecutorProgress(*executor);
+    EXPECT_EQ(gate->calls, 1);
+    gate->finish.post();
+    EXPECT_NE(std::move(pending).get(), nullptr);
+    executor->join();
+    EXPECT_EQ(DListTestFriend::get_loading_memory(*dlist), ResourceUsage{});
+}
+
+TEST_F(CoroutineCacheTest, ManagerCreationAwaitsWarmupAndRejectsCancelledContext) {
+    const auto original = TieredStorageConfig::GetInstance().GetSnapshot();
+    auto restore = folly::makeGuard([&] {
+        TieredStorageConfig::GetInstance().UpdateAll(original.storage_usage_tracking_enabled, original.loading_timeout,
+                                                     original.warmup_loading_timeout, original.warmup_policies);
+    });
+    Manager::ConfigureTieredStorage({}, CacheLimit{4096, 4096, 4096, 0, 0, 0}, false, true,
+                                    EvictionConfig{0, false, 600}, std::chrono::seconds(5));
+    auto gate = std::make_shared<CacheLoadGate>();
+    folly::CPUThreadPoolExecutor executor(1);
+    auto unblock = folly::makeGuard([gate] { gate->finish.post(); });
+    auto creation = Manager::GetInstance().CreateCacheSlot<TestCell>(
+        std::make_unique<GatedTranslator>(gate, CacheWarmupPolicy::CacheWarmupPolicy_Sync));
+    auto pending = folly::coro::co_withExecutor(folly::getKeepAliveToken(&executor), std::move(creation)).start();
+    ASSERT_EQ(gate->started.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    ExpectExecutorProgress(executor);
+    EXPECT_FALSE(pending.isReady());
+    gate->finish.post();
+    auto slot = std::move(pending).get();
+    EXPECT_TRUE(slot->IsCached(0));
+    folly::CancellationSource cancellation;
+    cancellation.requestCancellation();
+    milvus::OpContext ctx(cancellation.getToken());
+    auto cancelled_gate = std::make_shared<CacheLoadGate>();
+    auto cancelled =
+        Manager::GetInstance().CreateCacheSlot<TestCell>(std::make_unique<GatedTranslator>(cancelled_gate), &ctx);
+    EXPECT_THROW(folly::coro::blockingWait(std::move(cancelled)), milvus::SegcoreError);
+    EXPECT_EQ(cancelled_gate->calls, 0);
+}
+
+}  // namespace
+
+TEST_F(CacheSlotTest, ResourceWaitDoesNotOccupyExecutor) {
+    const ResourceUsage held{MEMORY_LIMIT, 0};
+    ASSERT_TRUE(SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(held, std::chrono::milliseconds(0))));
+    milvus::OpContext ctx;
+    folly::CPUThreadPoolExecutor executor(1);
+    const std::vector<cl_uid_t> uids{10};
+    auto pin = [&]() -> folly::coro::Task<std::shared_ptr<CellAccessor<TestCell>>> {
+        co_return co_await cache_slot_->PinCells(&ctx, uids);
+    };
+    auto pending = folly::coro::co_withExecutor(folly::getKeepAliveToken(&executor), pin()).start();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (DListTestFriend::get_waiting_request_count(*dlist_) == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_EQ(DListTestFriend::get_waiting_request_count(*dlist_), 1);
+    std::promise<void> progressed;
+    auto progress = progressed.get_future();
+    executor.add([&] { progressed.set_value(); });
+    const auto status = progress.wait_for(std::chrono::milliseconds(500));
+    // Always unblock the old implementation before reporting the regression.
+    dlist_->ReleaseLoadingResource(held);
+    auto accessor = std::move(pending).get();
+    executor.join();
+    EXPECT_EQ(status, std::future_status::ready);
+    ASSERT_NE(accessor, nullptr);
+    EXPECT_EQ(accessor->get_cell_of(10)->data, 0);
+    EXPECT_EQ(DListTestFriend::get_loading_memory(*dlist_), ResourceUsage{});
+}
+
 TEST_F(CacheSlotTest, IsCachedReflectsLoadedAndCachedStates) {
     cl_uid_t target_uid = 30;
     cid_t expected_cid = 2;
@@ -400,7 +729,7 @@ TEST_F(CacheSlotTest, PinSingleCellSuccess) {
     translator_->ResetCounters();
     auto op_ctx = std::make_unique<milvus::OpContext>();
     auto future = cache_slot_->PinCells(op_ctx.get(), {target_uid});
-    auto accessor = SemiInlineGet(std::move(future));
+    auto accessor = folly::coro::blockingWait(std::move(future));
 
     ASSERT_NE(accessor, nullptr);
     ASSERT_EQ(translator_->GetCellsCallCount(), 1);
@@ -432,7 +761,7 @@ TEST_F(CacheSlotTest, PinMultipleCellsSuccess) {
     translator_->ResetCounters();
     auto op_ctx = std::make_unique<milvus::OpContext>();
     auto future = cache_slot_->PinCells(op_ctx.get(), target_uids);
-    auto accessor = SemiInlineGet(std::move(future));
+    auto accessor = folly::coro::blockingWait(std::move(future));
 
     ASSERT_NE(accessor, nullptr);
     ASSERT_EQ(translator_->GetCellsCallCount(), 1);
@@ -642,7 +971,7 @@ TEST_F(CacheSlotTest, PinMultipleUidsMappingToSameCid) {
     translator_->ResetCounters();
     auto op_ctx = std::make_unique<milvus::OpContext>();
     auto future = cache_slot_->PinCells(op_ctx.get(), target_uids);
-    auto accessor = SemiInlineGet(std::move(future));
+    auto accessor = folly::coro::blockingWait(std::move(future));
 
     ASSERT_NE(accessor, nullptr);
     ASSERT_EQ(translator_->GetCellsCallCount(), 1);
@@ -679,7 +1008,7 @@ TEST_F(CacheSlotTest, PinInvalidUid) {
     EXPECT_THROW(
         {
             try {
-                SemiInlineGet(std::move(future));
+                folly::coro::blockingWait(std::move(future));
             } catch (const milvus::SegcoreError& e) {
                 std::string error_what = e.what();
                 EXPECT_TRUE(error_what.find("out of range") != std::string::npos ||
@@ -707,7 +1036,7 @@ TEST_F(CacheSlotTest, LoadFailure) {
     EXPECT_THROW(
         {
             try {
-                SemiInlineGet(std::move(future));
+                folly::coro::blockingWait(std::move(future));
             } catch (const std::runtime_error& e) {
                 std::string error_what = e.what();
                 EXPECT_TRUE(error_what.find("Simulated load error") != std::string::npos ||
@@ -730,7 +1059,7 @@ TEST_F(CacheSlotTest, LoadFailure) {
     translator_->SetShouldThrow(false);
     auto expected_size = translator_->estimated_byte_size_of_cell(expected_cid).first;
     auto future2 = cache_slot_->PinCells(op_ctx.get(), {target_uid});
-    auto accessor = SemiInlineGet(std::move(future2));
+    auto accessor = folly::coro::blockingWait(std::move(future2));
     ASSERT_NE(accessor, nullptr);
     TestCell* cell = accessor->get_cell_of(target_uid);
     ASSERT_NE(cell, nullptr);
@@ -749,7 +1078,7 @@ TEST_F(CacheSlotTest, PinAlreadyLoadedCell) {
     auto op_ctx = std::make_unique<milvus::OpContext>();
 
     auto future1 = cache_slot_->PinCells(op_ctx.get(), {target_uid});
-    auto accessor1 = SemiInlineGet(std::move(future1));
+    auto accessor1 = folly::coro::blockingWait(std::move(future1));
     ASSERT_NE(accessor1, nullptr);
     ASSERT_EQ(translator_->GetCellsCallCount(), 1);
     ASSERT_EQ(translator_->GetRequestedCids().size(), 1);
@@ -762,7 +1091,7 @@ TEST_F(CacheSlotTest, PinAlreadyLoadedCell) {
 
     translator_->ResetCounters();
     auto future2 = cache_slot_->PinCells(op_ctx.get(), {target_uid});
-    auto accessor2 = SemiInlineGet(std::move(future2));
+    auto accessor2 = folly::coro::blockingWait(std::move(future2));
     ASSERT_NE(accessor2, nullptr);
 
     EXPECT_EQ(translator_->GetCellsCallCount(), 0);
@@ -791,7 +1120,7 @@ TEST_F(CacheSlotTest, PinAlreadyLoadedCellViaDifferentUid) {
 
     auto op_ctx = std::make_unique<milvus::OpContext>();
     auto future1 = cache_slot_->PinCells(op_ctx.get(), {uid1});
-    auto accessor1 = SemiInlineGet(std::move(future1));
+    auto accessor1 = folly::coro::blockingWait(std::move(future1));
     ASSERT_NE(accessor1, nullptr);
     ASSERT_EQ(translator_->GetCellsCallCount(), 1);
     ASSERT_EQ(translator_->GetRequestedCids().size(), 1);
@@ -805,7 +1134,7 @@ TEST_F(CacheSlotTest, PinAlreadyLoadedCellViaDifferentUid) {
 
     translator_->ResetCounters();
     auto future2 = cache_slot_->PinCells(op_ctx.get(), {uid2});
-    auto accessor2 = SemiInlineGet(std::move(future2));
+    auto accessor2 = folly::coro::blockingWait(std::move(future2));
     ASSERT_NE(accessor2, nullptr);
 
     EXPECT_EQ(translator_->GetCellsCallCount(), 0);
@@ -843,7 +1172,7 @@ TEST_F(CacheSlotTest, TranslatorReturnsExtraCells) {
 
     auto op_ctx = std::make_unique<milvus::OpContext>();
     auto future = cache_slot_->PinCells(op_ctx.get(), {requested_uid});
-    auto accessor = SemiInlineGet(std::move(future));
+    auto accessor = folly::coro::blockingWait(std::move(future));
 
     ASSERT_NE(accessor, nullptr);
     ASSERT_EQ(translator_->GetCellsCallCount(), 1);
@@ -863,7 +1192,7 @@ TEST_F(CacheSlotTest, TranslatorReturnsExtraCells) {
 
     translator_->ResetCounters();
     auto future_extra = cache_slot_->PinCells(op_ctx.get(), {extra_uid});
-    auto accessor_extra = SemiInlineGet(std::move(future_extra));
+    auto accessor_extra = folly::coro::blockingWait(std::move(future_extra));
 
     ASSERT_NE(accessor_extra, nullptr);
     EXPECT_EQ(translator_->GetCellsCallCount(), 0);
@@ -899,7 +1228,7 @@ TEST_F(CacheSlotTest, EvictionTest) {
     // 1. Load cells 0, 1, 2
     translator_->ResetCounters();
     auto future1 = cache_slot_->PinCells(op_ctx.get(), uids_012);
-    auto accessor1 = SemiInlineGet(std::move(future1));
+    auto accessor1 = folly::coro::blockingWait(std::move(future1));
     ASSERT_NE(accessor1, nullptr);
     EXPECT_EQ(translator_->GetCellsCallCount(), 1);
     auto requested1 = translator_->GetRequestedCids()[0];
@@ -922,7 +1251,7 @@ TEST_F(CacheSlotTest, EvictionTest) {
 
     translator_->ResetCounters();
     auto future2 = cache_slot_->PinCells(op_ctx.get(), {uid_3});
-    auto accessor2 = SemiInlineGet(std::move(future2));
+    auto accessor2 = folly::coro::blockingWait(std::move(future2));
     ASSERT_NE(accessor2, nullptr);
 
     EXPECT_EQ(translator_->GetCellsCallCount(),
@@ -951,7 +1280,7 @@ TEST_F(CacheSlotTest, PinCellsWithCancellationToken) {
 
     translator_->ResetCounters();
     auto future = cache_slot_->PinCells(op_ctx.get(), {target_uid});
-    auto accessor = SemiInlineGet(std::move(future));
+    auto accessor = folly::coro::blockingWait(std::move(future));
 
     ASSERT_NE(accessor, nullptr);
     ASSERT_EQ(translator_->GetCellsCallCount(), 1);
@@ -981,7 +1310,7 @@ TEST_F(CacheSlotTest, PinCellsWithShortTimeout) {
 
     // First pin some cells to fill the cache
     auto future1 = cache_slot_short_timeout->PinCells(op_ctx.get(), {10});  // cid 0, size 50
-    auto accessor1 = SemiInlineGet(std::move(future1));
+    auto accessor1 = folly::coro::blockingWait(std::move(future1));
     ASSERT_NE(accessor1, nullptr);
 
     // Keep accessor1 alive to prevent eviction, then try to pin a large cell
@@ -1042,7 +1371,7 @@ TEST_F(CacheSlotTest, PinAllCellsWithCancellationToken) {
 
     translator_->ResetCounters();
     auto future = cache_slot_->PinAllCells(op_ctx.get());
-    auto accessor = SemiInlineGet(std::move(future));
+    auto accessor = folly::coro::blockingWait(std::move(future));
 
     ASSERT_NE(accessor, nullptr);
     ASSERT_EQ(translator_->GetCellsCallCount(), 1);
@@ -1139,7 +1468,7 @@ TEST_P(CacheSlotConcurrentTest, ConcurrentAccessMultipleSlots) {
                 int expected_data = static_cast<int>(expected_cid * 10);
 
                 try {
-                    auto accessor = current_slot->PinCells(op_ctx.get(), {target_uid}).get();
+                    auto accessor = folly::coro::blockingWait(current_slot->PinCells(op_ctx.get(), {target_uid}));
 
                     if (!accessor) {
                         ADD_FAILURE() << "T" << tid << " Op" << j << ": PinCells returned null accessor for UID "
@@ -1213,7 +1542,7 @@ TEST_P(CacheSlotConcurrentTest, ConcurrentAccessMultipleSlots) {
             cid_t expected_cid = uid_map_3.at(target_uid);
             int expected_data = static_cast<int>(expected_cid * 10);
             try {
-                auto accessor = slot3->PinCells(op_ctx.get(), {target_uid}).get();
+                auto accessor = folly::coro::blockingWait(slot3->PinCells(op_ctx.get(), {target_uid}));
                 if (!accessor) {
                     ADD_FAILURE() << "T" << tid << " Op" << j << ": PinCells returned null accessor for UID "
                                   << target_uid;
@@ -1364,7 +1693,7 @@ class MockTranslatorWithWarmup : public Translator<TestCell> {
         return {};
     }
 
-    std::vector<std::pair<cid_t, std::unique_ptr<TestCell>>>
+    folly::coro::Task<std::vector<std::pair<cid_t, std::unique_ptr<TestCell>>>>
     get_cells(milvus::OpContext* ctx, const std::vector<cid_t>& cids) override {
         get_cells_call_count_++;
         if (shared_call_counter_) {
@@ -1411,7 +1740,7 @@ class MockTranslatorWithWarmup : public Translator<TestCell> {
             load_completed_promise_ = nullptr;
         }
 
-        return result;
+        co_return result;
     }
 
     void
@@ -1531,7 +1860,7 @@ TEST(ManagerCreateCacheSlotTest, NullCtxWorksNormally) {
     auto cache_slot =
         std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
                                               std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
-    cache_slot->Warmup(nullptr);
+    folly::coro::blockingWait(cache_slot->Warmup(nullptr));
 
     EXPECT_EQ(cache_slot->num_cells(), 2);
 }
@@ -1554,7 +1883,7 @@ TEST(ManagerCreateCacheSlotTest, ValidCtxWorksNormally) {
     auto cache_slot =
         std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
                                               std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
-    cache_slot->Warmup(op_ctx.get());
+    folly::coro::blockingWait(cache_slot->Warmup(op_ctx.get()));
 
     EXPECT_EQ(cache_slot->num_cells(), 2);
 }
@@ -1576,7 +1905,7 @@ TEST(WarmupTest, WarmupPassesCtxToGetCells) {
     auto cache_slot =
         std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
                                               std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
-    cache_slot->Warmup(op_ctx.get());
+    folly::coro::blockingWait(cache_slot->Warmup(op_ctx.get()));
 
     // Verify that get_cells was called (warmup loaded the cells)
     EXPECT_EQ(translator_ptr->GetCellsCallCount(), 1);
@@ -1606,7 +1935,7 @@ TEST(WarmupTraceContextTest, SyncWarmupPassesTraceContext) {
     auto op_ctx = std::make_unique<milvus::OpContext>();
     op_ctx->SetTraceContext(trace_ctx);
 
-    cache_slot->Warmup(op_ctx.get());
+    folly::coro::blockingWait(cache_slot->Warmup(op_ctx.get()));
 
     EXPECT_EQ(translator_ptr->GetLastCtx(), op_ctx.get());
     EXPECT_TRUE(translator_ptr->LastCtxHasTrace());
@@ -1638,7 +1967,7 @@ TEST(WarmupTest, WarmupWithCancelledCtxDuringLoadingThrows) {
                                               std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
 
     // Warmup should throw because cancellation will be requested during loading
-    EXPECT_THROW(cache_slot->Warmup(op_ctx.get()), std::runtime_error);
+    EXPECT_THROW(folly::coro::blockingWait(cache_slot->Warmup(op_ctx.get())), std::runtime_error);
 }
 
 // Test that Warmup with nullptr ctx and EveryLoad policy works (no crash)
@@ -1656,7 +1985,7 @@ TEST(WarmupTest, WarmupWithNullCtxAndEveryLoadPolicyWorks) {
     auto cache_slot =
         std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
                                               std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
-    EXPECT_NO_THROW(cache_slot->Warmup(nullptr));
+    EXPECT_NO_THROW(folly::coro::blockingWait(cache_slot->Warmup(nullptr)));
 
     // Verify that get_cells was called
     EXPECT_EQ(translator_ptr->GetCellsCallCount(), 1);
@@ -1718,7 +2047,7 @@ TEST(AsyncWarmupTest, AsyncWarmupWithPrefetchPoolLoadsInBackground) {
                                               std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
 
     // Warmup should return immediately (async)
-    cache_slot->Warmup(nullptr, prefetch_pool);
+    folly::coro::blockingWait(cache_slot->Warmup(nullptr, prefetch_pool));
 
     // Wait for async warmup to complete using synchronization
     ASSERT_EQ(load_completed_future.wait_for(std::chrono::seconds(5)), std::future_status::ready);
@@ -1761,7 +2090,7 @@ TEST(AsyncWarmupTest, AsyncWarmupWithoutPoolFallsBackToSync) {
 
     // Warmup with nullptr pool should fall back to sync and block
     auto start = std::chrono::steady_clock::now();
-    cache_slot->Warmup(nullptr, nullptr);  // No prefetch pool
+    folly::coro::blockingWait(cache_slot->Warmup(nullptr, nullptr));  // No prefetch pool
     auto warmup_duration = std::chrono::steady_clock::now() - start;
 
     // Should have blocked for the load duration (sync fallback)
@@ -1798,7 +2127,7 @@ TEST(AsyncWarmupTest, AsyncWarmupDoesNotCaptureCallerCtx) {
     // Create a context (should NOT be passed to async warmup)
     auto op_ctx = std::make_unique<milvus::OpContext>();
 
-    cache_slot->Warmup(op_ctx.get(), prefetch_pool);
+    folly::coro::blockingWait(cache_slot->Warmup(op_ctx.get(), prefetch_pool));
 
     // Wait for async warmup to complete using synchronization
     ASSERT_EQ(load_completed_future.wait_for(std::chrono::seconds(5)), std::future_status::ready);
@@ -1841,7 +2170,7 @@ TEST(AsyncWarmupTest, AsyncWarmupSkipsIfSlotDestroyed) {
                                                   std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
 
         // Start async warmup - task is queued behind the blocking task
-        cache_slot->Warmup(nullptr, prefetch_pool);
+        folly::coro::blockingWait(cache_slot->Warmup(nullptr, prefetch_pool));
 
         // The slot will be destroyed here, while the warmup task is still queued
     }  // cache_slot destroyed here, translator destroyed too
@@ -1883,7 +2212,7 @@ TEST(AsyncWarmupTest, AccessDuringAsyncWarmupBlocks) {
                                               std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
 
     // Start async warmup
-    cache_slot->Warmup(nullptr, prefetch_pool);
+    folly::coro::blockingWait(cache_slot->Warmup(nullptr, prefetch_pool));
 
     // Wait for loading to actually start before accessing
     ASSERT_EQ(load_started_future.wait_for(std::chrono::seconds(5)), std::future_status::ready);
@@ -1937,7 +2266,7 @@ TEST(AsyncWarmupTest, CancelWarmupStopsAsyncWarmup) {
                                               std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
 
     // Start async warmup
-    cache_slot->Warmup(nullptr, prefetch_pool);
+    folly::coro::blockingWait(cache_slot->Warmup(nullptr, prefetch_pool));
 
     // Wait for loading to start
     ASSERT_EQ(load_started_future.wait_for(std::chrono::seconds(5)), std::future_status::ready);
@@ -1980,7 +2309,7 @@ TEST(AsyncWarmupTest, CancelWarmupBeforeStartPreventsLoading) {
                                               std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
 
     // Queue async warmup (blocked behind the blocker task)
-    cache_slot->Warmup(nullptr, prefetch_pool);
+    folly::coro::blockingWait(cache_slot->Warmup(nullptr, prefetch_pool));
 
     // Cancel before the warmup task gets to run
     cache_slot->CancelWarmup();
@@ -2023,7 +2352,7 @@ TEST(AsyncWarmupTest, AsyncWarmupDoesNotInheritTraceContext) {
     auto op_ctx = std::make_unique<milvus::OpContext>();
     op_ctx->SetTraceContext(trace_ctx);
 
-    cache_slot->Warmup(op_ctx.get(), prefetch_pool);
+    folly::coro::blockingWait(cache_slot->Warmup(op_ctx.get(), prefetch_pool));
     ASSERT_EQ(load_started_future.wait_for(std::chrono::seconds(5)), std::future_status::ready);
     prefetch_pool->join();
 
@@ -2051,7 +2380,7 @@ TEST(AsyncWarmupTest, SyncWarmupStillWorks) {
     auto op_ctx = std::make_unique<milvus::OpContext>();
 
     // Sync warmup should load cells synchronously (even with prefetch pool provided)
-    cache_slot->Warmup(op_ctx.get(), prefetch_pool);
+    folly::coro::blockingWait(cache_slot->Warmup(op_ctx.get(), prefetch_pool));
 
     // Cells should be loaded immediately after Warmup returns
     EXPECT_EQ(translator_ptr->GetCellsCallCount(), 1);
@@ -2087,7 +2416,7 @@ TEST(AsyncWarmupTest, DisabledWarmupStillWorks) {
                                               std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
 
     // Disabled warmup should not load any cells
-    cache_slot->Warmup(nullptr, prefetch_pool);
+    folly::coro::blockingWait(cache_slot->Warmup(nullptr, prefetch_pool));
 
     EXPECT_EQ(translator_ptr->GetCellsCallCount(), 0);
 
@@ -2130,7 +2459,7 @@ TEST(WarmupTimeoutTest, SyncWarmupBestEffortFailsAtZeroTimeout) {
 
     // Warmup should fail immediately (zero timeout = no queue) and throw
     auto start = std::chrono::steady_clock::now();
-    EXPECT_THROW(cache_slot->Warmup(nullptr), std::exception);
+    EXPECT_THROW(folly::coro::blockingWait(cache_slot->Warmup(nullptr)), std::exception);
     auto duration = std::chrono::steady_clock::now() - start;
     EXPECT_LT(duration, std::chrono::milliseconds(50));
 
@@ -2164,7 +2493,7 @@ TEST(WarmupTimeoutTest, AsyncWarmupBestEffortResourceUnavailable) {
                                               std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
 
     // Async warmup dispatches to thread pool, should not throw here
-    EXPECT_NO_THROW(cache_slot->Warmup(nullptr, prefetch_pool));
+    EXPECT_NO_THROW(folly::coro::blockingWait(cache_slot->Warmup(nullptr, prefetch_pool)));
 
     // Wait for async task to complete
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -2198,7 +2527,7 @@ TEST(WarmupTimeoutTest, CellsLoadableAfterWarmupFailure) {
                                               std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
 
     // Warmup fails (zero timeout, resources unavailable)
-    EXPECT_THROW(cache_slot->Warmup(nullptr), std::exception);
+    EXPECT_THROW(folly::coro::blockingWait(cache_slot->Warmup(nullptr)), std::exception);
     EXPECT_EQ(translator_ptr->GetCellsCallCount(), 0);
 
     // Free pre-reserved resources so normal loading can proceed
@@ -2234,7 +2563,7 @@ TEST(WarmupTimeoutTest, SyncWarmupBestEffortResourceAvailable) {
         std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
                                               std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
 
-    EXPECT_NO_THROW(cache_slot->Warmup(nullptr));
+    EXPECT_NO_THROW(folly::coro::blockingWait(cache_slot->Warmup(nullptr)));
     EXPECT_EQ(translator_ptr->GetCellsCallCount(), 1);
 
     auto op_ctx = std::make_unique<milvus::OpContext>();
@@ -2609,7 +2938,7 @@ TEST(CacheSlotBorrowTest, TryBorrowCellReturnsResidentCellAfterWarmup) {
 
     EXPECT_EQ(cache_slot->TryBorrowCell(0), nullptr) << "must not borrow before warmup sets skip_pin_";
 
-    cache_slot->Warmup(nullptr);
+    folly::coro::blockingWait(cache_slot->Warmup(nullptr));
 
     for (cl_uid_t uid : {0, 1}) {
         auto* borrowed = cache_slot->TryBorrowCell(uid);

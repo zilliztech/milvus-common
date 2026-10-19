@@ -27,6 +27,12 @@ using namespace cachinglayer;
 namespace cachinglayer::internal {
 class DListTestFriend {
  public:
+    static size_t
+    get_waiting_request_count(const DList& dlist) {
+        std::lock_guard lock(dlist.list_mtx_);
+        return dlist.waiting_requests_map_.size();
+    }
+
     static ResourceUsage
     get_using_memory(const DList& dlist) {
         return dlist.total_loaded_size_.load() + dlist.total_loading_size_.load();

@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include <folly/coro/Task.h>
+
 #include <memory>
 #include <optional>
 #include <string>
@@ -101,8 +103,14 @@ class Translator {
     virtual int64_t
     cells_storage_bytes(const std::vector<cid_t>& cids) const = 0;
 
-    // extra cells strategy should be added in cell_ids_to_be_loaded(), get_cells() should just a load executor.
-    virtual std::vector<std::pair<cid_t, std::unique_ptr<CellT>>>
+    /**
+     * @brief Load the requested cells on the awaiting caller's executor.
+     * @param ctx Borrowed operation context, valid until completion; may be null.
+     * @param cids Borrowed cell IDs, valid until completion.
+     * @note Drain issued work before returning or throwing. Blocking I/O must be
+     * offloaded by the implementation. Extra cells belong in bonus_cells_to_be_loaded().
+     */
+    virtual folly::coro::Task<std::vector<std::pair<cid_t, std::unique_ptr<CellT>>>>
     get_cells(OpContext* ctx, const std::vector<cid_t>& cids) = 0;
     virtual ~Translator() = default;
 };
