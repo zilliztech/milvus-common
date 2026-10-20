@@ -530,7 +530,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                 ThrowInfo(ErrorCode::FollyCancel, "Operation cancelled, stop loading cache cells");
             }
             start = std::chrono::steady_clock::now();
-            auto results = co_await translator_->get_cells(ctx, loading_cids);
+            auto results = co_await translator_->get_cells_async(ctx, loading_cids);
             auto latency =
                 std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start);
             for (auto& result : results) {

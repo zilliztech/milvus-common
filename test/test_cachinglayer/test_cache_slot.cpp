@@ -162,7 +162,7 @@ class MockTranslator : public Translator<TestCell> {
         return {total_bonus_cids_set.begin(), total_bonus_cids_set.end()};
     }
 
-    folly::coro::Task<std::vector<std::pair<cid_t, std::unique_ptr<TestCell>>>>
+    std::vector<std::pair<cid_t, std::unique_ptr<TestCell>>>
     get_cells(milvus::OpContext* ctx, const std::vector<cid_t>& cids) override {
         if (!for_concurrent_test_) {
             get_cells_call_count_++;
@@ -191,7 +191,7 @@ class MockTranslator : public Translator<TestCell> {
             result.emplace_back(cid, std::make_unique<TestCell>(static_cast<int>(cid * 10), cid,
                                                                 estimated_byte_size_of_cell(cid).first));
         }
-        co_return result;
+        return result;
     }
 
     void
@@ -308,14 +308,14 @@ class DiskShardTranslator : public Translator<TestCell> {
         return &meta_;
     }
 
-    folly::coro::Task<std::vector<std::pair<cid_t, std::unique_ptr<TestCell>>>>
+    std::vector<std::pair<cid_t, std::unique_ptr<TestCell>>>
     get_cells(milvus::OpContext*, const std::vector<cid_t>& cids) override {
         std::vector<std::pair<cid_t, std::unique_ptr<TestCell>>> result;
         result.reserve(cids.size());
         for (const auto& cid : cids) {
             result.emplace_back(cid, std::make_unique<TestCell>(static_cast<int>(cid), cid, cell_sizes_.at(cid)));
         }
-        co_return result;
+        return result;
     }
 
  private:
@@ -452,8 +452,25 @@ class GatedTranslator : public MockTranslator {
         meta()->cache_warmup_policy = policy;
     }
 
-    folly::coro::Task<std::vector<std::pair<cid_t, std::unique_ptr<TestCell>>>>
+    const std::vector<cid_t>* expected_cids = nullptr;
+
+    std::vector<std::pair<cid_t, std::unique_ptr<TestCell>>>
     get_cells(milvus::OpContext* ctx, const std::vector<cid_t>& cids) override {
+        return folly::coro::blockingWait(LoadCells(ctx, cids));
+    }
+
+    folly::coro::Task<std::vector<std::pair<cid_t, std::unique_ptr<TestCell>>>>
+    get_cells_async(milvus::OpContext* ctx, const std::vector<cid_t>& cids) override {
+        return LoadCells(ctx, cids);
+    }
+
+ private:
+    folly::coro::Task<std::vector<std::pair<cid_t, std::unique_ptr<TestCell>>>>
+    LoadCells(milvus::OpContext* ctx, const std::vector<cid_t>& cids) {
+        if (expected_cids) {
+            EXPECT_EQ(&cids, expected_cids);
+            EXPECT_EQ(cids.data(), expected_cids->data());
+        }
         if (gate_->calls.fetch_add(1) == 0) {
             gate_->entered.set_value();
         }
@@ -464,10 +481,9 @@ class GatedTranslator : public MockTranslator {
         if (gate_->fail) {
             throw std::runtime_error("gated cache load failed");
         }
-        co_return co_await MockTranslator::get_cells(ctx, cids);
+        co_return MockTranslator::get_cells(ctx, cids);
     }
 
- private:
     std::shared_ptr<CacheLoadGate> gate_;
 };
 
@@ -491,6 +507,57 @@ class CoroutineCacheTest : public ::testing::Test {
                                                      true, true, std::chrono::seconds(5), std::chrono::seconds(5));
     }
 };
+
+TEST_F(CoroutineCacheTest, LegacyTranslatorAsyncFallbackBorrowsInputs) {
+    class LegacyTranslator : public MockTranslator {
+     public:
+        using MockTranslator::MockTranslator;
+        milvus::OpContext* expected_ctx = nullptr;
+        const std::vector<cid_t>* expected_cids = nullptr;
+
+        std::vector<std::pair<cid_t, std::unique_ptr<TestCell>>>
+        get_cells(milvus::OpContext* ctx, const std::vector<cid_t>& cids) override {
+            EXPECT_EQ(ctx, expected_ctx);
+            EXPECT_EQ(&cids, expected_cids);
+            EXPECT_EQ(cids.data(), expected_cids->data());
+            return MockTranslator::get_cells(ctx, cids);
+        }
+    };
+    LegacyTranslator legacy({{0, 100}}, {{0, 0}}, "legacy_slot", StorageType::MEMORY);
+    milvus::OpContext ctx;
+    const std::vector<cid_t> cids{0};
+    legacy.expected_ctx = &ctx;
+    legacy.expected_cids = &cids;
+    Translator<TestCell>& translator = legacy;
+    EXPECT_EQ(translator.get_cells(&ctx, cids).size(), 1);
+    auto task = translator.get_cells_async(&ctx, cids);
+    EXPECT_EQ(legacy.GetCellsCallCount(), 1);
+    EXPECT_EQ(folly::coro::blockingWait(std::move(task)).size(), 1);
+    EXPECT_EQ(legacy.GetCellsCallCount(), 2);
+    legacy.SetShouldThrow(true);
+    auto failed = translator.get_cells_async(&ctx, cids);
+    EXPECT_EQ(legacy.GetCellsCallCount(), 2);
+    EXPECT_THROW(folly::coro::blockingWait(std::move(failed)), std::runtime_error);
+}
+
+TEST_F(CoroutineCacheTest, AsyncTranslatorRetainsSynchronousEntryPoint) {
+    auto gate = std::make_shared<CacheLoadGate>();
+    gate->finish.post();
+    GatedTranslator implementation(gate);
+    Translator<TestCell>& translator = implementation;
+    const std::vector<cid_t> cids{0};
+    implementation.expected_cids = &cids;
+    EXPECT_EQ(translator.get_cells(nullptr, cids).size(), 1);
+    EXPECT_EQ(gate->calls, 1);
+    EXPECT_EQ(folly::coro::blockingWait(translator.get_cells_async(nullptr, cids)).size(), 1);
+    EXPECT_EQ(gate->calls, 2);
+    // Even the legacy fallback reaches the private load implementation without recursion.
+    EXPECT_EQ(folly::coro::blockingWait(implementation.Translator<TestCell>::get_cells_async(nullptr, cids)).size(), 1);
+    EXPECT_EQ(gate->calls, 3);
+    gate->fail = true;
+    EXPECT_THROW(translator.get_cells(nullptr, cids), std::runtime_error);
+    EXPECT_EQ(gate->calls, 4);
+}
 
 TEST_F(CoroutineCacheTest, SuspendedLoadAndSharedWaitLeaveWorkerAvailable) {
     auto gate = std::make_shared<CacheLoadGate>();
@@ -1879,7 +1946,7 @@ class MockTranslatorWithWarmup : public Translator<TestCell> {
         return {};
     }
 
-    folly::coro::Task<std::vector<std::pair<cid_t, std::unique_ptr<TestCell>>>>
+    std::vector<std::pair<cid_t, std::unique_ptr<TestCell>>>
     get_cells(milvus::OpContext* ctx, const std::vector<cid_t>& cids) override {
         get_cells_call_count_++;
         if (shared_call_counter_) {
@@ -1926,7 +1993,7 @@ class MockTranslatorWithWarmup : public Translator<TestCell> {
             load_completed_promise_ = nullptr;
         }
 
-        co_return result;
+        return result;
     }
 
     void
