@@ -25,6 +25,14 @@ struct FileMeta {
     size_t file_size;
 };
 
+struct OutputStreamOptions {
+    // Expected serialized size in bytes; zero means unknown, not a size limit.
+    size_t expected_size = 0;
+    // Allow build managers to stage output in memory instead of a local file.
+    // Managers writing directly to their backing storage may ignore this hint.
+    bool use_memory = false;
+};
+
 /**
  * @brief This FileManager is used to manage file, including its replication, backup, ect.
  * It will act as a cloud-like client, and Knowhere need to call load/add to better support
@@ -92,11 +100,12 @@ class FileManager {
      * @brief Open a file as an output stream.
      *
      * @param filename
-     * @param file_size Expected file size in bytes; 0 means unknown. Implementations may use it to reserve storage.
+     * @param options Storage reservation and optional in-memory staging. Defaults preserve the manager's backing
+     * storage.
      * @return a shared pointer to the output stream.
      */
     virtual std::shared_ptr<OutputStream>
-    OpenOutputStream(const std::string& filename, size_t file_size = 0) = 0;
+    OpenOutputStream(const std::string& filename, OutputStreamOptions options = {}) = 0;
 
     /**
      * @brief Open a fully initialized input stream without blocking the calling worker on IO.
