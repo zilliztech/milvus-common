@@ -852,6 +852,70 @@ TEST_F(CoroutineCacheTest, InlineReservationCompletionCanFinishLoad) {
     }
 }
 
+TEST_F(CoroutineCacheTest, SemiInlineGetKeepsQueuedLegacyLoadsOnCaller) {
+    for (const bool pin_all : {false, true}) {
+        for (const bool fail : {false, true}) {
+            SCOPED_TRACE(pin_all);
+            SCOPED_TRACE(fail);
+            const ResourceUsage held{4096, 0};
+            ASSERT_TRUE(SemiInlineGet(dlist->ReserveLoadingResourceWithTimeout(held, std::chrono::milliseconds(0))));
+            auto translator = std::make_unique<MockTranslator>(std::vector<std::pair<cid_t, int64_t>>{{0, 100}},
+                                                               std::unordered_map<cl_uid_t, cid_t>{{0, 0}},
+                                                               "queued_sync_load", StorageType::MEMORY);
+            std::promise<std::thread::id> caller_thread;
+            auto caller_id = caller_thread.get_future();
+            std::promise<std::thread::id> loading_thread;
+            auto loading_id = loading_thread.get_future();
+            std::promise<void> finish;
+            auto finish_load = finish.get_future().share();
+            translator->SetLoadStartCallback([&] {
+                loading_thread.set_value(std::this_thread::get_id());
+                finish_load.wait();
+            });
+            translator->SetShouldThrow(fail);
+            auto slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                                              std::chrono::seconds(5), std::chrono::seconds(5));
+            std::future<std::shared_ptr<CellAccessor<TestCell>>> caller;
+            std::future<void> notifier;
+            bool release_started = false;
+            auto cleanup = folly::makeGuard([&] {
+                finish.set_value();
+                if (!release_started) {
+                    dlist->ReleaseLoadingResource(held);
+                }
+            });
+            caller = std::async(std::launch::async, [&] {
+                caller_thread.set_value(std::this_thread::get_id());
+                return SemiInlineGet(pin_all ? slot->PinAllCells(nullptr) : slot->PinCells(nullptr, {0}));
+            });
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (DListTestFriend::get_waiting_request_count(*dlist) == 0 &&
+                   std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::yield();
+            }
+            ASSERT_EQ(DListTestFriend::get_waiting_request_count(*dlist), 1);
+            notifier = std::async(std::launch::async, [&] { dlist->ReleaseLoadingResource(held); });
+            release_started = true;
+            ASSERT_EQ(loading_id.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+            EXPECT_EQ(loading_id.get(), caller_id.get());
+            // A slow synchronous fetch must not hold up the thread publishing its reservation.
+            EXPECT_EQ(notifier.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+            EXPECT_EQ(caller.wait_for(std::chrono::milliseconds(0)), std::future_status::timeout);
+            finish.set_value();
+            cleanup.dismiss();
+            notifier.get();
+            if (fail) {
+                EXPECT_THROW(caller.get(), std::runtime_error);
+                EXPECT_FALSE(slot->IsCached(0));
+            } else {
+                EXPECT_NE(caller.get()->get_cell_of(0), nullptr);
+            }
+            EXPECT_EQ(DListTestFriend::get_waiting_request_count(*dlist), 0);
+            EXPECT_EQ(DListTestFriend::get_loading_memory(*dlist), ResourceUsage{});
+        }
+    }
+}
+
 TEST_F(CoroutineCacheTest, NodeReleaseAllowsInlineReservationReentry) {
     for (const bool evictable : {false, true}) {
         SCOPED_TRACE(evictable);
