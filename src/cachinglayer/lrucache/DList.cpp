@@ -54,6 +54,33 @@ RequestLocalLoading(const ResourceUsage& loaded, const ResourceUsage& overhead, 
 
 }  // namespace
 
+// Drain on the notifying thread; splice keeps recursive publication allocation-free.
+DList::WaitingRequestCompletions::~WaitingRequestCompletions() {
+    if (batches_.empty() || batches_.front().empty()) {
+        return;
+    }
+    static thread_local std::list<std::vector<Completion>> pending;
+    static thread_local bool publishing = false;
+    pending.splice(pending.end(), batches_);
+    if (publishing) {
+        return;
+    }
+
+    publishing = true;
+    while (!pending.empty()) {
+        auto entries = std::move(pending.front());
+        pending.pop_front();
+        for (auto& completion : entries) {
+            if (completion.resource_promise.valid()) {
+                completion.resource_promise.setValue(completion.result);
+            } else if (completion.bool_promise.valid()) {
+                completion.bool_promise.setValue(completion.result.success);
+            }
+        }
+    }
+    publishing = false;
+}
+
 LoadingOverheadGroupHandle
 DList::CreateLoadingOverheadGroup(LoadingOverheadDimension dimension, LoadingOverheadPolicy policy) {
     if (dimension != LoadingOverheadDimension::kMemory && dimension != LoadingOverheadDimension::kFile) {
@@ -979,7 +1006,7 @@ DList::handleWaitingRequests(WaitingRequestCompletions& completions) {
             break;
         }
         // Allocate completion storage before claiming a request or reserving its resources.
-        auto& completion = completions.entries.emplace_back();
+        auto& completion = completions.Entries().emplace_back();
         auto& request_ptr_ref = const_cast<std::unique_ptr<WaitingRequest>&>(waiting_queue_.top());
 
         // Check if request was already handled by timeout/cancel (not in map anymore)
@@ -1108,7 +1135,7 @@ DList::handleWaitingRequests(WaitingRequestCompletions& completions) {
             }
             LOG_DEBUG("[MCL] Request {} of size {} cannot be satisfied, checking peers with the same deadline.",
                       request->request_id, required_size.ToString());
-            completions.entries.pop_back();
+            completions.Entries().pop_back();
         }
     }
 }
@@ -1119,7 +1146,7 @@ DList::failWaitingRequest(uint64_t request_id, const char* reason, WaitingReques
     if (it == waiting_requests_map_.end()) {
         return;
     }
-    auto& completion = completions.entries.emplace_back();
+    auto& completion = completions.Entries().emplace_back();
     LOG_WARN("[MCL] Waiting request {} {}.", request_id, reason);
     completion.SetResult(*it->second, false);
     waiting_requests_map_.erase(it);
@@ -1132,7 +1159,7 @@ DList::clearWaitingQueue() {
     {
         std::unique_lock<std::mutex> lock(list_mtx_);
         while (!waiting_queue_.empty()) {
-            auto& completion = completions.entries.emplace_back();
+            auto& completion = completions.Entries().emplace_back();
             completion.retired = std::move(const_cast<std::unique_ptr<WaitingRequest>&>(waiting_queue_.top()));
             waiting_queue_.pop();
             auto& request = completion.retired;

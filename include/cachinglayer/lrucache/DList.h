@@ -21,6 +21,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <list>
 #include <mutex>
 #include <optional>
 #include <queue>
@@ -261,6 +262,8 @@ class DList : public std::enable_shared_from_this<DList> {
      * @brief Own claimed promises and retired requests until the DList lock is released.
      * Declare before acquiring list_mtx_: destruction publishes results and destroys
      * cancellation callbacks outside the lock, including during exception unwinding.
+     * Nested publication transfers ownership to the outer publisher on the same thread.
+     * Inline consumers must not synchronously wait for notifications deferred by their own callback.
      */
     struct WaitingRequestCompletions {
         struct Completion {
@@ -279,17 +282,19 @@ class DList : public std::enable_shared_from_this<DList> {
             }
         };
 
-        ~WaitingRequestCompletions() {
-            for (auto& completion : entries) {
-                if (completion.resource_promise.valid()) {
-                    completion.resource_promise.setValue(completion.result);
-                } else if (completion.bool_promise.valid()) {
-                    completion.bool_promise.setValue(completion.result.success);
-                }
+        ~WaitingRequestCompletions();
+
+        // Allocate a transferable batch before claiming promises or reserving resources.
+        std::vector<Completion>&
+        Entries() {
+            if (batches_.empty()) {
+                batches_.emplace_back();
             }
+            return batches_.front();
         }
 
-        std::vector<Completion> entries;
+     private:
+        std::list<std::vector<Completion>> batches_;
     };
 
     struct LoadingResourceReservationAttempt {
