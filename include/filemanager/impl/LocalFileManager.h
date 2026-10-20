@@ -44,7 +44,8 @@ class LocalFileManager : public FileManager {
     OpenInputStream(const std::string& filename) -> std::shared_ptr<InputStream> override;
 
     auto
-    OpenOutputStream(const std::string& filename, size_t file_size = 0) -> std::shared_ptr<OutputStream> override;
+    OpenOutputStream(const std::string& filename,
+                     OutputStreamOptions options = {}) -> std::shared_ptr<OutputStream> override;
 
     ~LocalFileManager() override = default;
 
