@@ -533,22 +533,96 @@ TEST_F(CoroutineCacheTest, SharedFailureReleasesResourcesAndAllowsRetry) {
     EXPECT_EQ(gate->calls, 2);
 }
 
-TEST_F(CoroutineCacheTest, TaskOwnsSlotAndIdsBeforeStarting) {
-    auto gate = std::make_shared<CacheLoadGate>();
-    gate->finish.post();
-    auto slot = MakeSlot(gate);
+class MappingTranslator : public MockTranslator {
+ public:
+    using MockTranslator::MockTranslator;
+
+    cid_t
+    cell_id_of(cl_uid_t uid) const override {
+        ++mapping_calls;
+        if (fail_mapping) {
+            throw std::runtime_error("mapping failed");
+        }
+        return MockTranslator::cell_id_of(uid);
+    }
+
+    mutable size_t mapping_calls = 0;
+    bool fail_mapping = false;
+};
+
+TEST_F(CoroutineCacheTest, TaskOwnsSlotAndResolvedIdsBeforeStarting) {
+    auto translator = std::make_unique<MappingTranslator>(std::vector<std::pair<cid_t, int64_t>>{{0, 100}},
+                                                          std::unordered_map<cl_uid_t, cid_t>{{10, 0}, {11, 0}},
+                                                          "mapping_slot", StorageType::MEMORY);
+    auto* mapping = translator.get();
+    auto slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                                      std::chrono::seconds(5), std::chrono::seconds(5));
     std::weak_ptr<CacheSlot<TestCell>> weak = slot;
-    std::vector<cl_uid_t> ids{0};
-    auto pin = slot->PinCells(nullptr, ids);
-    ids[0] = 999;
+    auto pin = [&] {
+        const std::vector<cl_uid_t> ids{10, 11, 10};
+        return slot->PinCells(nullptr, ids);
+    }();
+    EXPECT_EQ(mapping->mapping_calls, 3);
+    EXPECT_EQ(mapping->GetCellsCallCount(), 0);
     slot.reset();
     EXPECT_FALSE(weak.expired());
-    EXPECT_EQ(gate->calls, 0);
     auto accessor = folly::coro::blockingWait(std::move(pin));
-    EXPECT_NE(accessor->get_cell_of(0), nullptr);
+    EXPECT_NE(accessor->get_ith_cell(0), nullptr);
+    EXPECT_EQ(mapping->mapping_calls, 3);
+    ASSERT_EQ(mapping->GetRequestedCids(), (std::vector<std::vector<cid_t>>{{0}}));
     EXPECT_FALSE(weak.expired());
     accessor.reset();
     EXPECT_TRUE(weak.expired());
+}
+
+TEST_F(CoroutineCacheTest, MappingFailurePrecedesTaskCreationAndAllowsRetry) {
+    auto translator = std::make_unique<MappingTranslator>(std::vector<std::pair<cid_t, int64_t>>{{0, 100}},
+                                                          std::unordered_map<cl_uid_t, cid_t>{{10, 0}},
+                                                          "mapping_failure_slot", StorageType::MEMORY);
+    auto* mapping = translator.get();
+    auto slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                                      std::chrono::seconds(5), std::chrono::seconds(5));
+    mapping->fail_mapping = true;
+    EXPECT_THROW(static_cast<void>(slot->PinCells(nullptr, {10})), std::runtime_error);
+    EXPECT_THROW(slot->PinCellsDirect(nullptr, {10}), std::runtime_error);
+    EXPECT_EQ(mapping->GetCellsCallCount(), 0);
+    EXPECT_FALSE(slot->IsCached(0));
+    mapping->fail_mapping = false;
+    EXPECT_NE(folly::coro::blockingWait(slot->PinCells(nullptr, {10})), nullptr);
+    EXPECT_NE(slot->PinCellsDirect(nullptr, {10}), nullptr);
+    EXPECT_EQ(mapping->GetCellsCallCount(), 1);
+}
+
+TEST_F(CoroutineCacheTest, PinBuiltInMappingsHandleEmptyDuplicateAndResidentIds) {
+    for (const auto mode : {CellIdMappingMode::IDENTICAL, CellIdMappingMode::ALWAYS_ZERO}) {
+        for (const bool direct : {false, true}) {
+            SCOPED_TRACE(static_cast<int>(mode));
+            SCOPED_TRACE(direct);
+            auto translator = std::make_unique<MappingTranslator>(
+                std::vector<std::pair<cid_t, int64_t>>{{0, 100}, {1, 100}}, std::unordered_map<cl_uid_t, cid_t>{},
+                "builtin_mapping_slot", StorageType::MEMORY);
+            auto* mapping = translator.get();
+            translator->meta()->cell_id_mapping_mode = mode;
+            auto slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                                              std::chrono::seconds(5), std::chrono::seconds(5));
+            auto pin = [&](const std::vector<cl_uid_t>& ids) {
+                return direct ? slot->PinCellsDirect(nullptr, ids)
+                              : folly::coro::blockingWait(slot->PinCells(nullptr, ids));
+            };
+            EXPECT_NE(pin({}), nullptr);
+            EXPECT_EQ(mapping->GetCellsCallCount(), 0);
+            const auto ids = mode == CellIdMappingMode::ALWAYS_ZERO ? std::vector<cl_uid_t>(1000000, 999)
+                                                                    : std::vector<cl_uid_t>{1, 0, 1};
+            EXPECT_NE(pin(ids), nullptr);
+            EXPECT_NE(pin(ids), nullptr);
+            EXPECT_EQ(mapping->mapping_calls, 0);
+            ASSERT_EQ(mapping->GetCellsCallCount(), 1);
+            auto requested = mapping->GetRequestedCids().at(0);
+            std::sort(requested.begin(), requested.end());
+            EXPECT_EQ(requested,
+                      mode == CellIdMappingMode::ALWAYS_ZERO ? std::vector<cid_t>{0} : (std::vector<cid_t>{0, 1}));
+        }
+    }
 }
 
 TEST_F(CoroutineCacheTest, CancelledLoadDrainsBeforeReleasingReservation) {

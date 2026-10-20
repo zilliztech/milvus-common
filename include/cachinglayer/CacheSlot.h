@@ -153,14 +153,15 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         return cells_[cell_id_of(uid)]->cell();
     }
 
-    /// Own the requested IDs and await their pins, borrowing ctx until completion.
+    /// Resolve and deduplicate UIDs now (may throw); the task owns cell IDs and borrows ctx.
+    /// Pinning and loading start when the task runs.
     folly::coro::Task<std::shared_ptr<CellAccessor<CellT>>>
     PinCells(OpContext* ctx, const std::vector<uid_t>& uids) {
         if (skip_pin_.load(std::memory_order_acquire)) {
             return PinAllCellsImpl(this->shared_from_this(), ctx);
         }
         RecordAccessEvent();
-        return PinCellsImpl(this->shared_from_this(), ctx, uids, loading_timeout_);
+        return PinCellsImpl(this->shared_from_this(), ctx, ResolveCellIds(uids), loading_timeout_);
     }
 
     /// Synchronous adapter: do not call on an executor needed by this load.
@@ -226,8 +227,8 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             return std::make_shared<CellAccessor<CellT>>(this->shared_from_this(),
                                                          std::vector<internal::ListNode::NodePin>());
         }
-        return folly::coro::blockingWait(
-            PinCellsImpl(this->shared_from_this(), ctx, uids, timeout_override.value_or(loading_timeout_)));
+        return folly::coro::blockingWait(PinCellsImpl(this->shared_from_this(), ctx, ResolveCellIds(uids),
+                                                      timeout_override.value_or(loading_timeout_)));
     }
 
     // Manually evicts the cell if it is LOADED and not pinned.
@@ -287,40 +288,41 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
  private:
     friend class CellAccessor<CellT>;
 
-    // Values live in the coroutine frame, including before its first execution.
-    static folly::coro::Task<std::shared_ptr<CellAccessor<CellT>>>
-    PinCellsImpl(std::shared_ptr<CacheSlot> self, OpContext* ctx, std::vector<uid_t> uids,
-                 std::chrono::milliseconds timeout) {
-        if (self->skip_pin_.load(std::memory_order_acquire)) {
-            co_return std::make_shared<CellAccessor<CellT>>(self, std::vector<internal::ListNode::NodePin>());
+    // Normalize borrowed UIDs before creating a task so it only retains unique cell IDs.
+    [[nodiscard]] std::vector<cid_t>
+    ResolveCellIds(const std::vector<uid_t>& uids) const {
+        if (uids.empty()) {
+            return {};
         }
-        auto count = std::min(uids.size(), self->cells_.size());
+        if (cell_id_mapping_mode_ == CellIdMappingMode::ALWAYS_ZERO) {
+            return {0};
+        }
+        const auto count = std::min(uids.size(), cells_.size());
         ska::flat_hash_set<cid_t> involved_cids;
         involved_cids.reserve(count);
-        switch (self->cell_id_mapping_mode_) {
-            case CellIdMappingMode::IDENTICAL: {
-                for (auto& uid : uids) {
-                    involved_cids.insert(uid);
-                }
-                break;
+        if (cell_id_mapping_mode_ == CellIdMappingMode::IDENTICAL) {
+            for (const auto uid : uids) {
+                involved_cids.insert(uid);
             }
-            case CellIdMappingMode::ALWAYS_ZERO: {
-                if (uids.size() > 0) {
-                    involved_cids.insert(0);
-                }
-                break;
-            }
-            default: {
-                for (auto& uid : uids) {
-                    auto cid = self->cell_id_of(uid);
-                    involved_cids.insert(cid);
-                }
+        } else {
+            for (const auto uid : uids) {
+                involved_cids.insert(cell_id_of(uid));
             }
         }
         std::vector<cid_t> involved_cids_vec;
         involved_cids_vec.reserve(involved_cids.size());
         std::copy(involved_cids.begin(), involved_cids.end(), std::back_inserter(involved_cids_vec));
-        co_return co_await self->PinInternal(ctx, std::move(involved_cids_vec), timeout);
+        return involved_cids_vec;
+    }
+
+    // Values live in the coroutine frame, including before its first execution.
+    static folly::coro::Task<std::shared_ptr<CellAccessor<CellT>>>
+    PinCellsImpl(std::shared_ptr<CacheSlot> self, OpContext* ctx, std::vector<cid_t> cids,
+                 std::chrono::milliseconds timeout) {
+        if (self->skip_pin_.load(std::memory_order_acquire)) {
+            co_return std::make_shared<CellAccessor<CellT>>(self, std::vector<internal::ListNode::NodePin>());
+        }
+        co_return co_await self->PinInternal(ctx, std::move(cids), timeout);
     }
 
     static folly::coro::Task<std::shared_ptr<CellAccessor<CellT>>>
