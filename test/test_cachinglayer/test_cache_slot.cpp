@@ -67,6 +67,12 @@ struct TestCell {
     }
 };
 
+// Model an upstream coroutine that awaits the public Future interface.
+static folly::coro::Task<std::shared_ptr<CellAccessor<TestCell>>>
+AwaitPin(folly::SemiFuture<std::shared_ptr<CellAccessor<TestCell>>> pin) {
+    co_return co_await std::move(pin);
+}
+
 class MockTranslator : public Translator<TestCell> {
  public:
     MockTranslator(std::vector<std::pair<cid_t, int64_t>> cell_sizes,
@@ -390,7 +396,7 @@ TEST_F(CacheSlotTest, Initialization) {
 
 #ifdef __linux__
 TEST_F(CacheSlotTest, LoadTaskAllocationFailureAllowsRetry) {
-    // Sweep coroutine-frame failures through direct, Task and SemiFuture entry points.
+    // Sweep coroutine-frame failures through direct, co_await and synchronous Future callers.
     for (const int entry_point : {0, 1, 2}) {
         SCOPED_TRACE(entry_point);
         for (int allocation = 1;; ++allocation) {
@@ -402,7 +408,7 @@ TEST_F(CacheSlotTest, LoadTaskAllocationFailureAllowsRetry) {
                 if (entry_point == 0) {
                     cache_slot_->PinOneCellDirect(nullptr, 10);
                 } else if (entry_point == 1) {
-                    folly::coro::blockingWait(cache_slot_->PinCellsAsync(nullptr, {10}));
+                    folly::coro::blockingWait(AwaitPin(cache_slot_->PinCells(nullptr, {10})));
                 } else {
                     SemiInlineGet(cache_slot_->PinCells(nullptr, {10}));
                 }
@@ -415,7 +421,7 @@ TEST_F(CacheSlotTest, LoadTaskAllocationFailureAllowsRetry) {
             EXPECT_EQ(DListTestFriend::get_loading_memory(*dlist_), ResourceUsage{});
 
             auto retry = folly::coro::co_withExecutor(folly::getKeepAliveToken(&folly::InlineExecutor::instance()),
-                                                      cache_slot_->PinCellsAsync(nullptr, {10}))
+                                                      AwaitPin(cache_slot_->PinCells(nullptr, {10})))
                              .start();
             ASSERT_TRUE(retry.isReady());
             EXPECT_NE(std::move(retry).get()->get_cell_of(10), nullptr);
@@ -492,10 +498,12 @@ TEST_F(CoroutineCacheTest, SuspendedLoadAndSharedWaitLeaveWorkerAvailable) {
     folly::CPUThreadPoolExecutor executor(1);
     auto unblock = folly::makeGuard([gate] { gate->finish.post(); });
     auto first =
-        folly::coro::co_withExecutor(folly::getKeepAliveToken(&executor), slot->PinCellsAsync(nullptr, {0})).start();
+        folly::coro::co_withExecutor(folly::getKeepAliveToken(&executor), AwaitPin(slot->PinCells(nullptr, {0})))
+            .start();
     ASSERT_EQ(gate->started.wait_for(std::chrono::seconds(5)), std::future_status::ready);
     auto second =
-        folly::coro::co_withExecutor(folly::getKeepAliveToken(&executor), slot->PinCellsAsync(nullptr, {0})).start();
+        folly::coro::co_withExecutor(folly::getKeepAliveToken(&executor), AwaitPin(slot->PinCells(nullptr, {0})))
+            .start();
     ExpectExecutorProgress(executor);
     EXPECT_EQ(gate->calls, 1);
     EXPECT_FALSE(slot->ManualEvict(0));
@@ -507,7 +515,7 @@ TEST_F(CoroutineCacheTest, SuspendedLoadAndSharedWaitLeaveWorkerAvailable) {
     EXPECT_FALSE(slot->ManualEvict(0));
     second_pin.reset();
     EXPECT_TRUE(slot->ManualEvict(0));
-    EXPECT_NE(folly::coro::blockingWait(slot->PinAllCellsAsync(nullptr)), nullptr);
+    EXPECT_NE(folly::coro::blockingWait(slot->PinAllCells(nullptr)), nullptr);
     EXPECT_EQ(gate->calls, 2);
     EXPECT_EQ(DListTestFriend::get_loading_memory(*dlist), ResourceUsage{});
 }
@@ -519,10 +527,12 @@ TEST_F(CoroutineCacheTest, SharedFailureReleasesResourcesAndAllowsRetry) {
     folly::CPUThreadPoolExecutor executor(1);
     auto unblock = folly::makeGuard([gate] { gate->finish.post(); });
     auto first =
-        folly::coro::co_withExecutor(folly::getKeepAliveToken(&executor), slot->PinCellsAsync(nullptr, {0})).start();
+        folly::coro::co_withExecutor(folly::getKeepAliveToken(&executor), AwaitPin(slot->PinCells(nullptr, {0})))
+            .start();
     ASSERT_EQ(gate->started.wait_for(std::chrono::seconds(5)), std::future_status::ready);
     auto second =
-        folly::coro::co_withExecutor(folly::getKeepAliveToken(&executor), slot->PinCellsAsync(nullptr, {0})).start();
+        folly::coro::co_withExecutor(folly::getKeepAliveToken(&executor), AwaitPin(slot->PinCells(nullptr, {0})))
+            .start();
     ExpectExecutorProgress(executor);
     gate->finish.post();
     EXPECT_THROW(std::move(first).get(), std::runtime_error);
@@ -531,11 +541,11 @@ TEST_F(CoroutineCacheTest, SharedFailureReleasesResourcesAndAllowsRetry) {
     EXPECT_EQ(DListTestFriend::get_loading_memory(*dlist), ResourceUsage{});
     EXPECT_FALSE(slot->IsCached(0));
     gate->fail = false;
-    EXPECT_NE(folly::coro::blockingWait(slot->PinCellsAsync(nullptr, {0})), nullptr);
+    EXPECT_NE(folly::coro::blockingWait(slot->PinCells(nullptr, {0})), nullptr);
     EXPECT_EQ(gate->calls, 2);
 }
 
-TEST_F(CoroutineCacheTest, FutureAdaptersRemainLazyAndShareAsyncLoads) {
+TEST_F(CoroutineCacheTest, FutureAndCoroutineCallersShareLoads) {
     for (const bool pin_all : {false, true}) {
         for (const bool fail : {false, true}) {
             SCOPED_TRACE(pin_all);
@@ -554,9 +564,9 @@ TEST_F(CoroutineCacheTest, FutureAdaptersRemainLazyAndShareAsyncLoads) {
             auto unblock = folly::makeGuard([gate] { gate->finish.post(); });
             auto first = std::move(legacy).via(&executor);
             ASSERT_EQ(gate->started.wait_for(std::chrono::seconds(5)), std::future_status::ready);
-            auto second =
-                folly::coro::co_withExecutor(folly::getKeepAliveToken(&executor), slot->PinCellsAsync(nullptr, {0}))
-                    .start();
+            auto second = folly::coro::co_withExecutor(folly::getKeepAliveToken(&executor),
+                                                       AwaitPin(slot->PinCells(nullptr, {0})))
+                              .start();
             ExpectExecutorProgress(executor);
             EXPECT_EQ(gate->calls, 1);
             slot.reset();
@@ -610,7 +620,7 @@ class MappingTranslator : public MockTranslator {
     bool fail_mapping = false;
 };
 
-TEST_F(CoroutineCacheTest, TaskOwnsSlotAndResolvedIdsBeforeStarting) {
+TEST_F(CoroutineCacheTest, FutureOwnsSlotAndResolvedIdsBeforeStarting) {
     auto translator = std::make_unique<MappingTranslator>(std::vector<std::pair<cid_t, int64_t>>{{0, 100}},
                                                           std::unordered_map<cl_uid_t, cid_t>{{10, 0}, {11, 0}},
                                                           "mapping_slot", StorageType::MEMORY);
@@ -620,7 +630,7 @@ TEST_F(CoroutineCacheTest, TaskOwnsSlotAndResolvedIdsBeforeStarting) {
     std::weak_ptr<CacheSlot<TestCell>> weak = slot;
     auto pin = [&] {
         const std::vector<cl_uid_t> ids{10, 11, 10};
-        return slot->PinCellsAsync(nullptr, ids);
+        return slot->PinCells(nullptr, ids);
     }();
     EXPECT_EQ(mapping->mapping_calls, 3);
     EXPECT_EQ(mapping->GetCellsCallCount(), 0);
@@ -635,7 +645,7 @@ TEST_F(CoroutineCacheTest, TaskOwnsSlotAndResolvedIdsBeforeStarting) {
     EXPECT_TRUE(weak.expired());
 }
 
-TEST_F(CoroutineCacheTest, MappingFailurePrecedesTaskCreationAndAllowsRetry) {
+TEST_F(CoroutineCacheTest, MappingFailureReturnsFailedFutureAndAllowsRetry) {
     auto translator = std::make_unique<MappingTranslator>(std::vector<std::pair<cid_t, int64_t>>{{0, 100}},
                                                           std::unordered_map<cl_uid_t, cid_t>{{10, 0}},
                                                           "mapping_failure_slot", StorageType::MEMORY);
@@ -643,7 +653,6 @@ TEST_F(CoroutineCacheTest, MappingFailurePrecedesTaskCreationAndAllowsRetry) {
     auto slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
                                                       std::chrono::seconds(5), std::chrono::seconds(5));
     mapping->fail_mapping = true;
-    EXPECT_THROW(static_cast<void>(slot->PinCellsAsync(nullptr, {10})), std::runtime_error);
     EXPECT_THROW(slot->PinCellsDirect(nullptr, {10}), std::runtime_error);
     auto failed = slot->PinCells(nullptr, {10});
     EXPECT_TRUE(failed.isReady());
@@ -651,7 +660,7 @@ TEST_F(CoroutineCacheTest, MappingFailurePrecedesTaskCreationAndAllowsRetry) {
     EXPECT_EQ(mapping->GetCellsCallCount(), 0);
     EXPECT_FALSE(slot->IsCached(0));
     mapping->fail_mapping = false;
-    EXPECT_NE(folly::coro::blockingWait(slot->PinCellsAsync(nullptr, {10})), nullptr);
+    EXPECT_NE(folly::coro::blockingWait(slot->PinCells(nullptr, {10})), nullptr);
     EXPECT_NE(slot->PinCellsDirect(nullptr, {10}), nullptr);
     EXPECT_NE(SemiInlineGet(slot->PinCells(nullptr, {10})), nullptr);
     EXPECT_NE(SemiInlineGet(slot->PinAllCells(nullptr)), nullptr);
@@ -672,7 +681,7 @@ TEST_F(CoroutineCacheTest, PinBuiltInMappingsHandleEmptyDuplicateAndResidentIds)
                                                               std::chrono::seconds(5), std::chrono::seconds(5));
             auto pin = [&](const std::vector<cl_uid_t>& ids) {
                 return direct ? slot->PinCellsDirect(nullptr, ids)
-                              : folly::coro::blockingWait(slot->PinCellsAsync(nullptr, ids));
+                              : folly::coro::blockingWait(slot->PinCells(nullptr, ids));
             };
             EXPECT_NE(pin({}), nullptr);
             EXPECT_EQ(mapping->GetCellsCallCount(), 0);
@@ -697,7 +706,8 @@ TEST_F(CoroutineCacheTest, CancelledLoadDrainsBeforeReleasingReservation) {
     milvus::OpContext ctx(cancellation.getToken());
     folly::CPUThreadPoolExecutor executor(1);
     auto unblock = folly::makeGuard([gate] { gate->finish.post(); });
-    auto pending = folly::coro::co_withExecutor(folly::getKeepAliveToken(&executor), slot->PinCellsAsync(&ctx, {0})).start();
+    auto pending =
+        folly::coro::co_withExecutor(folly::getKeepAliveToken(&executor), AwaitPin(slot->PinCells(&ctx, {0}))).start();
     ASSERT_EQ(gate->started.wait_for(std::chrono::seconds(5)), std::future_status::ready);
     cancellation.requestCancellation();
     ExpectExecutorProgress(executor);
@@ -711,7 +721,7 @@ TEST_F(CoroutineCacheTest, CancelledLoadDrainsBeforeReleasingReservation) {
         EXPECT_EQ(error.get_error_code(), milvus::ErrorCode::FollyCancel);
     }
     EXPECT_EQ(DListTestFriend::get_loading_memory(*dlist), ResourceUsage{});
-    EXPECT_NE(folly::coro::blockingWait(slot->PinCellsAsync(nullptr, {0})), nullptr);
+    EXPECT_NE(folly::coro::blockingWait(slot->PinCells(nullptr, {0})), nullptr);
 }
 
 TEST_F(CoroutineCacheTest, ResourceWaitCancellationLeavesNoClaim) {
@@ -726,7 +736,8 @@ TEST_F(CoroutineCacheTest, ResourceWaitCancellationLeavesNoClaim) {
         gate->finish.post();
         dlist->ReleaseLoadingResource(held);
     });
-    auto pending = folly::coro::co_withExecutor(folly::getKeepAliveToken(&executor), slot->PinCellsAsync(&ctx, {0})).start();
+    auto pending =
+        folly::coro::co_withExecutor(folly::getKeepAliveToken(&executor), AwaitPin(slot->PinCells(&ctx, {0}))).start();
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (DListTestFriend::get_waiting_request_count(*dlist) == 0 && std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -740,7 +751,7 @@ TEST_F(CoroutineCacheTest, ResourceWaitCancellationLeavesNoClaim) {
     gate->finish.post();
     dlist->ReleaseLoadingResource(held);
     release.dismiss();
-    EXPECT_NE(folly::coro::blockingWait(slot->PinCellsAsync(nullptr, {0})), nullptr);
+    EXPECT_NE(folly::coro::blockingWait(slot->PinCells(nullptr, {0})), nullptr);
     EXPECT_EQ(gate->calls, 1);
 }
 
@@ -767,7 +778,8 @@ TEST_F(CoroutineCacheTest, BackgroundWarmupSharesDemandLoad) {
     folly::coro::blockingWait(slot->Warmup(nullptr, executor));
     ASSERT_EQ(gate->started.wait_for(std::chrono::seconds(5)), std::future_status::ready);
     auto pending =
-        folly::coro::co_withExecutor(folly::getKeepAliveToken(&demand_executor), slot->PinCellsAsync(nullptr, {0})).start();
+        folly::coro::co_withExecutor(folly::getKeepAliveToken(&demand_executor), AwaitPin(slot->PinCells(nullptr, {0})))
+            .start();
     ExpectExecutorProgress(demand_executor);
     EXPECT_EQ(gate->calls, 1);
     gate->finish.post();
@@ -849,7 +861,7 @@ TEST_F(CacheSlotTest, ResourceWaitDoesNotOccupyExecutor) {
     folly::CPUThreadPoolExecutor executor(1);
     const std::vector<cl_uid_t> uids{10};
     auto pin = [&]() -> folly::coro::Task<std::shared_ptr<CellAccessor<TestCell>>> {
-        co_return co_await cache_slot_->PinCellsAsync(&ctx, uids);
+        co_return co_await cache_slot_->PinCells(&ctx, uids);
     };
     auto pending = folly::coro::co_withExecutor(folly::getKeepAliveToken(&executor), pin()).start();
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -934,7 +946,7 @@ TEST_F(CacheSlotTest, PinMultipleCellsSuccess) {
 
     translator_->ResetCounters();
     auto op_ctx = std::make_unique<milvus::OpContext>();
-    auto future = cache_slot_->PinCellsAsync(op_ctx.get(), target_uids);
+    auto future = cache_slot_->PinCells(op_ctx.get(), target_uids);
     auto accessor = folly::coro::blockingWait(std::move(future));
 
     ASSERT_NE(accessor, nullptr);
@@ -1144,7 +1156,7 @@ TEST_F(CacheSlotTest, PinMultipleUidsMappingToSameCid) {
 
     translator_->ResetCounters();
     auto op_ctx = std::make_unique<milvus::OpContext>();
-    auto future = cache_slot_->PinCellsAsync(op_ctx.get(), target_uids);
+    auto future = cache_slot_->PinCells(op_ctx.get(), target_uids);
     auto accessor = folly::coro::blockingWait(std::move(future));
 
     ASSERT_NE(accessor, nullptr);
@@ -1177,7 +1189,7 @@ TEST_F(CacheSlotTest, PinInvalidUid) {
 
     translator_->ResetCounters();
     auto op_ctx = std::make_unique<milvus::OpContext>();
-    auto future = cache_slot_->PinCellsAsync(op_ctx.get(), target_uids);
+    auto future = cache_slot_->PinCells(op_ctx.get(), target_uids);
 
     EXPECT_THROW(
         {
@@ -1205,7 +1217,7 @@ TEST_F(CacheSlotTest, LoadFailure) {
     translator_->SetShouldThrow(true);
 
     auto op_ctx = std::make_unique<milvus::OpContext>();
-    auto future = cache_slot_->PinCellsAsync(op_ctx.get(), {target_uid});
+    auto future = cache_slot_->PinCells(op_ctx.get(), {target_uid});
 
     EXPECT_THROW(
         {
@@ -1232,7 +1244,7 @@ TEST_F(CacheSlotTest, LoadFailure) {
     // recover the translator and try again
     translator_->SetShouldThrow(false);
     auto expected_size = translator_->estimated_byte_size_of_cell(expected_cid).first;
-    auto future2 = cache_slot_->PinCellsAsync(op_ctx.get(), {target_uid});
+    auto future2 = cache_slot_->PinCells(op_ctx.get(), {target_uid});
     auto accessor = folly::coro::blockingWait(std::move(future2));
     ASSERT_NE(accessor, nullptr);
     TestCell* cell = accessor->get_cell_of(target_uid);
@@ -1251,7 +1263,7 @@ TEST_F(CacheSlotTest, PinAlreadyLoadedCell) {
 
     auto op_ctx = std::make_unique<milvus::OpContext>();
 
-    auto future1 = cache_slot_->PinCellsAsync(op_ctx.get(), {target_uid});
+    auto future1 = cache_slot_->PinCells(op_ctx.get(), {target_uid});
     auto accessor1 = folly::coro::blockingWait(std::move(future1));
     ASSERT_NE(accessor1, nullptr);
     ASSERT_EQ(translator_->GetCellsCallCount(), 1);
@@ -1264,7 +1276,7 @@ TEST_F(CacheSlotTest, PinAlreadyLoadedCell) {
     ASSERT_NE(cell1, nullptr);
 
     translator_->ResetCounters();
-    auto future2 = cache_slot_->PinCellsAsync(op_ctx.get(), {target_uid});
+    auto future2 = cache_slot_->PinCells(op_ctx.get(), {target_uid});
     auto accessor2 = folly::coro::blockingWait(std::move(future2));
     ASSERT_NE(accessor2, nullptr);
 
@@ -1293,7 +1305,7 @@ TEST_F(CacheSlotTest, PinAlreadyLoadedCellViaDifferentUid) {
     translator_->ResetCounters();
 
     auto op_ctx = std::make_unique<milvus::OpContext>();
-    auto future1 = cache_slot_->PinCellsAsync(op_ctx.get(), {uid1});
+    auto future1 = cache_slot_->PinCells(op_ctx.get(), {uid1});
     auto accessor1 = folly::coro::blockingWait(std::move(future1));
     ASSERT_NE(accessor1, nullptr);
     ASSERT_EQ(translator_->GetCellsCallCount(), 1);
@@ -1307,7 +1319,7 @@ TEST_F(CacheSlotTest, PinAlreadyLoadedCellViaDifferentUid) {
     EXPECT_EQ(cell1->cid, expected_cid);
 
     translator_->ResetCounters();
-    auto future2 = cache_slot_->PinCellsAsync(op_ctx.get(), {uid2});
+    auto future2 = cache_slot_->PinCells(op_ctx.get(), {uid2});
     auto accessor2 = folly::coro::blockingWait(std::move(future2));
     ASSERT_NE(accessor2, nullptr);
 
@@ -1345,7 +1357,7 @@ TEST_F(CacheSlotTest, TranslatorReturnsExtraCells) {
     translator_->SetExtraReturnCids({{requested_cid, {extra_cid}}});
 
     auto op_ctx = std::make_unique<milvus::OpContext>();
-    auto future = cache_slot_->PinCellsAsync(op_ctx.get(), {requested_uid});
+    auto future = cache_slot_->PinCells(op_ctx.get(), {requested_uid});
     auto accessor = folly::coro::blockingWait(std::move(future));
 
     ASSERT_NE(accessor, nullptr);
@@ -1365,7 +1377,7 @@ TEST_F(CacheSlotTest, TranslatorReturnsExtraCells) {
     EXPECT_EQ(requested_cell->cid, requested_cid);
 
     translator_->ResetCounters();
-    auto future_extra = cache_slot_->PinCellsAsync(op_ctx.get(), {extra_uid});
+    auto future_extra = cache_slot_->PinCells(op_ctx.get(), {extra_uid});
     auto accessor_extra = folly::coro::blockingWait(std::move(future_extra));
 
     ASSERT_NE(accessor_extra, nullptr);
@@ -1401,7 +1413,7 @@ TEST_F(CacheSlotTest, EvictionTest) {
 
     // 1. Load cells 0, 1, 2
     translator_->ResetCounters();
-    auto future1 = cache_slot_->PinCellsAsync(op_ctx.get(), uids_012);
+    auto future1 = cache_slot_->PinCells(op_ctx.get(), uids_012);
     auto accessor1 = folly::coro::blockingWait(std::move(future1));
     ASSERT_NE(accessor1, nullptr);
     EXPECT_EQ(translator_->GetCellsCallCount(), 1);
@@ -1424,7 +1436,7 @@ TEST_F(CacheSlotTest, EvictionTest) {
     ASSERT_EQ(size_3, ResourceUsage(200, 0));
 
     translator_->ResetCounters();
-    auto future2 = cache_slot_->PinCellsAsync(op_ctx.get(), {uid_3});
+    auto future2 = cache_slot_->PinCells(op_ctx.get(), {uid_3});
     auto accessor2 = folly::coro::blockingWait(std::move(future2));
     ASSERT_NE(accessor2, nullptr);
 
@@ -1453,7 +1465,7 @@ TEST_F(CacheSlotTest, PinCellsWithCancellationToken) {
     cid_t expected_cid = 2;
 
     translator_->ResetCounters();
-    auto future = cache_slot_->PinCellsAsync(op_ctx.get(), {target_uid});
+    auto future = cache_slot_->PinCells(op_ctx.get(), {target_uid});
     auto accessor = folly::coro::blockingWait(std::move(future));
 
     ASSERT_NE(accessor, nullptr);
@@ -1483,7 +1495,7 @@ TEST_F(CacheSlotTest, PinCellsWithShortTimeout) {
     auto op_ctx = std::make_unique<milvus::OpContext>();
 
     // First pin some cells to fill the cache
-    auto future1 = cache_slot_short_timeout->PinCellsAsync(op_ctx.get(), {10});  // cid 0, size 50
+    auto future1 = cache_slot_short_timeout->PinCells(op_ctx.get(), {10});  // cid 0, size 50
     auto accessor1 = folly::coro::blockingWait(std::move(future1));
     ASSERT_NE(accessor1, nullptr);
 
@@ -1642,7 +1654,7 @@ TEST_P(CacheSlotConcurrentTest, ConcurrentAccessMultipleSlots) {
                 int expected_data = static_cast<int>(expected_cid * 10);
 
                 try {
-                    auto accessor = folly::coro::blockingWait(current_slot->PinCellsAsync(op_ctx.get(), {target_uid}));
+                    auto accessor = folly::coro::blockingWait(current_slot->PinCells(op_ctx.get(), {target_uid}));
 
                     if (!accessor) {
                         ADD_FAILURE() << "T" << tid << " Op" << j << ": PinCells returned null accessor for UID "
@@ -1716,7 +1728,7 @@ TEST_P(CacheSlotConcurrentTest, ConcurrentAccessMultipleSlots) {
             cid_t expected_cid = uid_map_3.at(target_uid);
             int expected_data = static_cast<int>(expected_cid * 10);
             try {
-                auto accessor = folly::coro::blockingWait(slot3->PinCellsAsync(op_ctx.get(), {target_uid}));
+                auto accessor = folly::coro::blockingWait(slot3->PinCells(op_ctx.get(), {target_uid}));
                 if (!accessor) {
                     ADD_FAILURE() << "T" << tid << " Op" << j << ": PinCells returned null accessor for UID "
                                   << target_uid;

@@ -122,20 +122,15 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         warmup_cancel_source_.requestCancellation();
     }
 
-    /// Future-compatible entry point; loading starts when the future is driven.
+    /// Pin all cells; the future retains the slot and borrows ctx until completion.
+    /// Loading starts when the future is awaited or otherwise driven.
     folly::SemiFuture<std::shared_ptr<CellAccessor<CellT>>>
     PinAllCells(OpContext* ctx) {
         if (skip_pin_.load(std::memory_order_acquire)) {
             return std::make_shared<CellAccessor<CellT>>(this->shared_from_this(),
                                                          std::vector<internal::ListNode::NodePin>());
         }
-        return folly::makeSemiFutureWith([&] { return PinAllCellsAsync(ctx).semi(); });
-    }
-
-    /// Pin all cells; the task retains the slot and borrows ctx until completion.
-    folly::coro::Task<std::shared_ptr<CellAccessor<CellT>>>
-    PinAllCellsAsync(OpContext* ctx) {
-        return PinAllCellsImpl(this->shared_from_this(), ctx);
+        return folly::makeSemiFutureWith([&] { return PinAllCellsImpl(this->shared_from_this(), ctx).semi(); });
     }
 
     // Borrows a resident cell without taking shared ownership. Returns nullptr when the slot still
@@ -149,7 +144,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     // This exists because the skip_pin_ fast path is not free: it still builds a CellAccessor that
     // holds no pin at all, which costs a shared_from_this() refcount bump on a control block shared
     // by every thread touching this slot, plus the allocations for the accessor and for the
-    // coroutine wrapping it. Callers that only need the cell for the duration of an already-pinned
+    // future wrapping it. Callers that only need the cell for the duration of an already-pinned
     // scope should borrow instead.
     //
     // Deliberately records no metrics: see RecordAccessEvent() for why a per-access prometheus
@@ -163,26 +158,18 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         return cells_[cell_id_of(uid)]->cell();
     }
 
-    /// Future-compatible entry point; resolve IDs now and deliver failures through the future.
-    /// Loading starts when the future is driven; ctx remains borrowed until completion.
+    /// Resolve IDs now; the future owns unique cell IDs, retains the slot and delivers failures.
+    /// Loading starts when the future is awaited or otherwise driven; ctx is borrowed until completion.
     folly::SemiFuture<std::shared_ptr<CellAccessor<CellT>>>
     PinCells(OpContext* ctx, const std::vector<uid_t>& uids) {
         if (skip_pin_.load(std::memory_order_acquire)) {
             return std::make_shared<CellAccessor<CellT>>(this->shared_from_this(),
                                                          std::vector<internal::ListNode::NodePin>());
         }
-        return folly::makeSemiFutureWith([&] { return PinCellsAsync(ctx, uids).semi(); });
-    }
-
-    /// Resolve and deduplicate UIDs now (may throw); the task owns cell IDs and borrows ctx.
-    /// Pinning and loading start when the task runs.
-    folly::coro::Task<std::shared_ptr<CellAccessor<CellT>>>
-    PinCellsAsync(OpContext* ctx, const std::vector<uid_t>& uids) {
-        if (skip_pin_.load(std::memory_order_acquire)) {
-            return PinAllCellsImpl(this->shared_from_this(), ctx);
-        }
-        RecordAccessEvent();
-        return PinCellsImpl(this->shared_from_this(), ctx, ResolveCellIds(uids), loading_timeout_);
+        return folly::makeSemiFutureWith([&] {
+            RecordAccessEvent();
+            return PinCellsImpl(this->shared_from_this(), ctx, ResolveCellIds(uids), loading_timeout_).semi();
+        });
     }
 
     /// Synchronous adapter: do not call on an executor needed by this load.
@@ -413,7 +400,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         return cids;
     }
 
-    // The owning public task retains the slot while this operation is suspended.
+    // The owning pin task retains the slot while this operation is suspended.
     folly::coro::Task<std::shared_ptr<CellAccessor<CellT>>>
     PinInternal(OpContext* ctx, std::vector<cid_t> cids, std::chrono::milliseconds timeout) {
         std::vector<folly::SemiFuture<internal::ListNode::NodePin>> futures;
@@ -496,9 +483,8 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     // Read this before trusting internal_cache_access_event_total: it does NOT count every cell
     // access, and it cannot be made to without a cheaper counter first.
     //
-    //   - It is only reached from PinCellsAsync() (also through PinCells()), so the
-    //     PinAllCells*(), PinOneCellDirect(), PinCellsDirect() and TryBorrowCell()
-    //     accesses are not counted at all.
+    //   - It is only reached from PinCells(), so PinAllCells(), PinOneCellDirect(),
+    //     PinCellsDirect() and TryBorrowCell() accesses are not counted at all.
     //   - It sits below the skip_pin_ early return. skip_pin_ is assigned !evictable_ after warmup
     //     and never cleared, so for a non-evictable (permanently resident) slot this counter reads
     //     zero for the lifetime of the process - and resident slots are the common case for loaded
