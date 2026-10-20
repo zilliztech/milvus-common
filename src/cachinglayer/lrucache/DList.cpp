@@ -23,6 +23,7 @@
 #include "cachinglayer/Utils.h"
 #include "cachinglayer/lrucache/ListNode.h"
 #include "log/Log.h"
+#include "syncpoint/sync_point.h"
 
 namespace milvus::cachinglayer::internal {
 
@@ -102,7 +103,7 @@ DList::UnbindLoadingOverheadGroups(const LoadingOverheadConfig& config) {
                 LOG_ERROR("[MCL] LoadingOverheadGroup cannot unbind invalid file Group");
             }
         }
-        if (!waiting_queue_empty_) {
+        if (reservation_notifications_needed_) {
             handleWaitingRequests(completions);
         }
     }
@@ -127,6 +128,10 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& loaded, const Reso
                                          const LoadingOverheadConfig* config, std::chrono::milliseconds timeout,
                                          OpContext* ctx) {
     std::unique_lock<std::mutex> lock(list_mtx_);
+    // Arm before inspecting resources so a concurrent release cannot miss an about-to-enqueue request.
+    reservation_notifications_needed_ = true;
+    auto restore_notifications = folly::makeGuard([&] { reservation_notifications_needed_ = !waiting_queue_.empty(); });
+    TEST_SYNC_POINT("DList::Reserve:BeforeAttempt");
     auto attempt = reserveResourceInternalWithOverhead(loaded, overhead, config);
     if (attempt.result.success) {
         return folly::makeSemiFuture(attempt.result);
@@ -146,6 +151,7 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& loaded, const Reso
         return folly::makeSemiFuture(LoadingResourceReservationResult{});
     }
 
+    TEST_SYNC_POINT("DList::Reserve:BeforeEnqueue");
     auto deadline =
         timeout.count() > 0 ? std::chrono::steady_clock::now() + timeout : std::chrono::steady_clock::time_point::max();
     auto [promise, future] = folly::makePromiseContract<LoadingResourceReservationResult>();
@@ -156,7 +162,6 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& loaded, const Reso
     WaitingRequest* request_ptr = waiting_request.get();
     waiting_requests_map_[request_id] = request_ptr;
     waiting_queue_.push(std::move(waiting_request));
-    waiting_queue_empty_ = false;
     std::weak_ptr<DList> weak_self = shared_from_this();
 
     if (timeout.count() > 0) {
@@ -218,6 +223,10 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std
     // to avoid a race window where resources could be released and notified between
     // a failed reserve and the enqueue.
     std::unique_lock<std::mutex> lock(list_mtx_);
+    // Keep notifications armed through both the resource check and a possible enqueue.
+    reservation_notifications_needed_ = true;
+    auto restore_notifications = folly::makeGuard([&] { reservation_notifications_needed_ = !waiting_queue_.empty(); });
+    TEST_SYNC_POINT("DList::Reserve:BeforeAttempt");
     if (!max_resource_limit_.load().CanHold(size)) {
         LOG_ERROR("[MCL] Failed to reserve size={} as it exceeds max_memory_={}.", size.ToString(),
                   max_resource_limit_.load().ToString());
@@ -232,6 +241,7 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std
         return folly::makeSemiFuture(false);
     }
 
+    TEST_SYNC_POINT("DList::Reserve:BeforeEnqueue");
     auto deadline =
         timeout.count() > 0 ? std::chrono::steady_clock::now() + timeout : std::chrono::steady_clock::time_point::max();
     auto [promise, future] = folly::makePromiseContract<bool>();
@@ -242,7 +252,6 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std
     WaitingRequest* request_ptr = waiting_request.get();
     waiting_requests_map_[request_id] = request_ptr;
     waiting_queue_.push(std::move(waiting_request));
-    waiting_queue_empty_ = false;
     std::weak_ptr<DList> weak_self = shared_from_this();
 
     if (timeout.count() > 0) {
@@ -530,7 +539,7 @@ DList::evictionLoop() {
         // not just after successful eviction. Resources may have been freed
         // by other paths (ReleaseLoadingResource, RefundLoadedResource) between
         // loop iterations without fully draining the queue.
-        if (evicted.AnyGTZero() || !waiting_queue_empty_) {
+        if (evicted.AnyGTZero() || reservation_notifications_needed_) {
             handleWaitingRequests(completions);
         }
     }
@@ -943,6 +952,9 @@ DList::RefundLoadedResource(const ResourceUsage& size) {
 
 void
 DList::notifyWaitingRequests() {
+    if (!reservation_notifications_needed_) {
+        return;
+    }
     WaitingRequestCompletions completions;
     {
         std::unique_lock<std::mutex> lock(list_mtx_);
@@ -959,7 +971,7 @@ DList::handleWaitingRequests(WaitingRequestCompletions& completions) {
         for (auto& request : deferred_requests) {
             waiting_queue_.push(std::move(request));
         }
-        waiting_queue_empty_ = waiting_queue_.empty();
+        reservation_notifications_needed_ = !waiting_queue_.empty();
     });
 
     while (!waiting_queue_.empty()) {
@@ -1128,7 +1140,7 @@ DList::clearWaitingQueue() {
                 completion.SetResult(*request, false);
             }
         }
-        waiting_queue_empty_ = true;
+        reservation_notifications_needed_ = false;
     }
 }
 

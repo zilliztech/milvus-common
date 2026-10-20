@@ -93,19 +93,17 @@ class DListTestFriend {
     static void
     test_add_evictable_memory(DList* dlist, const ResourceUsage& size) {
         dlist->evictable_size_ += size;
-        // If there are waiters, try to satisfy them
-        if (!dlist->waiting_queue_empty_) {
-            DList::WaitingRequestCompletions completions;
-            {
-                std::unique_lock<std::mutex> lock(dlist->list_mtx_);
-                dlist->handleWaitingRequests(completions);
-            }
-        }
+        dlist->notifyWaitingRequests();
     }
 
     static std::unique_lock<std::mutex>
     test_lock_list(DList* dlist) {
         return std::unique_lock<std::mutex>(dlist->list_mtx_);
+    }
+
+    static bool
+    test_notifications_needed(const DList& dlist) {
+        return dlist.reservation_notifications_needed_.load();
     }
 
     static void

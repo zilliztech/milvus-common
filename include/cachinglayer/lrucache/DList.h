@@ -360,7 +360,7 @@ class DList : public std::enable_shared_from_this<DList> {
     tryEvict(const ResourceUsage& expected_eviction, const ResourceUsage& min_eviction,
              const bool evict_expired_items = false);
 
-    // Called after releasing node locks; serialize with reservations that are still being enqueued.
+    // Called after releasing node locks; skip locking only when neither a reservation attempt nor queued work exists.
     void
     notifyWaitingRequests();
 
@@ -434,8 +434,9 @@ class DList : public std::enable_shared_from_this<DList> {
     std::priority_queue<std::unique_ptr<WaitingRequest>, std::vector<std::unique_ptr<WaitingRequest>>,
                         WaitingRequestComparator>
         waiting_queue_;
-    // using a separate variable to avoid locking just to check if the queue is empty.
-    std::atomic<bool> waiting_queue_empty_{true};
+    // Set under list_mtx_ before checking resources, and kept set while requests remain queued.
+    // Sequential consistency pairs the notification check with resource publication and reservation reads.
+    std::atomic<bool> reservation_notifications_needed_{false};
 
     // Quick lookup map for waiting requests (for timeout handling)
     std::unordered_map<uint64_t, WaitingRequest*> waiting_requests_map_;
