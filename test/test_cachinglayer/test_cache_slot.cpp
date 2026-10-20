@@ -960,8 +960,9 @@ TEST_F(CoroutineCacheTest, ManagerCreationAwaitsWarmupAndRejectsCancelledContext
     auto gate = std::make_shared<CacheLoadGate>();
     folly::CPUThreadPoolExecutor executor(1);
     auto unblock = folly::makeGuard([gate] { gate->finish.post(); });
-    auto creation = Manager::GetInstance().CreateCacheSlot<TestCell>(
+    auto creation = Manager::GetInstance().CreateCacheSlotAsync<TestCell>(
         std::make_unique<GatedTranslator>(gate, CacheWarmupPolicy::CacheWarmupPolicy_Sync));
+    EXPECT_EQ(gate->calls, 0);
     auto pending = folly::coro::co_withExecutor(folly::getKeepAliveToken(&executor), std::move(creation)).start();
     ASSERT_EQ(gate->started.wait_for(std::chrono::seconds(5)), std::future_status::ready);
     ExpectExecutorProgress(executor);
@@ -974,9 +975,52 @@ TEST_F(CoroutineCacheTest, ManagerCreationAwaitsWarmupAndRejectsCancelledContext
     milvus::OpContext ctx(cancellation.getToken());
     auto cancelled_gate = std::make_shared<CacheLoadGate>();
     auto cancelled =
-        Manager::GetInstance().CreateCacheSlot<TestCell>(std::make_unique<GatedTranslator>(cancelled_gate), &ctx);
+        Manager::GetInstance().CreateCacheSlotAsync<TestCell>(std::make_unique<GatedTranslator>(cancelled_gate), &ctx);
     EXPECT_THROW(folly::coro::blockingWait(std::move(cancelled)), milvus::SegcoreError);
     EXPECT_EQ(cancelled_gate->calls, 0);
+}
+
+TEST_F(CoroutineCacheTest, ManagerSynchronousCreationPreservesWarmupAndErrors) {
+    const auto original = TieredStorageConfig::GetInstance().GetSnapshot();
+    auto restore = folly::makeGuard([&] {
+        TieredStorageConfig::GetInstance().UpdateAll(original.storage_usage_tracking_enabled, original.loading_timeout,
+                                                     original.warmup_loading_timeout, original.warmup_policies);
+    });
+    Manager::ConfigureTieredStorage({}, CacheLimit{4096, 4096, 4096, 0, 0, 0}, false, true,
+                                    EvictionConfig{0, false, 600}, std::chrono::seconds(5));
+    auto cold_gate = std::make_shared<CacheLoadGate>();
+    std::shared_ptr<CacheSlot<TestCell>> cold =
+        Manager::GetInstance().CreateCacheSlot<TestCell>(std::make_unique<GatedTranslator>(cold_gate));
+    EXPECT_FALSE(cold->IsCached(0));
+    EXPECT_EQ(cold_gate->calls, 0);
+
+    auto gate = std::make_shared<CacheLoadGate>();
+    auto pending = std::async(std::launch::async, [gate] {
+        return Manager::GetInstance().CreateCacheSlot<TestCell>(
+            std::make_unique<GatedTranslator>(gate, CacheWarmupPolicy::CacheWarmupPolicy_Sync));
+    });
+    auto unblock = folly::makeGuard([gate] { gate->finish.post(); });
+    ASSERT_EQ(gate->started.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    EXPECT_EQ(pending.wait_for(std::chrono::milliseconds(0)), std::future_status::timeout);
+    gate->finish.post();
+    std::shared_ptr<CacheSlot<TestCell>> slot = pending.get();
+    EXPECT_TRUE(slot->IsCached(0));
+    EXPECT_EQ(gate->calls, 1);
+
+    auto failed_gate = std::make_shared<CacheLoadGate>();
+    failed_gate->fail = true;
+    failed_gate->finish.post();
+    EXPECT_THROW(Manager::GetInstance().CreateCacheSlot<TestCell>(
+                     std::make_unique<GatedTranslator>(failed_gate, CacheWarmupPolicy::CacheWarmupPolicy_Sync)),
+                 std::runtime_error);
+    EXPECT_EQ(failed_gate->calls, 1);
+
+    folly::CancellationSource cancellation;
+    cancellation.requestCancellation();
+    milvus::OpContext ctx(cancellation.getToken());
+    EXPECT_THROW(Manager::GetInstance().CreateCacheSlot<TestCell>(std::make_unique<GatedTranslator>(cold_gate), &ctx),
+                 milvus::SegcoreError);
+    EXPECT_EQ(cold_gate->calls, 0);
 }
 
 }  // namespace
