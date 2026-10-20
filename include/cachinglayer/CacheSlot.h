@@ -108,8 +108,9 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
 
     /**
      * @brief Await foreground warmup, or schedule background warmup on prefetch_pool.
-     * Call once before pinning. Background work uses its own cancellation context;
-     * foreground work borrows ctx until completion. No pool means foreground fallback.
+     * Call once before pinning. Background work holds a prefetch worker until completion
+     * and uses its own cancellation context; foreground work borrows ctx until completion.
+     * No pool means foreground fallback.
      */
     folly::coro::Task<void>
     Warmup(OpContext* ctx, const std::shared_ptr<folly::CPUThreadPoolExecutor>& prefetch_pool = nullptr) {
@@ -356,14 +357,19 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         }
         if (policy == CacheWarmupPolicy::CacheWarmupPolicy_Async) {
             if (prefetch_pool) {
+                std::weak_ptr<CacheSlot> weak_self = self;
                 auto token = self->warmup_cancel_source_.getToken();
-                folly::coro::co_withExecutor(folly::getKeepAliveToken(prefetch_pool.get()),
-                                             BackgroundWarmup(self, token))
-                    .start([token](folly::Try<void>&& result) {
-                        if (result.hasException() && !token.isCancellationRequested()) {
-                            LOG_ERROR("[MCL] Async warmup failed: {}", result.exception().what());
+                prefetch_pool->add([weak_self, token] {
+                    try {
+                        // Keep the worker occupied until issued loading work drains.
+                        folly::coro::blockingWait(BackgroundWarmup(weak_self, token));
+                    } catch (...) {
+                        if (!token.isCancellationRequested()) {
+                            LOG_ERROR("[MCL] Async warmup failed: {}",
+                                      folly::exception_wrapper(std::current_exception()).what());
                         }
-                    });
+                    }
+                });
                 co_return;
             }
             LOG_WARN("[MCL] Async warmup requested but no prefetch pool provided, falling back to sync");

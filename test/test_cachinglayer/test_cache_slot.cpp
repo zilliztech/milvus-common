@@ -619,20 +619,55 @@ TEST_F(CoroutineCacheTest, ForegroundWarmupSuspends) {
     EXPECT_TRUE(slot->IsCached(0));
 }
 
-TEST_F(CoroutineCacheTest, BackgroundWarmupSuspendsAndSharesDemandLoad) {
+TEST_F(CoroutineCacheTest, BackgroundWarmupSharesDemandLoad) {
     auto gate = std::make_shared<CacheLoadGate>();
     auto slot = MakeSlot(gate, CacheWarmupPolicy::CacheWarmupPolicy_Async);
     auto executor = std::make_shared<folly::CPUThreadPoolExecutor>(1);
+    folly::CPUThreadPoolExecutor demand_executor(1);
     auto unblock = folly::makeGuard([gate] { gate->finish.post(); });
     folly::coro::blockingWait(slot->Warmup(nullptr, executor));
     ASSERT_EQ(gate->started.wait_for(std::chrono::seconds(5)), std::future_status::ready);
     auto pending =
-        folly::coro::co_withExecutor(folly::getKeepAliveToken(executor.get()), slot->PinCells(nullptr, {0})).start();
-    ExpectExecutorProgress(*executor);
+        folly::coro::co_withExecutor(folly::getKeepAliveToken(&demand_executor), slot->PinCells(nullptr, {0})).start();
+    ExpectExecutorProgress(demand_executor);
     EXPECT_EQ(gate->calls, 1);
     gate->finish.post();
     EXPECT_NE(std::move(pending).get(), nullptr);
     executor->join();
+    EXPECT_EQ(DListTestFriend::get_loading_memory(*dlist), ResourceUsage{});
+}
+
+TEST_F(CoroutineCacheTest, BackgroundWarmupBoundsConcurrencyUntilCancelledLoadDrains) {
+    auto first_gate = std::make_shared<CacheLoadGate>();
+    auto second_gate = std::make_shared<CacheLoadGate>();
+    auto make_slot = [this](const std::shared_ptr<CacheLoadGate>& gate) {
+        return std::make_shared<CacheSlot<TestCell>>(
+            std::make_unique<GatedTranslator>(gate, CacheWarmupPolicy::CacheWarmupPolicy_Async), dlist.get(), false,
+            false, false, std::chrono::seconds(5), std::chrono::seconds(5));
+    };
+    auto first = make_slot(first_gate);
+    auto second = make_slot(second_gate);
+    auto executor = std::make_shared<folly::CPUThreadPoolExecutor>(1);
+    auto unblock = folly::makeGuard([&] {
+        first_gate->finish.post();
+        second_gate->finish.post();
+    });
+
+    folly::coro::blockingWait(first->Warmup(nullptr, executor));
+    ASSERT_EQ(first_gate->started.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    folly::coro::blockingWait(second->Warmup(nullptr, executor));
+    EXPECT_EQ(second_gate->started.wait_for(std::chrono::milliseconds(200)), std::future_status::timeout);
+
+    first->CancelWarmup();
+    EXPECT_EQ(second_gate->started.wait_for(std::chrono::milliseconds(200)), std::future_status::timeout);
+    first_gate->finish.post();
+    ASSERT_EQ(second_gate->started.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    second_gate->finish.post();
+    executor->join();
+    EXPECT_FALSE(first->IsCached(0));
+    EXPECT_TRUE(second->IsCached(0));
+    EXPECT_EQ(first_gate->calls, 1);
+    EXPECT_EQ(second_gate->calls, 1);
     EXPECT_EQ(DListTestFriend::get_loading_memory(*dlist), ResourceUsage{});
 }
 
