@@ -822,6 +822,66 @@ TEST_F(CoroutineCacheTest, ResourceWaitCancellationLeavesNoClaim) {
     EXPECT_EQ(gate->calls, 1);
 }
 
+TEST_F(CoroutineCacheTest, InlineReservationCompletionCanFinishLoad) {
+    for (const bool fail : {false, true}) {
+        SCOPED_TRACE(fail);
+        const ResourceUsage held{4096, 0};
+        ASSERT_TRUE(SemiInlineGet(dlist->ReserveLoadingResourceWithTimeout(held, std::chrono::milliseconds(0))));
+        auto gate = std::make_shared<CacheLoadGate>();
+        gate->fail = fail;
+        gate->finish.post();
+        auto slot = MakeSlot(gate);
+        auto pending = slot->PinCells(nullptr, {0}).via(&folly::InlineExecutor::instance());
+        ASSERT_FALSE(pending.isReady());
+        ASSERT_EQ(DListTestFriend::get_waiting_request_count(*dlist), 1);
+
+        // The resumed load immediately releases its reservation and reacquires the DList lock.
+        dlist->ReleaseLoadingResource(held);
+        ASSERT_TRUE(pending.isReady());
+        if (fail) {
+            EXPECT_THROW(std::move(pending).get(), std::runtime_error);
+            EXPECT_FALSE(slot->IsCached(0));
+        } else {
+            auto pin = std::move(pending).get();
+            EXPECT_NE(pin->get_cell_of(0), nullptr);
+            pin.reset();
+            EXPECT_TRUE(slot->ManualEvict(0));
+        }
+        EXPECT_EQ(gate->calls, 1);
+        EXPECT_EQ(DListTestFriend::get_loading_memory(*dlist), ResourceUsage{});
+    }
+}
+
+TEST_F(CoroutineCacheTest, NodeReleaseAllowsInlineReservationReentry) {
+    for (const bool evictable : {false, true}) {
+        SCOPED_TRACE(evictable);
+        auto gate = std::make_shared<CacheLoadGate>();
+        gate->finish.post();
+        auto slot =
+            std::make_shared<CacheSlot<TestCell>>(std::make_unique<GatedTranslator>(gate), dlist.get(), evictable, true,
+                                                  true, std::chrono::seconds(5), std::chrono::seconds(5));
+        auto pin = SemiInlineGet(slot->PinCells(nullptr, {0}));
+        ASSERT_TRUE(SemiInlineGet(dlist->ReserveLoadingResourceWithTimeout({3996, 0}, std::chrono::milliseconds(0))));
+        auto release = folly::makeGuard([&] { dlist->ReleaseLoadingResource({3996, 0}); });
+        auto pending = dlist->ReserveLoadingResourceWithTimeout({100, 0}, std::chrono::milliseconds(-1))
+                           .via(&folly::InlineExecutor::instance())
+                           .thenValue([&](bool success) {
+                               EXPECT_TRUE(success);
+                               EXPECT_FALSE(slot->IsCached(0));
+                               dlist->ReleaseLoadingResource({100, 0});
+                           });
+        ASSERT_FALSE(pending.isReady());
+        pin.reset();
+        if (!evictable) {
+            EXPECT_TRUE(slot->ManualEvict(0));
+        }
+        ASSERT_TRUE(pending.isReady());
+        EXPECT_NO_THROW(std::move(pending).get());
+        EXPECT_EQ(DListTestFriend::get_loading_memory(*dlist), (ResourceUsage{3996, 0}));
+        EXPECT_EQ(DListTestFriend::get_used_memory(*dlist), ResourceUsage{});
+    }
+}
+
 TEST_F(CoroutineCacheTest, ForegroundWarmupSuspends) {
     auto gate = std::make_shared<CacheLoadGate>();
     auto slot = MakeSlot(gate, CacheWarmupPolicy::CacheWarmupPolicy_Sync);

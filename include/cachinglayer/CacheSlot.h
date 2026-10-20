@@ -681,13 +681,16 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
 
         // use the default destructor
         ~CacheCell() override {
-            mark_unload([this]() {
+            ResourceUsage refund{};
+            mark_unload([this, &refund]() {
                 if (cell_) {
-                    auto saved_loaded_size = loaded_size_;
+                    refund = loaded_size_;
                     clear_data();
-                    slot_->dlist_->RefundLoadedResource(saved_loaded_size);
                 }
             });
+            if (refund.AnyGTZero()) {
+                slot_->dlist_->RefundLoadedResource(refund);
+            }
         }
 
         CellT*

@@ -95,18 +95,22 @@ class DListTestFriend {
         dlist->evictable_size_ += size;
         // If there are waiters, try to satisfy them
         if (!dlist->waiting_queue_empty_) {
-            std::vector<std::unique_ptr<DList::WaitingRequest>> to_destroy;
+            DList::WaitingRequestCompletions completions;
             {
                 std::unique_lock<std::mutex> lock(dlist->list_mtx_);
-                to_destroy = dlist->handleWaitingRequests();
+                dlist->handleWaitingRequests(completions);
             }
-            // Destroy requests outside lock to avoid deadlock with cancel callbacks
         }
     }
 
     static std::unique_lock<std::mutex>
     test_lock_list(DList* dlist) {
         return std::unique_lock<std::mutex>(dlist->list_mtx_);
+    }
+
+    static void
+    test_clear_waiting_queue(DList* dlist) {
+        dlist->clearWaitingQueue();
     }
 
     // nodes are from tail to head

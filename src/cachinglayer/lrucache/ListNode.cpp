@@ -78,6 +78,7 @@ ListNode::manual_evict() {
             }
             auto saved_loaded_size = loaded_size_;
             unload();
+            lock.unlock();
             dlist_->RefundLoadedResource(saved_loaded_size);
             return true;
         }
@@ -202,10 +203,22 @@ ListNode::state_to_string(State state) {
 
 void
 ListNode::unpin() {
-    std::unique_lock<std::shared_mutex> lock(mtx_);
-    if (pin_count_.fetch_sub(1) == 1 && evictable_ && (state_ == State::LOADED || state_ == State::CACHED)) {
-        touch_to_dlist(true);
+    bool made_evictable = false;
+    {
+        std::unique_lock<std::shared_mutex> lock(mtx_);
+        if (pin_count_.fetch_sub(1) == 1 && evictable_ && (state_ == State::LOADED || state_ == State::CACHED)) {
+            touch_to_dlist(true);
+            made_evictable = true;
+        }
     }
+    if (made_evictable) {
+        notify_waiting_requests();
+    }
+}
+
+void
+ListNode::notify_waiting_requests() {
+    dlist_->notifyWaitingRequests();
 }
 
 // ListNode::touch_to_dlist() should only be called when evictable_ is true
