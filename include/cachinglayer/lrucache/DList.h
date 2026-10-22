@@ -21,11 +21,11 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <list>
 #include <mutex>
 #include <optional>
 #include <queue>
 #include <unordered_map>
+#include <vector>
 
 #include "cachinglayer/LoadingOverhead.h"
 #include "cachinglayer/Metrics.h"
@@ -151,6 +151,8 @@ class DList : public std::enable_shared_from_this<DList> {
     // When timeout < 0, the request will wait indefinitely (no timeout).
     //   Note: negative timeout requests use time_point::max() as their deadline,
     //   which means they sort after all finite-deadline requests in the waiting queue.
+    // Consume reservation futures with blockingWait or a queued executor; inline
+    // continuations that recursively reserve/release resources are not supported.
     folly::SemiFuture<bool>
     ReserveLoadingResourceWithTimeout(const ResourceUsage& size, std::chrono::milliseconds timeout,
                                       OpContext* ctx = nullptr);
@@ -159,6 +161,7 @@ class DList : public std::enable_shared_from_this<DList> {
     // Group-managed overhead is capped across the bound Group before the
     // request total is scaled by loading_resource_factor.
     // A successful reservation may reserve zero bytes, so success is explicit.
+    // The same timeout and executor requirements apply as for the overload above.
     folly::SemiFuture<LoadingResourceReservationResult>
     ReserveLoadingResourceWithTimeout(const ResourceUsage& loaded, const ResourceUsage& overhead,
                                       const LoadingOverheadConfig* config, std::chrono::milliseconds timeout,
@@ -258,43 +261,21 @@ class DList : public std::enable_shared_from_this<DList> {
         }
     };
 
-    /**
-     * @brief Own claimed promises and retired requests until the DList lock is released.
-     * Declare before acquiring list_mtx_: destruction publishes results and destroys
-     * cancellation callbacks outside the lock, including during exception unwinding.
-     * Nested publication transfers ownership to the outer publisher on the same thread.
-     * Inline consumers must not synchronously wait for notifications deferred by their own callback.
-     */
-    struct WaitingRequestCompletions {
-        struct Completion {
-            std::unique_ptr<WaitingRequest> retired;
-            folly::Promise<bool> bool_promise{folly::Promise<bool>::makeEmpty()};
-            folly::Promise<LoadingResourceReservationResult> resource_promise{
-                folly::Promise<LoadingResourceReservationResult>::makeEmpty()};
-            LoadingResourceReservationResult result;
+    // Own a claimed result and any retired request until notification outside list_mtx_.
+    struct WaitingRequestCompletion {
+        std::unique_ptr<WaitingRequest> retired;
+        folly::Promise<bool> bool_promise{folly::Promise<bool>::makeEmpty()};
+        folly::Promise<LoadingResourceReservationResult> resource_promise{
+            folly::Promise<LoadingResourceReservationResult>::makeEmpty()};
+        LoadingResourceReservationResult result;
 
-            // Claim a result without running the waiting caller under list_mtx_.
-            void
-            SetResult(WaitingRequest& request, bool success, ResourceUsage actual = {}) noexcept {
-                result = {success, success ? actual : ResourceUsage{}};
-                bool_promise = std::move(request.bool_promise);
-                resource_promise = std::move(request.resource_promise);
-            }
-        };
-
-        ~WaitingRequestCompletions();
-
-        // Allocate a transferable batch before claiming promises or reserving resources.
-        std::vector<Completion>&
-        Entries() {
-            if (batches_.empty()) {
-                batches_.emplace_back();
-            }
-            return batches_.front();
+        // Claim a result without running the waiting caller under list_mtx_.
+        void
+        SetResult(WaitingRequest& request, bool success, ResourceUsage actual = {}) noexcept {
+            result = {success, success ? actual : ResourceUsage{}};
+            bool_promise = std::move(request.bool_promise);
+            resource_promise = std::move(request.resource_promise);
         }
-
-     private:
-        std::list<std::vector<Completion>> batches_;
     };
 
     struct LoadingResourceReservationAttempt {
@@ -373,12 +354,16 @@ class DList : public std::enable_shared_from_this<DList> {
     // This method should be called with list_mtx_ already held.
     // Completions must outlive the lock so promises and callbacks complete outside it.
     void
-    handleWaitingRequests(WaitingRequestCompletions& completions);
+    handleWaitingRequests(std::vector<WaitingRequestCompletion>& completions);
 
     // Fail one queued request and immediately retry requests behind it.
     // Must be called with list_mtx_ held; completions must outlive the lock.
     void
-    failWaitingRequest(uint64_t request_id, const char* reason, WaitingRequestCompletions& completions);
+    failWaitingRequest(uint64_t request_id, const char* reason, std::vector<WaitingRequestCompletion>& completions);
+
+    // Publish claimed results outside list_mtx_, including when a scope guard unwinds.
+    static void
+    completeWaitingRequests(std::vector<WaitingRequestCompletion>& completions);
 
     // Clear all waiting requests (used in destructor)
     void

@@ -1,6 +1,7 @@
 #include <folly/CancellationToken.h>
 #include <folly/ScopeGuard.h>
 #include <folly/executors/InlineExecutor.h>
+#include <folly/executors/ManualExecutor.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
@@ -272,6 +273,7 @@ TEST(DListNotificationTest, UnpinDuringReservationDoesNotLoseNotification) {
 }
 #endif
 
+// Inline callbacks probe lock release; they do not require recursive notification scheduling.
 TEST(DListInlineCompletionTest, NotificationsAllowReentry) {
     enum class Trigger { Release, Cancel, Timeout, Clear, Shrink };
     for (const bool group_aware : {false, true}) {
@@ -332,7 +334,7 @@ TEST(DListInlineCompletionTest, NotificationsAllowReentry) {
     }
 }
 
-TEST(DListInlineCompletionTest, QueuedLoadsDoNotNestNotifications) {
+TEST(DListNotificationTest, QueuedLoadsRunOnWaitingExecutor) {
     for (const bool group_aware : {false, true}) {
         SCOPED_TRACE(group_aware);
         constexpr int kLoads = 64;
@@ -342,8 +344,7 @@ TEST(DListInlineCompletionTest, QueuedLoadsDoNotNestNotifications) {
         auto dlist = std::make_shared<DList>(true, capacity, capacity, capacity, EvictionConfig{});
         ASSERT_TRUE(std::move(dlist->ReserveLoadingResourceWithTimeout(capacity, std::chrono::milliseconds(0))).get());
 
-        int depth = 0;
-        int max_depth = 0;
+        folly::ManualExecutor executor;
         int completed = 0;
         std::vector<folly::Future<folly::Unit>> loads;
         loads.reserve(kLoads);
@@ -356,11 +357,8 @@ TEST(DListInlineCompletionTest, QueuedLoadsDoNotNestNotifications) {
                               return result.success;
                           })
                     : dlist->ReserveLoadingResourceWithTimeout(loaded + overhead, std::chrono::milliseconds(-1));
-            loads.push_back(std::move(reservation).via(&folly::InlineExecutor::instance()).thenValue([&](bool success) {
+            loads.push_back(std::move(reservation).via(&executor).thenValue([&](bool success) {
                 ASSERT_TRUE(success);
-                ++depth;
-                max_depth = std::max(max_depth, depth);
-                auto leave = folly::makeGuard([&] { --depth; });
                 ++completed;
                 // Keep resident data charged: releasing temporary overhead alone must drain the queue.
                 dlist->ChargeLoadedResource(loaded);
@@ -373,13 +371,13 @@ TEST(DListInlineCompletionTest, QueuedLoadsDoNotNestNotifications) {
         }
         ASSERT_EQ(DLF::get_waiting_request_count(*dlist), kLoads);
         dlist->ReleaseLoadingResource(capacity);
+        EXPECT_EQ(completed, 0);
+        executor.drain();
         for (auto& load : loads) {
             ASSERT_TRUE(load.isReady());
             EXPECT_NO_THROW(std::move(load).get());
         }
         EXPECT_EQ(completed, kLoads);
-        EXPECT_EQ(max_depth, 1);
-        EXPECT_EQ(depth, 0);
         EXPECT_EQ(DLF::get_waiting_request_count(*dlist), 0);
         EXPECT_EQ(DLF::get_loading_memory(*dlist), ResourceUsage{});
         EXPECT_EQ(DLF::get_used_memory(*dlist), (ResourceUsage{kLoads, 0}));
@@ -387,56 +385,42 @@ TEST(DListInlineCompletionTest, QueuedLoadsDoNotNestNotifications) {
     }
 }
 
-TEST(DListInlineCompletionTest, NestedQueueClearOwnsCompletionsAfterListDestruction) {
+TEST(DListNotificationTest, QueueClearCompletesAfterListDestruction) {
     const ResourceUsage capacity{100, 0};
-    auto outer = std::make_shared<DList>(true, capacity, capacity, capacity, EvictionConfig{});
-    ASSERT_TRUE(std::move(outer->ReserveLoadingResourceWithTimeout(capacity, std::chrono::milliseconds(0))).get());
-    auto inner = std::make_shared<DList>(true, capacity, capacity, capacity, EvictionConfig{});
-    ASSERT_TRUE(std::move(inner->ReserveLoadingResourceWithTimeout(capacity, std::chrono::milliseconds(0))).get());
-    const std::weak_ptr<DList> weak_inner = inner;
+    auto dlist = std::make_shared<DList>(true, capacity, capacity, capacity, EvictionConfig{});
+    ASSERT_TRUE(std::move(dlist->ReserveLoadingResourceWithTimeout(capacity, std::chrono::milliseconds(0))).get());
+    const std::weak_ptr<DList> weak_dlist = dlist;
     folly::CancellationSource cancellation;
     milvus::OpContext ctx(cancellation.getToken());
-    bool in_outer_callback = false;
+    folly::ManualExecutor executor;
     int completed = 0;
     std::vector<folly::Future<folly::Unit>> waiters;
     waiters.reserve(2);
     for (const bool group_aware : {false, true}) {
         auto reservation =
             group_aware
-                ? inner->ReserveLoadingResourceWithTimeout({1, 0}, {}, nullptr, std::chrono::milliseconds(-1), &ctx)
+                ? dlist->ReserveLoadingResourceWithTimeout({1, 0}, {}, nullptr, std::chrono::milliseconds(-1), &ctx)
                       .deferValue([](auto result) { return result.success; })
-                : inner->ReserveLoadingResourceWithTimeout({1, 0}, std::chrono::milliseconds(-1), &ctx);
-        waiters.push_back(
-            std::move(reservation).via(&folly::InlineExecutor::instance()).thenValue([&, group_aware](bool success) {
-                EXPECT_FALSE(success);
-                EXPECT_FALSE(in_outer_callback);
-                EXPECT_TRUE(weak_inner.expired());
-                ++completed;
-                if (!group_aware) {
-                    throw std::runtime_error("notification consumer failed");
-                }
-            }));
+                : dlist->ReserveLoadingResourceWithTimeout({1, 0}, std::chrono::milliseconds(-1), &ctx);
+        waiters.push_back(std::move(reservation).via(&executor).thenValue([&, group_aware](bool success) {
+            EXPECT_FALSE(success);
+            EXPECT_TRUE(weak_dlist.expired());
+            ++completed;
+            if (!group_aware) {
+                throw std::runtime_error("notification consumer failed");
+            }
+        }));
     }
-    auto first = outer->ReserveLoadingResourceWithTimeout(capacity, std::chrono::milliseconds(-1))
-                     .via(&folly::InlineExecutor::instance())
-                     .thenValue([&](bool success) {
-                         ASSERT_TRUE(success);
-                         in_outer_callback = true;
-                         auto leave = folly::makeGuard([&] { in_outer_callback = false; });
-                         DLF::test_clear_waiting_queue(inner.get());
-                         inner->ReleaseLoadingResource(capacity);
-                         inner.reset();
-                         outer->ReleaseLoadingResource(capacity);
-                     });
-    outer->ReleaseLoadingResource(capacity);
-    ASSERT_TRUE(first.isReady());
-    EXPECT_NO_THROW(std::move(first).get());
+    DLF::test_clear_waiting_queue(dlist.get());
+    dlist->ReleaseLoadingResource(capacity);
+    dlist.reset();
+    EXPECT_EQ(completed, 0);
+    executor.drain();
     ASSERT_TRUE(waiters[0].isReady());
     ASSERT_TRUE(waiters[1].isReady());
     EXPECT_THROW(std::move(waiters[0]).get(), std::runtime_error);
     EXPECT_NO_THROW(std::move(waiters[1]).get());
     EXPECT_EQ(completed, 2);
-    EXPECT_EQ(DLF::get_loading_memory(*outer), ResourceUsage{});
 }
 
 TEST(DListInlineCompletionTest, CancellationNotifiesBeforeRequestLeavesQueue) {

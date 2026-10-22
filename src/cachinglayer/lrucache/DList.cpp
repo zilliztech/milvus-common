@@ -54,31 +54,15 @@ RequestLocalLoading(const ResourceUsage& loaded, const ResourceUsage& overhead, 
 
 }  // namespace
 
-// Drain on the notifying thread; splice keeps recursive publication allocation-free.
-DList::WaitingRequestCompletions::~WaitingRequestCompletions() {
-    if (batches_.empty() || batches_.front().empty()) {
-        return;
-    }
-    static thread_local std::list<std::vector<Completion>> pending;
-    static thread_local bool publishing = false;
-    pending.splice(pending.end(), batches_);
-    if (publishing) {
-        return;
-    }
-
-    publishing = true;
-    while (!pending.empty()) {
-        auto entries = std::move(pending.front());
-        pending.pop_front();
-        for (auto& completion : entries) {
-            if (completion.resource_promise.valid()) {
-                completion.resource_promise.setValue(completion.result);
-            } else if (completion.bool_promise.valid()) {
-                completion.bool_promise.setValue(completion.result.success);
-            }
+void
+DList::completeWaitingRequests(std::vector<WaitingRequestCompletion>& completions) {
+    for (auto& completion : completions) {
+        if (completion.resource_promise.valid()) {
+            completion.resource_promise.setValue(completion.result);
+        } else if (completion.bool_promise.valid()) {
+            completion.bool_promise.setValue(completion.result.success);
         }
     }
-    publishing = false;
 }
 
 LoadingOverheadGroupHandle
@@ -113,7 +97,8 @@ DList::BindLoadingOverheadGroups(const LoadingOverheadConfig& config) {
 
 void
 DList::UnbindLoadingOverheadGroups(const LoadingOverheadConfig& config) {
-    WaitingRequestCompletions completions;
+    std::vector<WaitingRequestCompletion> completions;
+    auto complete = folly::makeGuard([&] { completeWaitingRequests(completions); });
     {
         std::lock_guard<std::mutex> lock(list_mtx_);
         if (config.memory.has_value()) {
@@ -138,7 +123,8 @@ DList::UnbindLoadingOverheadGroups(const LoadingOverheadConfig& config) {
 
 LoadingOverheadUpdateResult
 DList::UpdateLoadingOverheadGroup(const LoadingOverheadGroupHandle& group, LoadingOverheadPolicy policy) {
-    WaitingRequestCompletions completions;
+    std::vector<WaitingRequestCompletion> completions;
+    auto complete = folly::makeGuard([&] { completeWaitingRequests(completions); });
     LoadingOverheadUpdateResult result;
     {
         std::unique_lock<std::mutex> lock(list_mtx_);
@@ -206,7 +192,8 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& loaded, const Reso
                     if (!self) {
                         return;
                     }
-                    WaitingRequestCompletions completions;
+                    std::vector<WaitingRequestCompletion> completions;
+                    auto complete = folly::makeGuard([&] { completeWaitingRequests(completions); });
                     {
                         std::unique_lock<std::mutex> lock(self->list_mtx_);
                         self->failWaitingRequest(request_id, "timed out", completions);
@@ -227,7 +214,8 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& loaded, const Reso
                 if (!self) {
                     return;
                 }
-                WaitingRequestCompletions completions;
+                std::vector<WaitingRequestCompletion> completions;
+                auto complete = folly::makeGuard([&] { completeWaitingRequests(completions); });
                 {
                     std::unique_lock<std::mutex> lock(self->list_mtx_);
                     self->failWaitingRequest(request_id, "cancelled", completions);
@@ -298,7 +286,8 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std
                     if (!self) {
                         return;  // DList already destroyed
                     }
-                    WaitingRequestCompletions completions;
+                    std::vector<WaitingRequestCompletion> completions;
+                    auto complete = folly::makeGuard([&] { completeWaitingRequests(completions); });
                     {
                         std::unique_lock<std::mutex> lock(self->list_mtx_);
                         self->failWaitingRequest(request_id, "timed out", completions);
@@ -322,7 +311,8 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std
                 if (!self) {
                     return;  // DList already destroyed
                 }
-                WaitingRequestCompletions completions;
+                std::vector<WaitingRequestCompletion> completions;
+                auto complete = folly::makeGuard([&] { completeWaitingRequests(completions); });
                 {
                     std::unique_lock<std::mutex> lock(self->list_mtx_);
                     self->failWaitingRequest(request_id, "cancelled", completions);
@@ -543,7 +533,8 @@ DList::reserveResourceInternalImpl(const ResourceUsage& size, std::function<void
 void
 DList::evictionLoop() {
     while (true) {
-        WaitingRequestCompletions completions;
+        std::vector<WaitingRequestCompletion> completions;
+        auto complete = folly::makeGuard([&] { completeWaitingRequests(completions); });
         std::unique_lock<std::mutex> lock(list_mtx_);
         if (bg_eviction_thread_cv_.wait_for(lock, eviction_config_.eviction_interval,
                                             [this] { return stop_bg_eviction_loop_.load(); })) {
@@ -764,7 +755,8 @@ DList::UpdateMaxLimit(const ResourceUsage& new_limit) {
                "[MCL] limit must be greater than high watermark. new_limit: "
                "{}, high_watermark: {}",
                new_limit.ToString(), high_watermark_.load().ToString());
-    WaitingRequestCompletions completions;
+    std::vector<WaitingRequestCompletion> completions;
+    auto complete = folly::makeGuard([&] { completeWaitingRequests(completions); });
     {
         std::unique_lock<std::mutex> list_lock(list_mtx_);
         auto using_resources = total_loaded_size_.load() + total_loading_size_.load();
@@ -788,7 +780,8 @@ DList::UpdateMaxLimit(const ResourceUsage& new_limit) {
 
 void
 DList::UpdateLowWatermark(const ResourceUsage& new_low_watermark) {
-    WaitingRequestCompletions completions;
+    std::vector<WaitingRequestCompletion> completions;
+    auto complete = folly::makeGuard([&] { completeWaitingRequests(completions); });
     {
         std::unique_lock<std::mutex> list_lock(list_mtx_);
         AssertInfo(new_low_watermark.AllGEZero(),
@@ -810,7 +803,8 @@ DList::UpdateLowWatermark(const ResourceUsage& new_low_watermark) {
 
 void
 DList::UpdateHighWatermark(const ResourceUsage& new_high_watermark) {
-    WaitingRequestCompletions completions;
+    std::vector<WaitingRequestCompletion> completions;
+    auto complete = folly::makeGuard([&] { completeWaitingRequests(completions); });
     {
         std::unique_lock<std::mutex> list_lock(list_mtx_);
         AssertInfo((new_high_watermark - low_watermark_.load()).AllGEZero(),
@@ -833,7 +827,8 @@ DList::UpdateHighWatermark(const ResourceUsage& new_high_watermark) {
 ResourceUsage
 DList::ReleaseLoadingResource(const ResourceUsage& loaded, const ResourceUsage& overhead,
                               const LoadingOverheadConfig* config) {
-    WaitingRequestCompletions completions;
+    std::vector<WaitingRequestCompletion> completions;
+    auto complete = folly::makeGuard([&] { completeWaitingRequests(completions); });
     LoadingOverheadDelta delta{.unscaled_delta = overhead};
     ResourceUsage unscaled;
     {
@@ -982,7 +977,8 @@ DList::notifyWaitingRequests() {
     if (!reservation_notifications_needed_) {
         return;
     }
-    WaitingRequestCompletions completions;
+    std::vector<WaitingRequestCompletion> completions;
+    auto complete = folly::makeGuard([&] { completeWaitingRequests(completions); });
     {
         std::unique_lock<std::mutex> lock(list_mtx_);
         handleWaitingRequests(completions);
@@ -990,7 +986,7 @@ DList::notifyWaitingRequests() {
 }
 
 void
-DList::handleWaitingRequests(WaitingRequestCompletions& completions) {
+DList::handleWaitingRequests(std::vector<WaitingRequestCompletion>& completions) {
     std::vector<std::unique_ptr<WaitingRequest>> deferred_requests;
     std::optional<std::chrono::steady_clock::time_point> blocked_deadline;
     auto restore_deferred = folly::makeGuard([&] {
@@ -1006,7 +1002,7 @@ DList::handleWaitingRequests(WaitingRequestCompletions& completions) {
             break;
         }
         // Allocate completion storage before claiming a request or reserving its resources.
-        auto& completion = completions.Entries().emplace_back();
+        auto& completion = completions.emplace_back();
         auto& request_ptr_ref = const_cast<std::unique_ptr<WaitingRequest>&>(waiting_queue_.top());
 
         // Check if request was already handled by timeout/cancel (not in map anymore)
@@ -1135,18 +1131,18 @@ DList::handleWaitingRequests(WaitingRequestCompletions& completions) {
             }
             LOG_DEBUG("[MCL] Request {} of size {} cannot be satisfied, checking peers with the same deadline.",
                       request->request_id, required_size.ToString());
-            completions.Entries().pop_back();
+            completions.pop_back();
         }
     }
 }
 
 void
-DList::failWaitingRequest(uint64_t request_id, const char* reason, WaitingRequestCompletions& completions) {
+DList::failWaitingRequest(uint64_t request_id, const char* reason, std::vector<WaitingRequestCompletion>& completions) {
     auto it = waiting_requests_map_.find(request_id);
     if (it == waiting_requests_map_.end()) {
         return;
     }
-    auto& completion = completions.Entries().emplace_back();
+    auto& completion = completions.emplace_back();
     LOG_WARN("[MCL] Waiting request {} {}.", request_id, reason);
     completion.SetResult(*it->second, false);
     waiting_requests_map_.erase(it);
@@ -1155,11 +1151,12 @@ DList::failWaitingRequest(uint64_t request_id, const char* reason, WaitingReques
 
 void
 DList::clearWaitingQueue() {
-    WaitingRequestCompletions completions;
+    std::vector<WaitingRequestCompletion> completions;
+    auto complete = folly::makeGuard([&] { completeWaitingRequests(completions); });
     {
         std::unique_lock<std::mutex> lock(list_mtx_);
         while (!waiting_queue_.empty()) {
-            auto& completion = completions.Entries().emplace_back();
+            auto& completion = completions.emplace_back();
             completion.retired = std::move(const_cast<std::unique_ptr<WaitingRequest>&>(waiting_queue_.top()));
             waiting_queue_.pop();
             auto& request = completion.retired;
