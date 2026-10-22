@@ -44,7 +44,7 @@ struct Meta {
     // Whether the translator supports strategy based eviction.
     // Does not affect manual eviction.
     bool support_eviction;
-    // Loading-overhead configuration for this translator.
+    // Shared-overhead configuration for this translator. Private overhead is never capped.
     // Each configured resource dimension is capped across CacheSlots sharing its group.
     // An omitted dimension passes through unchanged and remains subject to DList admission.
     // If the config is not set, no capping is applied (existing behavior).
@@ -73,19 +73,15 @@ class Translator {
     num_cells() const = 0;
     virtual cid_t
     cell_id_of(uid_t uid) const = 0;
-    // For resource reservation when a cell is about to be loaded.
-    // Returns {loaded_usage, loading_overhead}:
-    //   - loaded_usage (first): the final resource usage after the cell is fully loaded and in cache.
-    //   - loading_overhead (second): a conservative upper bound for the *temporary* resource usage during loading
-    //     (e.g., preprocessing buffers), excluding the final loaded usage. For grouped dimensions it must cover the
-    //     request's actual transient usage from successful DList reservation until the paired Release.
-    // When a loading_overhead dimension is configured in Meta, the total reservation across all CacheSlots sharing
-    // that dimension's group is governed by the Group policy. Omitted dimensions pass through unchanged.
-    // If a cell is about to be pinned and loaded, and there are not enough resource for it, EvictionManager
-    // will try to evict some other cells to make space. Both estimates must be greater than or equal to the actual
-    // usage. Underestimation can break admission safety and may make the load fail.
-    virtual std::pair<ResourceUsage, ResourceUsage>
-    estimated_byte_size_of_cell(cid_t cid) const = 0;
+    // Estimate one complete get_cells request, accounting for its loading concurrency.
+    // Resident is the sum of final cell sizes; each temporary category bounds its batch peak,
+    // excluding resident. Do not include private allocations in shared overhead: only scratch
+    // whose entire lifetime is covered by the bound group's runtime admission may be capped.
+    // Unbound shared dimensions pass through unchanged. All values must be non-negative and
+    // conservative from successful reservation until get_cells completes (including failure).
+    // Empty input returns zero. Loaded cells are charged individually using CellByteSize().
+    virtual LoadingResourceUsage
+    estimated_loading_usage(const std::vector<cid_t>& cids) const = 0;
     // must be unique to identify a CacheSlot.
     virtual const std::string&
     key() const = 0;

@@ -41,13 +41,13 @@ ClampNonNegative(std::atomic<ResourceUsage>& counter, LogFn&& log_fn) {
 namespace {
 
 ResourceUsage
-RequestLocalLoading(const ResourceUsage& loaded, const ResourceUsage& overhead, const LoadingOverheadConfig* config) {
-    auto local = loaded;
+RequestLocalLoading(const LoadingResourceUsage& usage, const LoadingOverheadConfig* config) {
+    auto local = usage.resident + usage.private_overhead;
     if (config == nullptr || !config->memory.has_value()) {
-        local.memory_bytes += overhead.memory_bytes;
+        local.memory_bytes += usage.shared_overhead.memory_bytes;
     }
     if (config == nullptr || !config->file.has_value()) {
-        local.file_bytes += overhead.file_bytes;
+        local.file_bytes += usage.shared_overhead.file_bytes;
     }
     return local;
 }
@@ -137,21 +137,19 @@ DList::UpdateLoadingOverheadGroup(const LoadingOverheadGroupHandle& group, Loadi
 }
 
 folly::SemiFuture<LoadingResourceReservationResult>
-DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& loaded, const ResourceUsage& overhead,
-                                         const LoadingOverheadConfig* config, std::chrono::milliseconds timeout,
-                                         OpContext* ctx) {
+DList::ReserveLoadingResourceWithTimeout(const LoadingResourceUsage& usage, const LoadingOverheadConfig* config,
+                                         std::chrono::milliseconds timeout, OpContext* ctx) {
     std::unique_lock<std::mutex> lock(list_mtx_);
     // Arm before inspecting resources so a concurrent release cannot miss an about-to-enqueue request.
     reservation_notifications_needed_ = true;
     auto restore_notifications = folly::makeGuard([&] { reservation_notifications_needed_ = !waiting_queue_.empty(); });
     TEST_SYNC_POINT("DList::Reserve:BeforeAttempt");
-    auto attempt = reserveResourceInternalWithOverhead(loaded, overhead, config);
+    auto attempt = reserveResourceInternalWithOverhead(usage, config);
     if (attempt.result.success) {
         return folly::makeSemiFuture(attempt.result);
     }
 
-    const auto minimum_required_size =
-        RequestLocalLoading(loaded, overhead, config) * eviction_config_.loading_resource_factor;
+    const auto minimum_required_size = RequestLocalLoading(usage, config) * eviction_config_.loading_resource_factor;
     if (!max_resource_limit_.load().CanHold(minimum_required_size)) {
         LOG_ERROR(
             "[MCL] Failed to reserve Group-aware loading resource because the minimum requirement={} "
@@ -170,7 +168,7 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& loaded, const Reso
     auto [promise, future] = folly::makePromiseContract<LoadingResourceReservationResult>();
     uint64_t request_id = next_request_id_.fetch_add(1);
 
-    auto waiting_request = std::make_unique<WaitingRequest>(attempt.required_size, loaded, overhead, config, deadline,
+    auto waiting_request = std::make_unique<WaitingRequest>(attempt.required_size, usage, config, deadline,
                                                             std::move(promise), request_id);
     WaitingRequest* request_ptr = waiting_request.get();
     waiting_requests_map_[request_id] = request_ptr;
@@ -178,8 +176,9 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& loaded, const Reso
     std::weak_ptr<DList> weak_self = shared_from_this();
 
     if (timeout.count() > 0) {
-        LOG_DEBUG("[MCL] Request {} loaded={} overhead={} added to waiting queue, timeout={}ms", request_id,
-                  loaded.ToString(), overhead.ToString(), timeout.count());
+        LOG_DEBUG("[MCL] Request {} resident={} private={} shared={} added to waiting queue, timeout={}ms", request_id,
+                  usage.resident.ToString(), usage.private_overhead.ToString(), usage.shared_overhead.ToString(),
+                  timeout.count());
 
         event_base_thread_->getEventBase()->runInEventBaseThread([weak_self, request_id, timeout]() {
             auto self = weak_self.lock();
@@ -413,20 +412,19 @@ DList::releaseLoadingOverhead(const LoadingOverheadConfig& config, const Resourc
 }
 
 DList::LoadingResourceReservationAttempt
-DList::reserveResourceInternalWithOverhead(const ResourceUsage& loaded, const ResourceUsage& overhead,
-                                           const LoadingOverheadConfig* config) {
-    const auto delta = config != nullptr ? reserveLoadingOverhead(*config, overhead)
-                                         : LoadingOverheadDelta{.unscaled_delta = overhead};
+DList::reserveResourceInternalWithOverhead(const LoadingResourceUsage& usage, const LoadingOverheadConfig* config) {
+    const auto delta = config != nullptr ? reserveLoadingOverhead(*config, usage.shared_overhead)
+                                         : LoadingOverheadDelta{.unscaled_delta = usage.shared_overhead};
 
-    auto rollback = [this, config, overhead, delta]() {
+    auto rollback = [this, config, shared = usage.shared_overhead, delta]() {
         if (config != nullptr) {
-            rollbackLoadingOverhead(*config, overhead, delta.unscaled_delta);
+            rollbackLoadingOverhead(*config, shared, delta.unscaled_delta);
         }
     };
 
-    const auto unscaled = loaded + delta.unscaled_delta;
-    const auto scaled = RequestLocalLoading(loaded, overhead, config) * eviction_config_.loading_resource_factor +
-                        delta.scaled_group_delta;
+    const auto unscaled = usage.resident + usage.private_overhead + delta.unscaled_delta;
+    const auto scaled =
+        RequestLocalLoading(usage, config) * eviction_config_.loading_resource_factor + delta.scaled_group_delta;
 
     if (!max_resource_limit_.load().CanHold(scaled)) {
         rollback();
@@ -439,10 +437,11 @@ DList::reserveResourceInternalWithOverhead(const ResourceUsage& loaded, const Re
     }
 
     LOG_TRACE(
-        "[MCL] reserve with loading-overhead Groups: loaded={}, overhead={}, delta={}, unscaled={}, scaled={}, "
+        "[MCL] reserve with loading-overhead Groups: resident={}, private={}, shared={}, delta={}, unscaled={}, "
+        "scaled={}, "
         "total_loading={}",
-        loaded.ToString(), overhead.ToString(), delta.unscaled_delta.ToString(), unscaled.ToString(), scaled.ToString(),
-        total_loading_size_.load().ToString());
+        usage.resident.ToString(), usage.private_overhead.ToString(), usage.shared_overhead.ToString(),
+        delta.unscaled_delta.ToString(), unscaled.ToString(), scaled.ToString(), total_loading_size_.load().ToString());
     return {.result = LoadingResourceReservationResult{.success = true, .reserved = unscaled}, .required_size = scaled};
 }
 
@@ -825,24 +824,26 @@ DList::UpdateHighWatermark(const ResourceUsage& new_high_watermark) {
 }
 
 ResourceUsage
-DList::ReleaseLoadingResource(const ResourceUsage& loaded, const ResourceUsage& overhead,
-                              const LoadingOverheadConfig* config) {
+DList::ReleaseLoadingResource(const LoadingResourceUsage& usage, const LoadingOverheadConfig* config) {
     std::vector<WaitingRequestCompletion> completions;
     auto complete = folly::makeGuard([&] { completeWaitingRequests(completions); });
-    LoadingOverheadDelta delta{.unscaled_delta = overhead};
+    LoadingOverheadDelta delta{.unscaled_delta = usage.shared_overhead};
     ResourceUsage unscaled;
     {
         std::unique_lock<std::mutex> lock(list_mtx_);
         if (config != nullptr) {
-            delta = releaseLoadingOverhead(*config, overhead);
+            delta = releaseLoadingOverhead(*config, usage.shared_overhead);
         }
-        unscaled = loaded + delta.unscaled_delta;
-        const auto scaled = RequestLocalLoading(loaded, overhead, config) * eviction_config_.loading_resource_factor +
-                            delta.scaled_group_delta;
+        unscaled = usage.resident + usage.private_overhead + delta.unscaled_delta;
+        const auto scaled =
+            RequestLocalLoading(usage, config) * eviction_config_.loading_resource_factor + delta.scaled_group_delta;
         total_loading_size_ -= scaled;
         ClampNonNegative(total_loading_size_, [&](const ResourceUsage& curr) {
-            LOG_ERROR("[MCL] total_loading_size_ negative after Group release: loaded={}, overhead={}, current={}",
-                      loaded.ToString(), overhead.ToString(), curr.ToString());
+            LOG_ERROR(
+                "[MCL] total_loading_size_ negative after Group release: resident={}, private={}, shared={}, "
+                "current={}",
+                usage.resident.ToString(), usage.private_overhead.ToString(), usage.shared_overhead.ToString(),
+                curr.ToString());
         });
         handleWaitingRequests(completions);
     }
@@ -1050,7 +1051,7 @@ DList::handleWaitingRequests(std::vector<WaitingRequestCompletion>& completions)
         auto attempted_requirement = request_ptr_ref->required_size;
         if (request_ptr_ref->use_resource_promise) {
             try {
-                auto attempt = reserveResourceInternalWithOverhead(request_ptr_ref->loaded, request_ptr_ref->overhead,
+                auto attempt = reserveResourceInternalWithOverhead(request_ptr_ref->usage,
                                                                    request_ptr_ref->loadingOverheadConfig());
                 fulfilled = attempt.result.success;
                 actual = attempt.result.reserved;
@@ -1088,13 +1089,13 @@ DList::handleWaitingRequests(std::vector<WaitingRequestCompletion>& completions)
                 LOG_WARN("[MCL] Request {} was already handled by timeout/cancel, rolling back.", request->request_id);
                 if (request->use_resource_promise) {
                     const auto* config = request->loadingOverheadConfig();
-                    auto delta = LoadingOverheadDelta{.unscaled_delta = request->overhead};
+                    auto delta = LoadingOverheadDelta{.unscaled_delta = request->usage.shared_overhead};
                     if (config != nullptr) {
-                        delta = releaseLoadingOverhead(*config, request->overhead);
+                        delta = releaseLoadingOverhead(*config, request->usage.shared_overhead);
                     }
-                    const auto scaled = RequestLocalLoading(request->loaded, request->overhead, config) *
-                                            eviction_config_.loading_resource_factor +
-                                        delta.scaled_group_delta;
+                    const auto scaled =
+                        RequestLocalLoading(request->usage, config) * eviction_config_.loading_resource_factor +
+                        delta.scaled_group_delta;
                     total_loading_size_ -= scaled;
                 } else {
                     total_loading_size_ -= actual;
@@ -1105,8 +1106,7 @@ DList::handleWaitingRequests(std::vector<WaitingRequestCompletion>& completions)
                 request_ptr_ref->use_resource_promise ? attempted_requirement : request_ptr_ref->required_size;
             const auto minimum_required_size =
                 request_ptr_ref->use_resource_promise
-                    ? RequestLocalLoading(request_ptr_ref->loaded, request_ptr_ref->overhead,
-                                          request_ptr_ref->loadingOverheadConfig()) *
+                    ? RequestLocalLoading(request_ptr_ref->usage, request_ptr_ref->loadingOverheadConfig()) *
                           eviction_config_.loading_resource_factor
                     : required_size;
             if (!max_resource_limit_.load().CanHold(minimum_required_size)) {

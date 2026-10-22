@@ -47,8 +47,8 @@ class LoadingOverheadGroupTest : public ::testing::Test {
 
     ResourceUsage
     Reserve(const LoadingOverheadConfig& binding, ResourceUsage overhead) {
-        auto result = std::move(dlist_->ReserveLoadingResourceWithTimeout(
-                                    /*loaded=*/{}, overhead, &binding, std::chrono::milliseconds(0)))
+        auto result = std::move(dlist_->ReserveLoadingResourceWithTimeout({{}, {}, overhead}, &binding,
+                                                                          std::chrono::milliseconds(0)))
                           .get();
         EXPECT_TRUE(result.success);
         return result.reserved;
@@ -56,7 +56,7 @@ class LoadingOverheadGroupTest : public ::testing::Test {
 
     ResourceUsage
     Release(const LoadingOverheadConfig& binding, ResourceUsage overhead) {
-        return dlist_->ReleaseLoadingResource(/*loaded=*/{}, overhead, &binding);
+        return dlist_->ReleaseLoadingResource({{}, {}, overhead}, &binding);
     }
 
     void
@@ -161,8 +161,8 @@ TEST_F(LoadingOverheadGroupTest, NegativeDemandReturnsInvalidParameter) {
     auto binding = BindMemory(group, 0);
 
     ExpectInvalidParameter([&] {
-        (void)std::move(dlist_->ReserveLoadingResourceWithTimeout(
-                            /*loaded=*/{}, /*overhead=*/{-1, 0}, &binding, std::chrono::milliseconds(0)))
+        (void)std::move(
+            dlist_->ReserveLoadingResourceWithTimeout({{}, {}, {-1, 0}}, &binding, std::chrono::milliseconds(0)))
             .get();
     });
 }
@@ -228,8 +228,8 @@ TEST_F(LoadingOverheadGroupTest, AggregateOverflowIsRejectedBeforeEitherDimensio
     constexpr auto kMax = std::numeric_limits<int64_t>::max();
     EXPECT_EQ(Reserve(file_only, {0, kMax}), (ResourceUsage{0, 1}));
     ExpectInvalidParameter([&] {
-        (void)std::move(dlist_->ReserveLoadingResourceWithTimeout(
-                            /*loaded=*/{}, /*overhead=*/{5, 1}, &both_dimensions, std::chrono::milliseconds(0)))
+        (void)std::move(
+            dlist_->ReserveLoadingResourceWithTimeout({{}, {}, {5, 1}}, &both_dimensions, std::chrono::milliseconds(0)))
             .get();
     });
 
@@ -332,9 +332,9 @@ TEST_F(LoadingOverheadGroupTest, FailedReserveRevertsDeltaAfterPolicyExpansion) 
               LoadingOverheadUpdateResult::kApplied);
 
     ASSERT_TRUE(std::move(dlist_->ReserveLoadingResourceWithTimeout({999'700, 0}, std::chrono::milliseconds(0))).get());
-    const auto failed = std::move(dlist_->ReserveLoadingResourceWithTimeout(
-                                      /*loaded=*/{}, /*overhead=*/{100, 0}, &binding, std::chrono::milliseconds(0)))
-                            .get();
+    const auto failed =
+        std::move(dlist_->ReserveLoadingResourceWithTimeout({{}, {}, {100, 0}}, &binding, std::chrono::milliseconds(0)))
+            .get();
     EXPECT_FALSE(failed.success);
     dlist_->ReleaseLoadingResource({999'700, 0});
 

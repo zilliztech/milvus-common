@@ -517,10 +517,6 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     // Retain the reservation until the translator completes; the caller publishes errors.
     folly::coro::Task<void>
     RunLoad(OpContext* ctx, const std::unordered_set<cid_t>& cids, std::chrono::milliseconds timeout) {
-        // loaded_resource: the estimated final resource usage (from .first), reserved unconditionally.
-        // loading_overhead: the estimated temporary overhead during loading (from .second).
-        //   Configured dimensions are capped by their loading-overhead Group; omitted dimensions
-        //   pass through unchanged. DList derives the incremental reservation from the Group target transition.
         auto start = std::chrono::steady_clock::now();
 
         std::vector<cid_t> loading_cids(cids.begin(), cids.end());
@@ -547,31 +543,12 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         // bonus cells should be empty if self_reserve_ is false.
         auto bonus_cids = translator_->bonus_cells_to_be_loaded(loading_cids);
 
-        ResourceUsage essential_loaded_resource{};
-        ResourceUsage essential_loading_overhead{};
-        for (auto& cid : loading_cids) {
-            auto [loaded, loading] = translator_->estimated_byte_size_of_cell(cid);
-            essential_loaded_resource += loaded;
-            essential_loading_overhead += loading;
-        }
+        const auto essential_count = loading_cids.size();
+        loading_cids.insert(loading_cids.end(), bonus_cids.begin(), bonus_cids.end());
+        auto usage = translator_->estimated_loading_usage(loading_cids);
 
-        ResourceUsage bonus_loaded_resource{};
-        ResourceUsage bonus_loading_overhead{};
-        for (auto& cid : bonus_cids) {
-            auto [loaded, loading] = translator_->estimated_byte_size_of_cell(cid);
-            bonus_loaded_resource += loaded;
-            bonus_loading_overhead += loading;
-        }
-
-        // loaded_resource is reserved unconditionally from DList (no capping).
-        // loading_overhead goes through its Groups: configured dimensions return the change
-        // in min(sum, bound), while omitted dimensions return their full overhead.
-        auto loaded_resource = essential_loaded_resource + bonus_loaded_resource;
-        auto loading_overhead = essential_loading_overhead + bonus_loading_overhead;
-
-        // Zero-resource cells: skip DList reservation entirely and load directly.
-        // set_cell() will ChargeLoadedResource with the actual size after loading.
-        if (!loaded_resource.AnyGTZero() && !loading_overhead.AnyGTZero()) {
+        // Zero-resource cells are charged by set_cell() after loading.
+        if (!usage.resident.AnyGTZero() && !usage.private_overhead.AnyGTZero() && !usage.shared_overhead.AnyGTZero()) {
             co_await run_load_internal();
             co_return;
         }
@@ -580,8 +557,8 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         // If that fails, fall back to essential-only with the real timeout.
         // This avoids blocking in the waiting queue for a bonus attempt that could retry immediately.
         auto reserve_timeout = bonus_cids.empty() ? timeout : std::chrono::milliseconds(0);
-        auto reservation = co_await dlist_->ReserveLoadingResourceWithTimeout(
-            loaded_resource, loading_overhead, loadingOverheadConfig(), reserve_timeout, ctx);
+        auto reservation =
+            co_await dlist_->ReserveLoadingResourceWithTimeout(usage, loadingOverheadConfig(), reserve_timeout, ctx);
         auto actual_dlist_reserve = reservation.reserved;
         bool reservation_success = reservation.success;
 
@@ -595,7 +572,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                 return;
             }
             try {
-                dlist_->ReleaseLoadingResource(loaded_resource, loading_overhead, loadingOverheadConfig());
+                dlist_->ReleaseLoadingResource(usage, loadingOverheadConfig());
                 if (metrics_tracked) {
                     monitor::cache_cell_loading_count(cell_data_type_, storage_type_).Decrement(loading_cids_count);
                     monitor::cache_loading_bytes(cell_data_type_, StorageType::MEMORY)
@@ -612,42 +589,39 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             }
         });
 
-        if (!bonus_cids.empty()) {
-            if (!reservation_success) {
-                // Bonus+essential failed immediately — retry with essential only using real timeout.
-                LOG_WARN(
-                    "[MCL] CacheSlot reserve loading resource with bonus cells failed, try to reserve only "
-                    "essential loading resource");
-                loaded_resource = essential_loaded_resource;
-                loading_overhead = essential_loading_overhead;
-                reservation = co_await dlist_->ReserveLoadingResourceWithTimeout(loaded_resource, loading_overhead,
-                                                                                 loadingOverheadConfig(), timeout, ctx);
-                actual_dlist_reserve = reservation.reserved;
-                reservation_success = reservation.success;
-            } else {
-                loading_cids.insert(loading_cids.end(), bonus_cids.begin(), bonus_cids.end());
-            }
+        if (!bonus_cids.empty() && !reservation_success) {
+            LOG_WARN(
+                "[MCL] CacheSlot reserve loading resource with bonus cells failed, try to reserve only "
+                "essential loading resource");
+            loading_cids.resize(essential_count);
+            // Batch peaks need not be additive, so estimate the actual retry request.
+            usage = translator_->estimated_loading_usage(loading_cids);
+            reservation =
+                co_await dlist_->ReserveLoadingResourceWithTimeout(usage, loadingOverheadConfig(), timeout, ctx);
+            actual_dlist_reserve = reservation.reserved;
+            reservation_success = reservation.success;
         }
 
         if (!reservation_success) {
             LOG_ERROR(
                 "[MCL] CacheSlot failed to reserve resource for "
                 "cells: key={}, cell_ids=[{}], "
-                "loaded_resource={}, loading_overhead={}, actual_dlist_reserve={}",
-                translator_->key(), fmt::join(loading_cids, ","), loaded_resource.ToString(),
-                loading_overhead.ToString(), actual_dlist_reserve.ToString());
+                "resident={}, private_overhead={}, shared_overhead={}, actual_dlist_reserve={}",
+                translator_->key(), fmt::join(loading_cids, ","), usage.resident.ToString(),
+                usage.private_overhead.ToString(), usage.shared_overhead.ToString(), actual_dlist_reserve.ToString());
             ThrowInfo(ErrorCode::InsufficientResource,
                       "[MCL] CacheSlot failed to reserve resource for "
                       "cells: key={}, cell_ids=[{}], "
-                      "loaded_resource={}, loading_overhead={}, actual_dlist_reserve={}",
-                      translator_->key(), fmt::join(loading_cids, ","), loaded_resource.ToString(),
-                      loading_overhead.ToString(), actual_dlist_reserve.ToString());
+                      "resident={}, private_overhead={}, shared_overhead={}, actual_dlist_reserve={}",
+                      translator_->key(), fmt::join(loading_cids, ","), usage.resident.ToString(),
+                      usage.private_overhead.ToString(), usage.shared_overhead.ToString(),
+                      actual_dlist_reserve.ToString());
         }
 
         // Track the active request estimate rather than the mutable Group reservation.
         // Group reconfiguration may change DList bookkeeping while this request is in flight,
         // but the metric must decrement the same value that it incremented.
-        metric_loading_resource = loaded_resource + loading_overhead;
+        metric_loading_resource = usage.resident + usage.private_overhead + usage.shared_overhead;
         monitor::cache_loading_bytes(cell_data_type_, StorageType::MEMORY)
             .Increment(metric_loading_resource.memory_bytes);
         monitor::cache_loading_bytes(cell_data_type_, StorageType::DISK).Increment(metric_loading_resource.file_bytes);
@@ -657,13 +631,13 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
 
         LOG_TRACE(
             "[MCL] CacheSlot reserveLoadingResourceWithTimeout {} sec "
-            "result: {} time: {} sec, loaded_resource: {}, loading_overhead: {}, "
+            "result: {} time: {} sec, resident: {}, private_overhead: {}, shared_overhead: {}, "
             "actual_dlist_reserve: {}, key: {}",
             timeout.count() / 1000.0, reservation_success ? "success" : "failed",
             std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count() *
                 1.0 / 1000,
-            loaded_resource.ToString(), loading_overhead.ToString(), actual_dlist_reserve.ToString(),
-            translator_->key());
+            usage.resident.ToString(), usage.private_overhead.ToString(), usage.shared_overhead.ToString(),
+            actual_dlist_reserve.ToString(), translator_->key());
 
         co_await run_load_internal();
     }
@@ -714,7 +688,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                             "[MCL] CacheSlot Cell {} has zero size, use "
                             "estimated size from translator",
                             key());
-                        loaded_size_ = slot_->translator_->estimated_byte_size_of_cell(cid_).first;
+                        loaded_size_ = slot_->translator_->estimated_loading_usage({cid_}).resident;
                     }
                     slot_->dlist_->ChargeLoadedResource(loaded_size_);
                     life_start_ = std::chrono::steady_clock::now();
