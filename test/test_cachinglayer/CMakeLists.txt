@@ -36,6 +36,9 @@ target_link_libraries(cachinglayer_test
 if(NOT APPLE)
     target_link_libraries(cachinglayer_test atomic gomp)
 endif()
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_options(cachinglayer_test PRIVATE "LINKER:--wrap=folly_coro_async_malloc")
+endif()
 
 add_test(NAME cachinglayer_test COMMAND cachinglayer_test)
 

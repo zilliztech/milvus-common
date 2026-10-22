@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <folly/coro/BlockingWait.h>
 #include <folly/futures/Future.h>
 #include <prometheus/counter.h>
 #include <prometheus/gauge.h>
@@ -21,7 +22,6 @@
 
 #include "common/CommonMonitor.h"
 #include "common/EasyAssert.h"
-#include "folly/executors/InlineExecutor.h"
 
 namespace milvus::cachinglayer {
 
@@ -48,12 +48,15 @@ enum class CellIdMappingMode : uint8_t {
     ALWAYS_ZERO = 2,  // the cell id is always 0
 };
 
-// TODO(tiered storage 4): this is a temporary function to get the result of a future
-// by running it on the inline executor. We don't need this once we are fully async.
+// Drive unbound continuations on the waiting thread, including after suspension.
+// Do not block an executor needed to complete this future.
 template <typename T>
 T
 SemiInlineGet(folly::SemiFuture<T>&& future) {
-    return std::move(future).via(&folly::InlineExecutor::instance()).get();
+    if (future.isReady()) {
+        return std::move(future).get();
+    }
+    return folly::coro::blockingWait(std::move(future));
 }
 
 inline std::string

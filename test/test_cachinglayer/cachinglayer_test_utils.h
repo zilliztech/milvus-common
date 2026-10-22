@@ -27,6 +27,12 @@ using namespace cachinglayer;
 namespace cachinglayer::internal {
 class DListTestFriend {
  public:
+    static size_t
+    get_waiting_request_count(const DList& dlist) {
+        std::lock_guard lock(dlist.list_mtx_);
+        return dlist.waiting_requests_map_.size();
+    }
+
     static ResourceUsage
     get_using_memory(const DList& dlist) {
         return dlist.total_loaded_size_.load() + dlist.total_loading_size_.load();
@@ -87,20 +93,22 @@ class DListTestFriend {
     static void
     test_add_evictable_memory(DList* dlist, const ResourceUsage& size) {
         dlist->evictable_size_ += size;
-        // If there are waiters, try to satisfy them
-        if (!dlist->waiting_queue_empty_) {
-            std::vector<std::unique_ptr<DList::WaitingRequest>> to_destroy;
-            {
-                std::unique_lock<std::mutex> lock(dlist->list_mtx_);
-                to_destroy = dlist->handleWaitingRequests();
-            }
-            // Destroy requests outside lock to avoid deadlock with cancel callbacks
-        }
+        dlist->notifyWaitingRequests();
     }
 
     static std::unique_lock<std::mutex>
     test_lock_list(DList* dlist) {
         return std::unique_lock<std::mutex>(dlist->list_mtx_);
+    }
+
+    static bool
+    test_notifications_needed(const DList& dlist) {
+        return dlist.reservation_notifications_needed_.load();
+    }
+
+    static void
+    test_clear_waiting_queue(DList* dlist) {
+        dlist->clearWaitingQueue();
     }
 
     // nodes are from tail to head

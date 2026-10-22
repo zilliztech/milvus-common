@@ -25,6 +25,7 @@
 #include <optional>
 #include <queue>
 #include <unordered_map>
+#include <vector>
 
 #include "cachinglayer/LoadingOverhead.h"
 #include "cachinglayer/Metrics.h"
@@ -150,6 +151,8 @@ class DList : public std::enable_shared_from_this<DList> {
     // When timeout < 0, the request will wait indefinitely (no timeout).
     //   Note: negative timeout requests use time_point::max() as their deadline,
     //   which means they sort after all finite-deadline requests in the waiting queue.
+    // Consume reservation futures with blockingWait or a queued executor; inline
+    // continuations that recursively reserve/release resources are not supported.
     folly::SemiFuture<bool>
     ReserveLoadingResourceWithTimeout(const ResourceUsage& size, std::chrono::milliseconds timeout,
                                       OpContext* ctx = nullptr);
@@ -158,6 +161,7 @@ class DList : public std::enable_shared_from_this<DList> {
     // Group-managed overhead is capped across the bound Group before the
     // request total is scaled by loading_resource_factor.
     // A successful reservation may reserve zero bytes, so success is explicit.
+    // The same timeout and executor requirements apply as for the overload above.
     folly::SemiFuture<LoadingResourceReservationResult>
     ReserveLoadingResourceWithTimeout(const ResourceUsage& loaded, const ResourceUsage& overhead,
                                       const LoadingOverheadConfig* config, std::chrono::milliseconds timeout,
@@ -190,6 +194,7 @@ class DList : public std::enable_shared_from_this<DList> {
     // force_touch is used to force a DList touch event, mainly for testing.
     //
     // If the item is really touched by DList, its last_touch_ time will be updated.
+    // The caller must notifyWaitingRequests after releasing the node lock when size is added.
     void
     touchItem(ListNode* list_node, bool force_touch = false, std::optional<ResourceUsage> size = std::nullopt);
 
@@ -209,6 +214,7 @@ class DList : public std::enable_shared_from_this<DList> {
 
  private:
     friend class DListTestFriend;
+    friend class ListNode;
 
     // Waiting request for timeout-based memory reservation
     struct WaitingRequest {
@@ -253,15 +259,22 @@ class DList : public std::enable_shared_from_this<DList> {
         loadingOverheadConfig() const {
             return loading_overhead_config ? &loading_overhead_config.value() : nullptr;
         }
+    };
 
+    // Own a claimed result and any retired request until notification outside list_mtx_.
+    struct WaitingRequestCompletion {
+        std::unique_ptr<WaitingRequest> retired;
+        folly::Promise<bool> bool_promise{folly::Promise<bool>::makeEmpty()};
+        folly::Promise<LoadingResourceReservationResult> resource_promise{
+            folly::Promise<LoadingResourceReservationResult>::makeEmpty()};
+        LoadingResourceReservationResult result;
+
+        // Claim a result without running the waiting caller under list_mtx_.
         void
-        setValue(bool success, ResourceUsage actual = {}) {
-            if (use_resource_promise) {
-                resource_promise.setValue(
-                    LoadingResourceReservationResult{success, success ? actual : ResourceUsage{}});
-            } else {
-                bool_promise.setValue(success);
-            }
+        SetResult(WaitingRequest& request, bool success, ResourceUsage actual = {}) noexcept {
+            result = {success, success ? actual : ResourceUsage{}};
+            bool_promise = std::move(request.bool_promise);
+            resource_promise = std::move(request.resource_promise);
         }
     };
 
@@ -333,17 +346,24 @@ class DList : public std::enable_shared_from_this<DList> {
     tryEvict(const ResourceUsage& expected_eviction, const ResourceUsage& min_eviction,
              const bool evict_expired_items = false);
 
+    // Called after releasing node locks; skip locking only when neither a reservation attempt nor queued work exists.
+    void
+    notifyWaitingRequests();
+
     // Handle waiting requests when resources are available.
     // This method should be called with list_mtx_ already held.
-    // Returns requests that need to be destroyed outside the lock to avoid deadlock.
-    std::vector<std::unique_ptr<WaitingRequest>>
-    handleWaitingRequests();
+    // Completions must outlive the lock so promises and callbacks complete outside it.
+    void
+    handleWaitingRequests(std::vector<WaitingRequestCompletion>& completions);
 
     // Fail one queued request and immediately retry requests behind it.
-    // Must be called with list_mtx_ held; returned requests are destroyed by
-    // the caller after releasing the lock.
-    std::vector<std::unique_ptr<WaitingRequest>>
-    failWaitingRequest(uint64_t request_id, const char* reason);
+    // Must be called with list_mtx_ held; completions must outlive the lock.
+    void
+    failWaitingRequest(uint64_t request_id, const char* reason, std::vector<WaitingRequestCompletion>& completions);
+
+    // Publish claimed results outside list_mtx_, including when a scope guard unwinds.
+    static void
+    completeWaitingRequests(std::vector<WaitingRequestCompletion>& completions);
 
     // Clear all waiting requests (used in destructor)
     void
@@ -404,8 +424,9 @@ class DList : public std::enable_shared_from_this<DList> {
     std::priority_queue<std::unique_ptr<WaitingRequest>, std::vector<std::unique_ptr<WaitingRequest>>,
                         WaitingRequestComparator>
         waiting_queue_;
-    // using a separate variable to avoid locking just to check if the queue is empty.
-    std::atomic<bool> waiting_queue_empty_{true};
+    // Set under list_mtx_ before checking resources, and kept set while requests remain queued.
+    // Sequential consistency pairs the notification check with resource publication and reservation reads.
+    std::atomic<bool> reservation_notifications_needed_{false};
 
     // Quick lookup map for waiting requests (for timeout handling)
     std::unordered_map<uint64_t, WaitingRequest*> waiting_requests_map_;

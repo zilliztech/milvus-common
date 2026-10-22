@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include <folly/coro/Task.h>
+
 #include <memory>
 #include <optional>
 #include <string>
@@ -101,9 +103,24 @@ class Translator {
     virtual int64_t
     cells_storage_bytes(const std::vector<cid_t>& cids) const = 0;
 
-    // extra cells strategy should be added in cell_ids_to_be_loaded(), get_cells() should just a load executor.
+    /// Synchronously load requested cells; extra cells belong in bonus_cells_to_be_loaded().
     virtual std::vector<std::pair<cid_t, std::unique_ptr<CellT>>>
     get_cells(OpContext* ctx, const std::vector<cid_t>& cids) = 0;
+
+    /**
+     * @brief Load requested cells on the awaiting caller's executor.
+     * @param ctx Borrowed operation context, valid until completion; may be null.
+     * @param cids Borrowed cell IDs, valid until completion.
+     * @note The default invokes synchronous get_cells() on that executor and may block.
+     * Override to await asynchronous work or offload blocking I/O. Drain issued work
+     * before returning or throwing. Extra cells belong in bonus_cells_to_be_loaded().
+     * Keep the translator alive until completion. Overrides should share a private
+     * load implementation with get_cells(), rather than delegate to each other.
+     */
+    virtual folly::coro::Task<std::vector<std::pair<cid_t, std::unique_ptr<CellT>>>>
+    get_cells_async(OpContext* ctx, const std::vector<cid_t>& cids) {
+        co_return get_cells(ctx, cids);
+    }
     virtual ~Translator() = default;
 };
 

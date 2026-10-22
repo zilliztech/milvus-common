@@ -10,6 +10,7 @@
 // or implied. See the License for the specific language governing permissions and limitations under the License
 #include "cachinglayer/lrucache/DList.h"
 
+#include <folly/ScopeGuard.h>
 #include <folly/futures/Future.h>
 #include <folly/futures/SharedPromise.h>
 
@@ -22,6 +23,7 @@
 #include "cachinglayer/Utils.h"
 #include "cachinglayer/lrucache/ListNode.h"
 #include "log/Log.h"
+#include "syncpoint/sync_point.h"
 
 namespace milvus::cachinglayer::internal {
 
@@ -51,6 +53,17 @@ RequestLocalLoading(const ResourceUsage& loaded, const ResourceUsage& overhead, 
 }
 
 }  // namespace
+
+void
+DList::completeWaitingRequests(std::vector<WaitingRequestCompletion>& completions) {
+    for (auto& completion : completions) {
+        if (completion.resource_promise.valid()) {
+            completion.resource_promise.setValue(completion.result);
+        } else if (completion.bool_promise.valid()) {
+            completion.bool_promise.setValue(completion.result.success);
+        }
+    }
+}
 
 LoadingOverheadGroupHandle
 DList::CreateLoadingOverheadGroup(LoadingOverheadDimension dimension, LoadingOverheadPolicy policy) {
@@ -84,7 +97,8 @@ DList::BindLoadingOverheadGroups(const LoadingOverheadConfig& config) {
 
 void
 DList::UnbindLoadingOverheadGroups(const LoadingOverheadConfig& config) {
-    std::vector<std::unique_ptr<WaitingRequest>> to_destroy;
+    std::vector<WaitingRequestCompletion> completions;
+    auto complete = folly::makeGuard([&] { completeWaitingRequests(completions); });
     {
         std::lock_guard<std::mutex> lock(list_mtx_);
         if (config.memory.has_value()) {
@@ -101,21 +115,22 @@ DList::UnbindLoadingOverheadGroups(const LoadingOverheadConfig& config) {
                 LOG_ERROR("[MCL] LoadingOverheadGroup cannot unbind invalid file Group");
             }
         }
-        if (!waiting_queue_empty_) {
-            to_destroy = handleWaitingRequests();
+        if (reservation_notifications_needed_) {
+            handleWaitingRequests(completions);
         }
     }
 }
 
 LoadingOverheadUpdateResult
 DList::UpdateLoadingOverheadGroup(const LoadingOverheadGroupHandle& group, LoadingOverheadPolicy policy) {
-    std::vector<std::unique_ptr<WaitingRequest>> to_destroy;
+    std::vector<WaitingRequestCompletion> completions;
+    auto complete = folly::makeGuard([&] { completeWaitingRequests(completions); });
     LoadingOverheadUpdateResult result;
     {
         std::unique_lock<std::mutex> lock(list_mtx_);
         result = group ? group->updatePolicy(std::move(policy)) : LoadingOverheadUpdateResult::kInvalidArgument;
         if (result == LoadingOverheadUpdateResult::kApplied) {
-            to_destroy = handleWaitingRequests();
+            handleWaitingRequests(completions);
         }
     }
     return result;
@@ -126,6 +141,10 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& loaded, const Reso
                                          const LoadingOverheadConfig* config, std::chrono::milliseconds timeout,
                                          OpContext* ctx) {
     std::unique_lock<std::mutex> lock(list_mtx_);
+    // Arm before inspecting resources so a concurrent release cannot miss an about-to-enqueue request.
+    reservation_notifications_needed_ = true;
+    auto restore_notifications = folly::makeGuard([&] { reservation_notifications_needed_ = !waiting_queue_.empty(); });
+    TEST_SYNC_POINT("DList::Reserve:BeforeAttempt");
     auto attempt = reserveResourceInternalWithOverhead(loaded, overhead, config);
     if (attempt.result.success) {
         return folly::makeSemiFuture(attempt.result);
@@ -145,6 +164,7 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& loaded, const Reso
         return folly::makeSemiFuture(LoadingResourceReservationResult{});
     }
 
+    TEST_SYNC_POINT("DList::Reserve:BeforeEnqueue");
     auto deadline =
         timeout.count() > 0 ? std::chrono::steady_clock::now() + timeout : std::chrono::steady_clock::time_point::max();
     auto [promise, future] = folly::makePromiseContract<LoadingResourceReservationResult>();
@@ -155,7 +175,6 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& loaded, const Reso
     WaitingRequest* request_ptr = waiting_request.get();
     waiting_requests_map_[request_id] = request_ptr;
     waiting_queue_.push(std::move(waiting_request));
-    waiting_queue_empty_ = false;
     std::weak_ptr<DList> weak_self = shared_from_this();
 
     if (timeout.count() > 0) {
@@ -173,10 +192,11 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& loaded, const Reso
                     if (!self) {
                         return;
                     }
-                    std::vector<std::unique_ptr<WaitingRequest>> to_destroy;
+                    std::vector<WaitingRequestCompletion> completions;
+                    auto complete = folly::makeGuard([&] { completeWaitingRequests(completions); });
                     {
                         std::unique_lock<std::mutex> lock(self->list_mtx_);
-                        to_destroy = self->failWaitingRequest(request_id, "timed out");
+                        self->failWaitingRequest(request_id, "timed out", completions);
                     }
                 },
                 static_cast<uint32_t>(timeout.count()));
@@ -194,10 +214,11 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& loaded, const Reso
                 if (!self) {
                     return;
                 }
-                std::vector<std::unique_ptr<WaitingRequest>> to_destroy;
+                std::vector<WaitingRequestCompletion> completions;
+                auto complete = folly::makeGuard([&] { completeWaitingRequests(completions); });
                 {
                     std::unique_lock<std::mutex> lock(self->list_mtx_);
-                    to_destroy = self->failWaitingRequest(request_id, "cancelled");
+                    self->failWaitingRequest(request_id, "cancelled", completions);
                 }
             });
         });
@@ -217,6 +238,10 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std
     // to avoid a race window where resources could be released and notified between
     // a failed reserve and the enqueue.
     std::unique_lock<std::mutex> lock(list_mtx_);
+    // Keep notifications armed through both the resource check and a possible enqueue.
+    reservation_notifications_needed_ = true;
+    auto restore_notifications = folly::makeGuard([&] { reservation_notifications_needed_ = !waiting_queue_.empty(); });
+    TEST_SYNC_POINT("DList::Reserve:BeforeAttempt");
     if (!max_resource_limit_.load().CanHold(size)) {
         LOG_ERROR("[MCL] Failed to reserve size={} as it exceeds max_memory_={}.", size.ToString(),
                   max_resource_limit_.load().ToString());
@@ -231,6 +256,7 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std
         return folly::makeSemiFuture(false);
     }
 
+    TEST_SYNC_POINT("DList::Reserve:BeforeEnqueue");
     auto deadline =
         timeout.count() > 0 ? std::chrono::steady_clock::now() + timeout : std::chrono::steady_clock::time_point::max();
     auto [promise, future] = folly::makePromiseContract<bool>();
@@ -241,7 +267,6 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std
     WaitingRequest* request_ptr = waiting_request.get();
     waiting_requests_map_[request_id] = request_ptr;
     waiting_queue_.push(std::move(waiting_request));
-    waiting_queue_empty_ = false;
     std::weak_ptr<DList> weak_self = shared_from_this();
 
     if (timeout.count() > 0) {
@@ -261,10 +286,11 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std
                     if (!self) {
                         return;  // DList already destroyed
                     }
-                    std::vector<std::unique_ptr<WaitingRequest>> to_destroy;
+                    std::vector<WaitingRequestCompletion> completions;
+                    auto complete = folly::makeGuard([&] { completeWaitingRequests(completions); });
                     {
                         std::unique_lock<std::mutex> lock(self->list_mtx_);
-                        to_destroy = self->failWaitingRequest(request_id, "timed out");
+                        self->failWaitingRequest(request_id, "timed out", completions);
                     }
                 },
                 static_cast<uint32_t>(timeout.count()));
@@ -285,10 +311,11 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std
                 if (!self) {
                     return;  // DList already destroyed
                 }
-                std::vector<std::unique_ptr<WaitingRequest>> to_destroy;
+                std::vector<WaitingRequestCompletion> completions;
+                auto complete = folly::makeGuard([&] { completeWaitingRequests(completions); });
                 {
                     std::unique_lock<std::mutex> lock(self->list_mtx_);
-                    to_destroy = self->failWaitingRequest(request_id, "cancelled");
+                    self->failWaitingRequest(request_id, "cancelled", completions);
                 }
             });
         });
@@ -506,6 +533,8 @@ DList::reserveResourceInternalImpl(const ResourceUsage& size, std::function<void
 void
 DList::evictionLoop() {
     while (true) {
+        std::vector<WaitingRequestCompletion> completions;
+        auto complete = folly::makeGuard([&] { completeWaitingRequests(completions); });
         std::unique_lock<std::mutex> lock(list_mtx_);
         if (bg_eviction_thread_cv_.wait_for(lock, eviction_config_.eviction_interval,
                                             [this] { return stop_bg_eviction_loop_.load(); })) {
@@ -528,10 +557,8 @@ DList::evictionLoop() {
         // not just after successful eviction. Resources may have been freed
         // by other paths (ReleaseLoadingResource, RefundLoadedResource) between
         // loop iterations without fully draining the queue.
-        if (evicted.AnyGTZero() || !waiting_queue_empty_) {
-            auto to_destroy = handleWaitingRequests();
-            lock.unlock();
-            // Destroy requests outside lock to avoid deadlock with cancel callbacks
+        if (evicted.AnyGTZero() || reservation_notifications_needed_) {
+            handleWaitingRequests(completions);
         }
     }
 }
@@ -728,7 +755,8 @@ DList::UpdateMaxLimit(const ResourceUsage& new_limit) {
                "[MCL] limit must be greater than high watermark. new_limit: "
                "{}, high_watermark: {}",
                new_limit.ToString(), high_watermark_.load().ToString());
-    std::vector<std::unique_ptr<WaitingRequest>> to_destroy;
+    std::vector<WaitingRequestCompletion> completions;
+    auto complete = folly::makeGuard([&] { completeWaitingRequests(completions); });
     {
         std::unique_lock<std::mutex> list_lock(list_mtx_);
         auto using_resources = total_loaded_size_.load() + total_loading_size_.load();
@@ -745,14 +773,15 @@ DList::UpdateMaxLimit(const ResourceUsage& new_limit) {
         max_resource_limit_ = new_limit;
         cachinglayer::monitor::cache_capacity_bytes(StorageType::MEMORY).Set(max_resource_limit_.load().memory_bytes);
         cachinglayer::monitor::cache_capacity_bytes(StorageType::DISK).Set(max_resource_limit_.load().file_bytes);
-        to_destroy = handleWaitingRequests();
+        handleWaitingRequests(completions);
     }
     return true;
 }
 
 void
 DList::UpdateLowWatermark(const ResourceUsage& new_low_watermark) {
-    std::vector<std::unique_ptr<WaitingRequest>> to_destroy;
+    std::vector<WaitingRequestCompletion> completions;
+    auto complete = folly::makeGuard([&] { completeWaitingRequests(completions); });
     {
         std::unique_lock<std::mutex> list_lock(list_mtx_);
         AssertInfo(new_low_watermark.AllGEZero(),
@@ -768,13 +797,14 @@ DList::UpdateLowWatermark(const ResourceUsage& new_low_watermark) {
         low_watermark_ = new_low_watermark;
         cachinglayer::monitor::cache_low_watermark_bytes(StorageType::MEMORY).Set(low_watermark_.load().memory_bytes);
         cachinglayer::monitor::cache_low_watermark_bytes(StorageType::DISK).Set(low_watermark_.load().file_bytes);
-        to_destroy = handleWaitingRequests();
+        handleWaitingRequests(completions);
     }
 }
 
 void
 DList::UpdateHighWatermark(const ResourceUsage& new_high_watermark) {
-    std::vector<std::unique_ptr<WaitingRequest>> to_destroy;
+    std::vector<WaitingRequestCompletion> completions;
+    auto complete = folly::makeGuard([&] { completeWaitingRequests(completions); });
     {
         std::unique_lock<std::mutex> list_lock(list_mtx_);
         AssertInfo((new_high_watermark - low_watermark_.load()).AllGEZero(),
@@ -790,14 +820,15 @@ DList::UpdateHighWatermark(const ResourceUsage& new_high_watermark) {
         high_watermark_ = new_high_watermark;
         cachinglayer::monitor::cache_high_watermark_bytes(StorageType::MEMORY).Set(high_watermark_.load().memory_bytes);
         cachinglayer::monitor::cache_high_watermark_bytes(StorageType::DISK).Set(high_watermark_.load().file_bytes);
-        to_destroy = handleWaitingRequests();
+        handleWaitingRequests(completions);
     }
 }
 
 ResourceUsage
 DList::ReleaseLoadingResource(const ResourceUsage& loaded, const ResourceUsage& overhead,
                               const LoadingOverheadConfig* config) {
-    std::vector<std::unique_ptr<WaitingRequest>> to_destroy;
+    std::vector<WaitingRequestCompletion> completions;
+    auto complete = folly::makeGuard([&] { completeWaitingRequests(completions); });
     LoadingOverheadDelta delta{.unscaled_delta = overhead};
     ResourceUsage unscaled;
     {
@@ -813,9 +844,8 @@ DList::ReleaseLoadingResource(const ResourceUsage& loaded, const ResourceUsage& 
             LOG_ERROR("[MCL] total_loading_size_ negative after Group release: loaded={}, overhead={}, current={}",
                       loaded.ToString(), overhead.ToString(), curr.ToString());
         });
-        to_destroy = handleWaitingRequests();
+        handleWaitingRequests(completions);
     }
-    // Destroy requests outside lock to avoid deadlock with cancel callbacks
     return unscaled;
 }
 
@@ -830,12 +860,7 @@ DList::ReleaseLoadingResource(const ResourceUsage& loading_size) {
             scaled_size.ToString(), loading_size.ToString(), eviction_config_.loading_resource_factor, curr.ToString());
     });
     // Notify waiting requests that resources are available
-    std::vector<std::unique_ptr<WaitingRequest>> to_destroy;
-    {
-        std::unique_lock<std::mutex> lock(list_mtx_);
-        to_destroy = handleWaitingRequests();
-    }
-    // Destroy requests outside lock to avoid deadlock with cancel callbacks
+    notifyWaitingRequests();
 }
 
 void
@@ -850,18 +875,10 @@ DList::touchItem(ListNode* list_node, bool force_touch, std::optional<ResourceUs
         return;
     }
     // move the node to the head of the list
-    std::vector<std::unique_ptr<WaitingRequest>> to_destroy;
-    {
-        std::lock_guard<std::mutex> list_lock(list_mtx_);
-        popItem(list_node);
-        pushHead(list_node);
-        // If there are waiters, try to satisfy them
-        if (size.has_value() && !waiting_queue_empty_) {
-            to_destroy = handleWaitingRequests();
-        }
-        list_node->last_touch_ = now;
-    }
-    // Destroy requests outside lock to avoid deadlock with cancel callbacks
+    std::lock_guard<std::mutex> list_lock(list_mtx_);
+    popItem(list_node);
+    pushHead(list_node);
+    list_node->last_touch_ = now;
 }
 
 void
@@ -952,32 +969,47 @@ DList::RefundLoadedResource(const ResourceUsage& size) {
             size.ToString(), curr.ToString(), usageInfo());
     });
     // Notify waiting requests that resources are available
-    std::vector<std::unique_ptr<WaitingRequest>> to_destroy;
-    {
-        std::unique_lock<std::mutex> lock(list_mtx_);
-        to_destroy = handleWaitingRequests();
-    }
-    // Destroy requests outside lock to avoid deadlock with cancel callbacks
+    notifyWaitingRequests();
 }
 
-std::vector<std::unique_ptr<DList::WaitingRequest>>
-DList::handleWaitingRequests() {
-    // Collect requests to destroy outside the lock to avoid deadlock with cancel callbacks.
-    std::vector<std::unique_ptr<WaitingRequest>> requests_to_destroy;
+void
+DList::notifyWaitingRequests() {
+    if (!reservation_notifications_needed_) {
+        return;
+    }
+    std::vector<WaitingRequestCompletion> completions;
+    auto complete = folly::makeGuard([&] { completeWaitingRequests(completions); });
+    {
+        std::unique_lock<std::mutex> lock(list_mtx_);
+        handleWaitingRequests(completions);
+    }
+}
+
+void
+DList::handleWaitingRequests(std::vector<WaitingRequestCompletion>& completions) {
     std::vector<std::unique_ptr<WaitingRequest>> deferred_requests;
     std::optional<std::chrono::steady_clock::time_point> blocked_deadline;
+    auto restore_deferred = folly::makeGuard([&] {
+        // Popping retains queue capacity, so restoring deferred requests cannot allocate.
+        for (auto& request : deferred_requests) {
+            waiting_queue_.push(std::move(request));
+        }
+        reservation_notifications_needed_ = !waiting_queue_.empty();
+    });
 
     while (!waiting_queue_.empty()) {
         if (blocked_deadline.has_value() && waiting_queue_.top()->deadline != blocked_deadline.value()) {
             break;
         }
+        // Allocate completion storage before claiming a request or reserving its resources.
+        auto& completion = completions.emplace_back();
         auto& request_ptr_ref = const_cast<std::unique_ptr<WaitingRequest>&>(waiting_queue_.top());
 
         // Check if request was already handled by timeout/cancel (not in map anymore)
         if (waiting_requests_map_.find(request_ptr_ref->request_id) == waiting_requests_map_.end()) {
             LOG_DEBUG("[MCL] Request {} has already been handled, destroying and continuing.",
                       request_ptr_ref->request_id);
-            requests_to_destroy.push_back(std::move(request_ptr_ref));
+            completion.retired = std::move(request_ptr_ref);
             waiting_queue_.pop();
             continue;
         }
@@ -987,22 +1019,22 @@ DList::handleWaitingRequests() {
             // This request is expired. We will handle its cleanup here to avoid
             // a race with the timeout handler. We "claim" the request by
             // erasing it from the map.
-            auto request = std::move(request_ptr_ref);
+            auto& request = completion.retired;
+            request = std::move(request_ptr_ref);
+            waiting_queue_.pop();
 
             if (waiting_requests_map_.erase(request->request_id) > 0) {
                 // If we successfully erased it, it means the timeout/cancel handler hasn't
                 // run yet. We are now responsible for fulfilling the promise.
+                completion.SetResult(*request, false);
                 LOG_DEBUG(
                     "[MCL] Request {} expired, cleaned up by "
                     "handleWaitingRequests.",
                     request->request_id);
-                request->setValue(false);
             }
             // If erase returned 0, the timeout/cancel handler ran first and claimed the
             // request. We don't need to do anything with the promise.
 
-            requests_to_destroy.push_back(std::move(request));
-            waiting_queue_.pop();
             continue;
         }
 
@@ -1027,14 +1059,14 @@ DList::handleWaitingRequests() {
                 if (error.get_error_code() != milvus::ErrorCode::InvalidParameter) {
                     throw;
                 }
-                auto request = std::move(request_ptr_ref);
+                auto& request = completion.retired;
+                request = std::move(request_ptr_ref);
                 waiting_queue_.pop();
                 if (waiting_requests_map_.erase(request->request_id) > 0) {
+                    completion.SetResult(*request, false);
                     LOG_WARN("[MCL] Request {} failed while retrying loading-overhead reservation: {}",
                              request->request_id, error.what());
-                    request->setValue(false);
                 }
-                requests_to_destroy.push_back(std::move(request));
                 continue;
             }
         } else {
@@ -1044,11 +1076,13 @@ DList::handleWaitingRequests() {
             }
         }
         if (fulfilled) {
-            auto request = std::move(request_ptr_ref);
+            auto& request = completion.retired;
+            request = std::move(request_ptr_ref);
+            waiting_queue_.pop();
 
             if (waiting_requests_map_.erase(request->request_id) > 0) {
-                LOG_DEBUG("[MCL] Executing success notification for request {}", request->request_id);
-                request->setValue(true, actual);
+                completion.SetResult(*request, true, actual);
+                LOG_DEBUG("[MCL] Reserved resources for request {}", request->request_id);
             } else {
                 // Request was already handled by timeout/cancel, rollback.
                 LOG_WARN("[MCL] Request {} was already handled by timeout/cancel, rolling back.", request->request_id);
@@ -1066,8 +1100,6 @@ DList::handleWaitingRequests() {
                     total_loading_size_ -= actual;
                 }
             }
-            requests_to_destroy.push_back(std::move(request));
-            waiting_queue_.pop();
         } else {
             const auto required_size =
                 request_ptr_ref->use_resource_promise ? attempted_requirement : request_ptr_ref->required_size;
@@ -1078,19 +1110,20 @@ DList::handleWaitingRequests() {
                           eviction_config_.loading_resource_factor
                     : required_size;
             if (!max_resource_limit_.load().CanHold(minimum_required_size)) {
-                auto request = std::move(request_ptr_ref);
+                auto& request = completion.retired;
+                request = std::move(request_ptr_ref);
+                waiting_queue_.pop();
                 if (waiting_requests_map_.erase(request->request_id) > 0) {
+                    completion.SetResult(*request, false);
                     LOG_WARN(
                         "[MCL] Request {} is permanently impossible (minimum_required_size={} capacity={}), "
                         "failing immediately.",
                         request->request_id, minimum_required_size.ToString(), max_resource_limit_.load().ToString());
-                    request->setValue(false);
                 }
-                requests_to_destroy.push_back(std::move(request));
-                waiting_queue_.pop();
                 continue;
             }
-            auto request = std::move(request_ptr_ref);
+            auto& request = deferred_requests.emplace_back();
+            request = std::move(request_ptr_ref);
             waiting_queue_.pop();
             request->required_size = required_size;
             if (!blocked_deadline.has_value()) {
@@ -1098,56 +1131,41 @@ DList::handleWaitingRequests() {
             }
             LOG_DEBUG("[MCL] Request {} of size {} cannot be satisfied, checking peers with the same deadline.",
                       request->request_id, required_size.ToString());
-            deferred_requests.push_back(std::move(request));
+            completions.pop_back();
         }
     }
-    for (auto& request : deferred_requests) {
-        waiting_queue_.push(std::move(request));
-    }
-    waiting_queue_empty_ = waiting_queue_.empty();
-    return requests_to_destroy;
 }
 
-std::vector<std::unique_ptr<DList::WaitingRequest>>
-DList::failWaitingRequest(uint64_t request_id, const char* reason) {
+void
+DList::failWaitingRequest(uint64_t request_id, const char* reason, std::vector<WaitingRequestCompletion>& completions) {
     auto it = waiting_requests_map_.find(request_id);
     if (it == waiting_requests_map_.end()) {
-        return {};
+        return;
     }
+    auto& completion = completions.emplace_back();
     LOG_WARN("[MCL] Waiting request {} {}.", request_id, reason);
-    it->second->setValue(false);
+    completion.SetResult(*it->second, false);
     waiting_requests_map_.erase(it);
-    return handleWaitingRequests();
+    handleWaitingRequests(completions);
 }
 
 void
 DList::clearWaitingQueue() {
-    // Move requests out while holding the lock, then destroy them outside the lock
-    // to avoid deadlock with cancel callbacks that also need the lock.
-    std::vector<std::unique_ptr<WaitingRequest>> requests_to_destroy;
-
+    std::vector<WaitingRequestCompletion> completions;
+    auto complete = folly::makeGuard([&] { completeWaitingRequests(completions); });
     {
         std::unique_lock<std::mutex> lock(list_mtx_);
-
-        // Notify all waiting requests that they failed
         while (!waiting_queue_.empty()) {
-            auto request = std::move(const_cast<std::unique_ptr<WaitingRequest>&>(waiting_queue_.top()));
+            auto& completion = completions.emplace_back();
+            completion.retired = std::move(const_cast<std::unique_ptr<WaitingRequest>&>(waiting_queue_.top()));
             waiting_queue_.pop();
-
-            // Only setValue if this request hasn't been handled by timeout/cancel
+            auto& request = completion.retired;
             if (waiting_requests_map_.erase(request->request_id) > 0) {
-                request->setValue(false);
+                completion.SetResult(*request, false);
             }
-            requests_to_destroy.push_back(std::move(request));
         }
-
-        waiting_queue_empty_ = true;
+        reservation_notifications_needed_ = false;
     }
-
-    // Destroy requests (and their cancel_cb) outside the lock
-    // This avoids deadlock: cancel_cb destructor waits for callback to finish,
-    // and callback needs the lock.
-    requests_to_destroy.clear();
 }
 
 ResourceUsage

@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <folly/coro/BlockingWait.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
 
 #include <memory>
@@ -67,9 +68,17 @@ class Manager {
     Manager&
     operator=(Manager&&) = delete;
 
+    /// Synchronous creation and warmup; do not call on an executor needed by this load.
     template <typename CellT>
     std::shared_ptr<CacheSlot<CellT>>
     CreateCacheSlot(std::unique_ptr<Translator<CellT>> translator, OpContext* ctx = nullptr) {
+        return folly::coro::blockingWait(CreateCacheSlotAsync(std::move(translator), ctx));
+    }
+
+    /// Owns translator; creation and warmup start when awaited. Borrowed ctx must outlive completion.
+    template <typename CellT>
+    folly::coro::Task<std::shared_ptr<CacheSlot<CellT>>>
+    CreateCacheSlotAsync(std::unique_ptr<Translator<CellT>> translator, OpContext* ctx = nullptr) {
         AssertInfo(dlist_ != nullptr,
                    "dlist_ must be initialized by ConfigureTieredStorage before any CacheSlot is created");
         if (ctx && ctx->cancellation_token.isCancellationRequested()) {
@@ -82,8 +91,8 @@ class Manager {
         auto cache_slot = std::make_shared<CacheSlot<CellT>>(std::move(translator), dlist_.get(), evictable,
                                                              self_reserve, config.storage_usage_tracking_enabled,
                                                              config.loading_timeout, config.warmup_loading_timeout);
-        cache_slot->Warmup(ctx, prefetch_pool_);
-        return cache_slot;
+        co_await cache_slot->Warmup(ctx, prefetch_pool_);
+        co_return cache_slot;
     }
 
     bool

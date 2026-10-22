@@ -1,4 +1,7 @@
 #include <folly/CancellationToken.h>
+#include <folly/ScopeGuard.h>
+#include <folly/executors/InlineExecutor.h>
+#include <folly/executors/ManualExecutor.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
@@ -14,6 +17,7 @@
 #include "cachinglayer_test_utils.h"
 #include "common/EasyAssert.h"
 #include "mock_list_node.h"
+#include "syncpoint/sync_point.h"
 
 using milvus::cachinglayer::cid_t;
 using milvus::cachinglayer::EvictionConfig;
@@ -147,6 +151,340 @@ TEST_F(DListTest, Initialization) {
     EXPECT_EQ(DLF::get_tail(*dlist), nullptr);
 }
 
+TEST(DListNotificationTest, CachedUnpinDoesNotWaitForListLock) {
+    EvictionConfig config;
+    config.cache_touch_window = std::chrono::hours(1);
+    auto dlist =
+        std::make_shared<DList>(true, ResourceUsage{100, 0}, ResourceUsage{80, 0}, ResourceUsage{90, 0}, config);
+    ::testing::NiceMock<MockListNode> node(dlist.get());
+    node.test_set_loaded_size({20, 0});
+    node.test_set_state(ListNode::State::CACHED);
+    dlist->ChargeLoadedResource({20, 0});
+    dlist->touchItem(&node, true, ResourceUsage{20, 0});
+    auto [need_load, pin] = node.pin();
+    ASSERT_FALSE(need_load);
+
+    auto lock = DLF::test_lock_list(dlist.get());
+    auto unpin = std::async(std::launch::async, [pin = std::get<ListNode::NodePin>(std::move(pin))]() mutable {
+        auto held = std::move(pin);
+    });
+    EXPECT_EQ(unpin.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    lock.unlock();
+    unpin.get();
+    EXPECT_EQ(node.test_get_pin_count(), 0);
+}
+
+TEST(DListNotificationTest, ReservationExitsRestoreNotificationState) {
+    for (const bool group_aware : {false, true}) {
+        SCOPED_TRACE(group_aware);
+        auto dlist = std::make_shared<DList>(true, ResourceUsage{100, 0}, ResourceUsage{80, 0}, ResourceUsage{90, 0},
+                                             EvictionConfig{});
+        auto reserve = [&](int64_t size, std::chrono::milliseconds timeout) {
+            return group_aware ? dlist->ReserveLoadingResourceWithTimeout({size, 0}, {}, nullptr, timeout)
+                                     .deferValue([](auto result) { return result.success; })
+                               : dlist->ReserveLoadingResourceWithTimeout({size, 0}, timeout);
+        };
+        ASSERT_TRUE(std::move(reserve(100, std::chrono::milliseconds(0))).get());
+        EXPECT_FALSE(DLF::test_notifications_needed(*dlist));
+        EXPECT_FALSE(std::move(reserve(101, std::chrono::milliseconds(-1))).get());
+        EXPECT_FALSE(DLF::test_notifications_needed(*dlist));
+        EXPECT_FALSE(std::move(reserve(1, std::chrono::milliseconds(0))).get());
+        EXPECT_FALSE(DLF::test_notifications_needed(*dlist));
+        if (group_aware) {
+            LoadingOverheadConfig invalid{LoadingOverheadGroupBinding{nullptr, 1}, std::nullopt};
+            EXPECT_THROW(dlist->ReserveLoadingResourceWithTimeout({}, {}, &invalid, std::chrono::milliseconds(0)),
+                         milvus::SegcoreError);
+            EXPECT_FALSE(DLF::test_notifications_needed(*dlist));
+        }
+
+        auto pending = reserve(1, std::chrono::milliseconds(-1));
+        EXPECT_TRUE(DLF::test_notifications_needed(*dlist));
+        EXPECT_FALSE(std::move(reserve(1, std::chrono::milliseconds(0))).get());
+        EXPECT_TRUE(DLF::test_notifications_needed(*dlist));
+        DLF::test_clear_waiting_queue(dlist.get());
+        EXPECT_FALSE(std::move(pending).get());
+        EXPECT_FALSE(DLF::test_notifications_needed(*dlist));
+        dlist->ReleaseLoadingResource({100, 0});
+    }
+}
+
+#ifdef ENABLE_SYNCPOINT
+TEST(DListNotificationTest, UnpinDuringReservationDoesNotLoseNotification) {
+    for (const bool group_aware : {false, true}) {
+        for (const auto* point : {"DList::Reserve:BeforeAttempt", "DList::Reserve:BeforeEnqueue"}) {
+            SCOPED_TRACE(group_aware);
+            SCOPED_TRACE(point);
+            EvictionConfig config;
+            config.cache_touch_window = std::chrono::hours(1);
+            auto dlist = std::make_shared<DList>(true, ResourceUsage{100, 0}, ResourceUsage{80, 0},
+                                                 ResourceUsage{90, 0}, config);
+            ::testing::NiceMock<MockListNode> node(dlist.get());
+            node.test_set_loaded_size({100, 0});
+            node.test_set_state(ListNode::State::CACHED);
+            dlist->ChargeLoadedResource({100, 0});
+            dlist->touchItem(&node, true, ResourceUsage{100, 0});
+            auto [need_load, pin] = node.pin();
+            ASSERT_FALSE(need_load);
+
+            auto* sync = milvus::SyncPoint::GetInstance();
+            sync->Reset();
+            auto reset = folly::makeGuard([&] { sync->Reset(); });
+            std::promise<void> reached;
+            auto reached_future = reached.get_future();
+            std::promise<void> resume;
+            auto resume_future = resume.get_future();
+            sync->SetCallBack(point, [&](void*) {
+                reached.set_value();
+                resume_future.wait();
+            });
+            sync->EnableProcessing();
+            auto reserve = std::async(std::launch::async, [&] {
+                auto pending =
+                    group_aware
+                        ? dlist->ReserveLoadingResourceWithTimeout({40, 0}, {}, nullptr, std::chrono::milliseconds(-1))
+                              .deferValue([](auto result) { return result.success; })
+                        : dlist->ReserveLoadingResourceWithTimeout({40, 0}, std::chrono::milliseconds(-1));
+                return std::move(pending).via(&folly::InlineExecutor::instance());
+            });
+            EXPECT_EQ(reached_future.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+            EXPECT_TRUE(DLF::test_notifications_needed(*dlist));
+            auto unpin = std::async(std::launch::async, [pin = std::get<ListNode::NodePin>(std::move(pin))]() mutable {
+                auto held = std::move(pin);
+            });
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+            while (node.test_get_pin_count() != 0 && std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::yield();
+            }
+            EXPECT_EQ(node.test_get_pin_count(), 0);
+            // A reservation is active even though it has not enqueued anything yet.
+            EXPECT_EQ(unpin.wait_for(std::chrono::milliseconds(20)), std::future_status::timeout);
+            resume.set_value();
+            auto pending = reserve.get();
+            unpin.get();
+            EXPECT_TRUE(pending.isReady());
+            if (!pending.isReady()) {
+                DLF::test_clear_waiting_queue(dlist.get());
+            }
+            EXPECT_TRUE(std::move(pending).get());
+            EXPECT_FALSE(DLF::test_notifications_needed(*dlist));
+            dlist->ReleaseLoadingResource({40, 0});
+        }
+    }
+}
+#endif
+
+// Inline callbacks probe lock release; they do not require recursive notification scheduling.
+TEST(DListInlineCompletionTest, NotificationsAllowReentry) {
+    enum class Trigger { Release, Cancel, Timeout, Clear, Shrink };
+    for (const bool group_aware : {false, true}) {
+        for (const auto trigger :
+             {Trigger::Release, Trigger::Cancel, Trigger::Timeout, Trigger::Clear, Trigger::Shrink}) {
+            SCOPED_TRACE(group_aware);
+            SCOPED_TRACE(static_cast<int>(trigger));
+            auto dlist = std::make_shared<DList>(true, ResourceUsage{100, 0}, ResourceUsage{5, 0}, ResourceUsage{10, 0},
+                                                 EvictionConfig{});
+            ASSERT_TRUE(
+                std::move(dlist->ReserveLoadingResourceWithTimeout({100, 0}, std::chrono::milliseconds(0))).get());
+            folly::CancellationSource cancellation;
+            milvus::OpContext ctx(cancellation.getToken());
+            auto timeout = trigger == Trigger::Timeout ? std::chrono::milliseconds(10) : std::chrono::milliseconds(-1);
+            auto reservation =
+                group_aware
+                    ? dlist->ReserveLoadingResourceWithTimeout({30, 0}, {10, 0}, nullptr, timeout, &ctx)
+                          .deferValue([](auto result) {
+                              EXPECT_EQ(result.reserved, (result.success ? ResourceUsage{40, 0} : ResourceUsage{}));
+                              return result.success;
+                          })
+                    : dlist->ReserveLoadingResourceWithTimeout({40, 0}, timeout, &ctx);
+            auto result = std::move(reservation).via(&folly::InlineExecutor::instance()).thenValue([&](bool success) {
+                EXPECT_TRUE(dlist->IsEmpty());
+                EXPECT_EQ(DLF::get_waiting_request_count(*dlist), 0);
+                if (success) {
+                    if (group_aware) {
+                        dlist->ReleaseLoadingResource({30, 0}, {10, 0}, nullptr);
+                    } else {
+                        dlist->ReleaseLoadingResource({40, 0});
+                    }
+                }
+                return success;
+            });
+            switch (trigger) {
+                case Trigger::Release:
+                    dlist->ReleaseLoadingResource({100, 0});
+                    break;
+                case Trigger::Cancel:
+                    cancellation.requestCancellation();
+                    break;
+                case Trigger::Timeout:
+                    break;
+                case Trigger::Clear:
+                    DLF::test_clear_waiting_queue(dlist.get());
+                    break;
+                case Trigger::Shrink:
+                    DLF::test_sub_loading_memory(dlist.get(), {100, 0});
+                    ASSERT_TRUE(dlist->UpdateMaxLimit({20, 0}));
+                    break;
+            }
+            EXPECT_EQ(std::move(result).get(std::chrono::seconds(2)), trigger == Trigger::Release);
+            if (trigger != Trigger::Release && trigger != Trigger::Shrink) {
+                dlist->ReleaseLoadingResource({100, 0});
+            }
+            EXPECT_EQ(DLF::get_loading_memory(*dlist), ResourceUsage{});
+        }
+    }
+}
+
+TEST(DListNotificationTest, QueuedLoadsRunOnWaitingExecutor) {
+    for (const bool group_aware : {false, true}) {
+        SCOPED_TRACE(group_aware);
+        constexpr int kLoads = 64;
+        const ResourceUsage capacity{2 * kLoads, 0};
+        const ResourceUsage loaded{1, 0};
+        const ResourceUsage overhead{kLoads, 0};
+        auto dlist = std::make_shared<DList>(true, capacity, capacity, capacity, EvictionConfig{});
+        ASSERT_TRUE(std::move(dlist->ReserveLoadingResourceWithTimeout(capacity, std::chrono::milliseconds(0))).get());
+
+        folly::ManualExecutor executor;
+        int completed = 0;
+        std::vector<folly::Future<folly::Unit>> loads;
+        loads.reserve(kLoads);
+        for (int i = 0; i < kLoads; ++i) {
+            auto reservation =
+                group_aware
+                    ? dlist->ReserveLoadingResourceWithTimeout(loaded, overhead, nullptr, std::chrono::milliseconds(-1))
+                          .deferValue([&](auto result) {
+                              EXPECT_EQ(result.reserved, loaded + overhead);
+                              return result.success;
+                          })
+                    : dlist->ReserveLoadingResourceWithTimeout(loaded + overhead, std::chrono::milliseconds(-1));
+            loads.push_back(std::move(reservation).via(&executor).thenValue([&](bool success) {
+                ASSERT_TRUE(success);
+                ++completed;
+                // Keep resident data charged: releasing temporary overhead alone must drain the queue.
+                dlist->ChargeLoadedResource(loaded);
+                if (group_aware) {
+                    dlist->ReleaseLoadingResource(loaded, overhead, nullptr);
+                } else {
+                    dlist->ReleaseLoadingResource(loaded + overhead);
+                }
+            }));
+        }
+        ASSERT_EQ(DLF::get_waiting_request_count(*dlist), kLoads);
+        dlist->ReleaseLoadingResource(capacity);
+        EXPECT_EQ(completed, 0);
+        executor.drain();
+        for (auto& load : loads) {
+            ASSERT_TRUE(load.isReady());
+            EXPECT_NO_THROW(std::move(load).get());
+        }
+        EXPECT_EQ(completed, kLoads);
+        EXPECT_EQ(DLF::get_waiting_request_count(*dlist), 0);
+        EXPECT_EQ(DLF::get_loading_memory(*dlist), ResourceUsage{});
+        EXPECT_EQ(DLF::get_used_memory(*dlist), (ResourceUsage{kLoads, 0}));
+        dlist->RefundLoadedResource({kLoads, 0});
+    }
+}
+
+TEST(DListNotificationTest, QueueClearCompletesAfterListDestruction) {
+    const ResourceUsage capacity{100, 0};
+    auto dlist = std::make_shared<DList>(true, capacity, capacity, capacity, EvictionConfig{});
+    ASSERT_TRUE(std::move(dlist->ReserveLoadingResourceWithTimeout(capacity, std::chrono::milliseconds(0))).get());
+    const std::weak_ptr<DList> weak_dlist = dlist;
+    folly::CancellationSource cancellation;
+    milvus::OpContext ctx(cancellation.getToken());
+    folly::ManualExecutor executor;
+    int completed = 0;
+    std::vector<folly::Future<folly::Unit>> waiters;
+    waiters.reserve(2);
+    for (const bool group_aware : {false, true}) {
+        auto reservation =
+            group_aware
+                ? dlist->ReserveLoadingResourceWithTimeout({1, 0}, {}, nullptr, std::chrono::milliseconds(-1), &ctx)
+                      .deferValue([](auto result) { return result.success; })
+                : dlist->ReserveLoadingResourceWithTimeout({1, 0}, std::chrono::milliseconds(-1), &ctx);
+        waiters.push_back(std::move(reservation).via(&executor).thenValue([&, group_aware](bool success) {
+            EXPECT_FALSE(success);
+            EXPECT_TRUE(weak_dlist.expired());
+            ++completed;
+            if (!group_aware) {
+                throw std::runtime_error("notification consumer failed");
+            }
+        }));
+    }
+    DLF::test_clear_waiting_queue(dlist.get());
+    dlist->ReleaseLoadingResource(capacity);
+    dlist.reset();
+    EXPECT_EQ(completed, 0);
+    executor.drain();
+    ASSERT_TRUE(waiters[0].isReady());
+    ASSERT_TRUE(waiters[1].isReady());
+    EXPECT_THROW(std::move(waiters[0]).get(), std::runtime_error);
+    EXPECT_NO_THROW(std::move(waiters[1]).get());
+    EXPECT_EQ(completed, 2);
+}
+
+TEST(DListInlineCompletionTest, CancellationNotifiesBeforeRequestLeavesQueue) {
+    auto dlist = std::make_shared<DList>(true, ResourceUsage{100, 0}, ResourceUsage{80, 0}, ResourceUsage{90, 0},
+                                         EvictionConfig{});
+    ASSERT_TRUE(std::move(dlist->ReserveLoadingResourceWithTimeout({100, 0}, std::chrono::milliseconds(0))).get());
+    auto head = dlist->ReserveLoadingResourceWithTimeout({40, 0}, std::chrono::seconds(10));
+    folly::CancellationSource cancellation;
+    milvus::OpContext ctx(cancellation.getToken());
+    auto tail = dlist->ReserveLoadingResourceWithTimeout({20, 0}, std::chrono::milliseconds(-1), &ctx)
+                    .via(&folly::InlineExecutor::instance())
+                    .thenValue([&](bool success) {
+                        EXPECT_TRUE(dlist->IsEmpty());
+                        EXPECT_EQ(DLF::get_waiting_request_count(*dlist), 1);
+                        return success;
+                    });
+    ASSERT_FALSE(head.isReady());
+    ASSERT_FALSE(tail.isReady());
+    // The blocked head has an earlier deadline, so handling cancellation cannot pop the tail.
+    cancellation.requestCancellation();
+    EXPECT_FALSE(std::move(tail).get(std::chrono::seconds(2)));
+    EXPECT_FALSE(head.isReady());
+    dlist->ReleaseLoadingResource({100, 0});
+    EXPECT_TRUE(std::move(head).get());
+    dlist->ReleaseLoadingResource({40, 0});
+    EXPECT_EQ(DLF::get_waiting_request_count(*dlist), 0);
+    EXPECT_EQ(DLF::get_loading_memory(*dlist), ResourceUsage{});
+}
+
+TEST(DListInlineCompletionTest, BonusPublicationNotifiesAfterNodeUnlock) {
+    class BonusNode : public MockListNode {
+     public:
+        using MockListNode::MockListNode;
+        void
+        LoadBonus(DList& dlist) {
+            mark_loaded(
+                [&] {
+                    loaded_size_ = {20, 0};
+                    dlist.ChargeLoadedResource(loaded_size_);
+                },
+                false);
+        }
+    };
+    auto dlist = std::make_shared<DList>(true, ResourceUsage{100, 0}, ResourceUsage{80, 0}, ResourceUsage{90, 0},
+                                         EvictionConfig{});
+    ::testing::NiceMock<BonusNode> node(dlist.get());
+    ASSERT_TRUE(std::move(dlist->ReserveLoadingResourceWithTimeout({100, 0}, std::chrono::milliseconds(0))).get());
+    auto pending = dlist->ReserveLoadingResourceWithTimeout({20, 0}, std::chrono::milliseconds(-1))
+                       .via(&folly::InlineExecutor::instance())
+                       .thenValue([&](bool success) {
+                           EXPECT_TRUE(success);
+                           EXPECT_FALSE(node.is_loaded_or_cached());
+                           dlist->ReleaseLoadingResource({20, 0});
+                       });
+    ASSERT_FALSE(pending.isReady());
+    // Make room for the bonus without notifying waiters before it is published.
+    DLF::test_sub_loading_memory(dlist.get(), {20, 0});
+    node.LoadBonus(*dlist);
+    ASSERT_TRUE(pending.isReady());
+    EXPECT_NO_THROW(std::move(pending).get());
+    dlist->ReleaseLoadingResource({80, 0});
+    EXPECT_EQ(DLF::get_using_memory(*dlist), ResourceUsage{});
+}
+
 TEST_F(DListTest, LoadingOverheadGroupNeedsNoSeparateTracker) {
     auto group = CreateMemoryGroup(LoadingOverheadPolicy::Executor(1));
     ASSERT_NE(group, nullptr);
@@ -266,8 +604,14 @@ TEST_F(DListTest, AggregateOverflowDuringWaiterRetryFailsCleanly) {
 
     auto deferred_peer = local_dlist->ReserveLoadingResourceWithTimeout(
         /*size=*/{1, 0}, std::chrono::milliseconds(-1));
-    auto overflow_waiter = local_dlist->ReserveLoadingResourceWithTimeout(
-        /*loaded=*/{2, 0}, /*overhead=*/{10, 0}, &binding, std::chrono::milliseconds(-1));
+    auto overflow_waiter = local_dlist
+                               ->ReserveLoadingResourceWithTimeout(
+                                   /*loaded=*/{2, 0}, /*overhead=*/{10, 0}, &binding, std::chrono::milliseconds(-1))
+                               .via(&folly::InlineExecutor::instance())
+                               .thenValue([&](auto result) {
+                                   EXPECT_TRUE(local_dlist->IsEmpty());
+                                   return result;
+                               });
     ASSERT_FALSE(deferred_peer.isReady());
     ASSERT_FALSE(overflow_waiter.isReady());
 

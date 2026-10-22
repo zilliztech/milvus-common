@@ -16,6 +16,8 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <memory>
+#include <stdexcept>
 #include <string>
 
 #include "cachinglayer/Utils.h"
@@ -73,6 +75,20 @@ CreateTempDir(const std::string& prefix) {
 }
 
 }  // namespace
+
+TEST(Utils, SemiInlineGetPreservesValuesAndErrors) {
+    using milvus::cachinglayer::SemiInlineGet;
+    auto value = std::make_unique<int>(42);
+    const auto* address = value.get();
+    EXPECT_EQ(SemiInlineGet(folly::makeSemiFuture(std::move(value))).get(), address);
+    EXPECT_EQ(*SemiInlineGet(folly::makeSemiFuture().deferValue([](auto) { return std::make_unique<int>(7); })), 7);
+    EXPECT_EQ(SemiInlineGet(folly::makeSemiFuture()), folly::unit);
+    EXPECT_EQ(SemiInlineGet(folly::makeSemiFuture().deferValue([](auto) {})), folly::unit);
+    EXPECT_THROW(SemiInlineGet(folly::makeSemiFuture<int>(std::runtime_error("ready failure"))), std::runtime_error);
+    EXPECT_THROW(
+        SemiInlineGet(folly::makeSemiFuture().deferValue([](auto) { throw std::runtime_error("deferred failure"); })),
+        std::runtime_error);
+}
 
 // getContainerMemLimit() basic env variable precedence: MEM_LIMIT only
 TEST(Utils, GetContainerMemLimitEnvOnly) {

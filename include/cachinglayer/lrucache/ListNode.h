@@ -121,6 +121,7 @@ class ListNode {
     void
     mark_loaded(Fn&& cb, bool requesting_thread) {
         std::unique_ptr<folly::SharedPromise<folly::Unit>> promise = nullptr;
+        bool made_evictable = false;
         {
             std::unique_lock<std::shared_mutex> lock(mtx_);
             if (requesting_thread) {
@@ -157,6 +158,7 @@ class ListNode {
                         // memory of this cell is not reserved, touch() to track it.
                         if (evictable_) {
                             touch_to_dlist(true);
+                            made_evictable = true;
                         }
                         break;
                     }
@@ -173,6 +175,9 @@ class ListNode {
                     default:;  // LOADED/CACHED: cell has been loaded by another thread, do nothing.
                 }
             }
+        }
+        if (made_evictable) {
+            notify_waiting_requests();
         }
         if (promise) {
             promise->setValue(folly::Unit());
@@ -209,6 +214,10 @@ class ListNode {
     // must be called under the lock of mtx_.
     void
     touch_to_dlist(bool update_evictable_size);
+
+    // May run inline continuations; must be called outside mtx_.
+    void
+    notify_waiting_requests();
 
     mutable std::shared_mutex mtx_;
     // if a ListNode is in a DList, last_touch_ is the time when the node was lastly pushed
