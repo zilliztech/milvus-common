@@ -12,12 +12,13 @@
 
 ### 1.1 Background
 
-Loading a cache cell consumes two different kinds of resources:
+Loading a batch of cache cells consumes three resource categories:
 
-- **loaded resource** is the final memory or file usage retained after the cell becomes resident;
-- **loading overhead** is temporary memory or file usage that exists only while the load is running, such as read buffers, decode buffers, conversion buffers, or index construction scratch space.
+- **resident** is final memory or file usage retained by each loaded cell;
+- **private_overhead** is temporary resource reserved independently for each load request, including complete sidecars and construction intermediates that outlive runtime admission leases;
+- **shared_overhead** is temporary scratch whose lifetime is covered by a shared runtime limiter, such as leased download, decryption or write buffers.
 
-Loaded resource must always be reserved per request because it remains resident independently of the mechanism that performs the load. Loading overhead is different. Concurrent requests are often constrained by a shared runtime resource such as a transient-memory budget or a thread pool. In that case, summing every request's conservative peak can be much larger than the maximum temporary resource that can be active at once.
+Resident and private overhead must always be reserved per request. Only shared overhead may be capped across requests by a Group. A worker-count bound cannot cover buffers retained outside those workers.
 
 For example, ten queued loads may each estimate 256 MiB of transient memory, while a four-worker executor can run only four of them concurrently. Reserving 2.5 GiB of overhead rejects useful work even though the runtime executor bounds the active peak near 1 GiB. Conversely, using a stale or undersized shared bound can admit work without reserving enough capacity in the caching layer.
 
@@ -25,8 +26,8 @@ This design introduces explicit loading-overhead Groups. A Group aggregates acti
 
 ### 1.2 Goals
 
-- Keep final loaded resource and temporary loading overhead as separate estimates.
-- Aggregate loading overhead across CacheSlots governed by the same runtime limiter.
+- Keep resident, private overhead and shared overhead as separate batch estimates.
+- Aggregate only shared overhead across CacheSlots governed by the same runtime limiter.
 - Support multiple independent Groups in one process.
 - Keep memory and file accounting independent.
 - Support passthrough, Budget-backed, and executor-backed policies.
@@ -52,13 +53,14 @@ This design introduces explicit loading-overhead Groups. A Group aggregates acti
 | Term | Meaning |
 |---|---|
 | Loaded resource | Final resource retained after loading completes. |
-| Loading overhead | Temporary resource used only during the load. |
+| Private overhead | Temporary resource reserved independently per load request. |
+| Shared overhead | Temporary resource covered by a shared runtime limiter and eligible for Group aggregation. |
 | Dimension | Memory or file/disk. The two dimensions are managed independently. |
 | Group | Shared accounting state for one dimension and one runtime concurrency domain. |
 | Binding | A CacheSlot's association with a Group, plus an optional per-runtime-unit bound. |
 | Runtime unit | One unit of runtime concurrency, such as one executor task or one oversized Budget acquisition. |
 | Policy owner | The Milvus component that owns the corresponding Budget/executor/configuration and serializes updates. |
-| Active demand | Sum of conservative loading-overhead estimates for admitted requests in a Group. |
+| Active demand | Sum of conservative shared-overhead estimates for admitted requests in a Group. |
 | Group target | Amount the current policy wants DList to book for the Group. |
 | Booked overhead | Amount currently represented in DList for the Group. It may temporarily differ from the latest target after a policy update. |
 | Request-local passthrough | Overhead for an unbound dimension; it is charged directly for every request. |
@@ -110,7 +112,7 @@ LoadingOverheadGroup                                       |
   +---------------------------------------------------------+
 
 Translator
-  | reports {loaded resource, loading overhead}
+  | reports {resident, private_overhead, shared_overhead}
   | carries the DList-issued Group Handle in Meta
   | does not register membership itself
   v
@@ -128,7 +130,7 @@ CacheSlot
 |---|---|---|
 | Policy owner in Milvus | Runtime Budget/executor, serialized configuration updates, and the control-plane copy of the Group Handle | Per-request DList bookkeeping or membership state |
 | `Manager` | Public entry points that ask the process-wide DList to create or update a Group | Translator/CacheSlot membership lifetime |
-| `Translator` | Conservative per-cell estimates and transport of the DList-issued Handle in Meta | Membership registration or runtime policy publication |
+| `Translator` | Conservative batch estimates and transport of the DList-issued Handle in Meta | Membership registration or runtime policy publication |
 | `CacheSlot` | Stable Handle/config snapshot, DList membership lifetime, and the request Reserve/Release pair | Shared target calculation or Group creation |
 | `LoadingOverheadGroup` | DList-scoped policy, binding metadata, active demand, and booked amount | Eviction, waiting, runtime acquisition, or external identity resolution |
 | `DList` | Logical ownership of Groups/Handles, membership registration, admission, eviction, waiters, scaling, and `total_loading_size_` | Budget/executor lifecycle |
@@ -184,16 +186,24 @@ Holding a Handle is therefore not equivalent to being registered. The Handle ide
 
 ### 4.1 Translator Estimates
 
-`Translator::estimated_byte_size_of_cell()` continues to return two values:
+`Translator::estimated_loading_usage()` estimates the exact cell batch passed to loading:
 
 ```cpp
-std::pair<ResourceUsage, ResourceUsage>
-estimated_byte_size_of_cell(cid_t cid) const;
+struct LoadingResourceUsage {
+    ResourceUsage resident;
+    ResourceUsage private_overhead;
+    ResourceUsage shared_overhead;
+};
+
+LoadingResourceUsage
+estimated_loading_usage(const std::vector<cid_t>& cids) const;
 ```
 
-The first value is final loaded resource. The second value is temporary loading overhead and excludes the final loaded resource.
+Resident is the sum of the final cell sizes. Private and shared overhead each bound the batch's temporary peak, excluding resident, and account for the translator's actual loading concurrency. They need not equal the sum of singleton estimates. Empty input returns zero.
 
-Both estimates are admission-safety inputs and must be conservative. For a Group-managed dimension, the loading-overhead estimate must cover the request's actual transient usage from successful DList admission until the paired DList release. Underestimation can make the Group target smaller than the runtime peak and break admission safety.
+All estimates must be non-negative and conservative from successful reservation until loading finishes or fails. Only shared overhead participates in `Meta::loading_overhead_config`; resident and private overhead are always charged per request. Loaded cells continue to be accounted individually using `CellByteSize()`. If a cell reports zero size, CacheSlot uses the resident estimate for that singleton as the existing fallback.
+
+When migrating from the old pair, move temporary allocations to private overhead unless their entire lifetime is covered by the configured runtime limiter. For example, a complete bitmap sidecar retained while constructing the index is private; download scratch held only under a global admission lease can be shared. Changing this common interface does not classify downstream Milvus allocations automatically.
 
 ### 4.2 Group Creation
 
@@ -355,8 +365,8 @@ The three request estimates total 350 bytes, but DList books at most 200 bytes f
 For each request, DList separates two components:
 
 ```text
-request_local = loaded_resource
-              + overhead from every unbound dimension
+request_local = resident + private_overhead
+              + shared_overhead from every unbound dimension
 
 group_change  = change in Q for every bound dimension
 ```
@@ -364,7 +374,7 @@ group_change  = change in Q for every bound dimension
 The unscaled value returned to `CacheSlot` is:
 
 ```text
-reserved = loaded_resource + passthrough_overhead + group_delta
+reserved = resident + private_overhead + unbound_shared_overhead + group_delta
 ```
 
 The result also contains an explicit `success` flag. `reserved == 0` is not a failure sentinel because a valid policy may produce a zero target.
@@ -403,7 +413,7 @@ Scaling each logical delta separately would produce `+2 +2 -3`, leaking one phan
 Two values intentionally describe different things:
 
 - `DList::total_loading_size_` is the factor-adjusted amount used for admission and includes Group aggregation.
-- `cache_loading_bytes` is the stable per-request estimate `loaded_resource + loading_overhead` for active CacheSlot loads.
+- `cache_loading_bytes` is the stable per-request estimate `resident + private_overhead + shared_overhead` for active CacheSlot loads.
 
 The metric increments and decrements the same request-local estimate even if a Group policy changes mid-flight. It therefore measures active requested work, not the current shared Group booking, and cannot drift because policy replacement changed the DList delta.
 
@@ -414,17 +424,17 @@ The metric increments and decrements the same request-local estimate even if a G
 ### 6.1 Normal Flow
 
 ```text
-Translator estimates cells
+CacheSlot combines essential and bonus cells
         |
         v
-CacheSlot combines essential and bonus cells
+Translator estimates the complete batch
         |
         v
 DList locks list_mtx_
         |
         +--> Group Reserve: add active demand, compute target delta
         |
-        +--> add final loaded resource and unbound overhead
+        +--> add resident, private overhead and unbound shared overhead
         |
         +--> scale, admit, and evict if necessary
         |
@@ -462,7 +472,7 @@ The Group does not observe actual runtime in-flight state. Its safety depends on
 
 CacheSlot first attempts the combined essential-plus-bonus reservation with a zero timeout. If that attempt fails, Group demand is rolled back with the rest of the DList transaction, and CacheSlot retries the essential cells with the caller's real timeout.
 
-The retry is a new admission transaction. No Group demand from the failed bonus attempt remains active.
+The retry re-estimates the essential-only batch and starts a new admission transaction; batch peaks cannot be derived by subtracting bonus estimates. No Group demand from the failed bonus attempt remains active.
 
 ### 6.3 Failure and Exception Cleanup
 
@@ -591,8 +601,9 @@ Callers that require strict transition-time admission safety need a stronger pro
 A Group-aware waiter stores:
 
 ```text
-loaded resource
-loading overhead
+resident resource
+private overhead
+shared overhead
 copied LoadingOverheadConfig
 last computed scaled requirement
 deadline and cancellation state
@@ -897,7 +908,7 @@ Request-path refresh leaves idle CacheSlots stale and allows concurrent requests
 3. Ask DList to create one Group Handle per limiter/dimension and retain the control-plane copy in the authoritative owner.
 4. Distribute that same Handle to the relevant Translator/CacheSlot construction path; do not synthesize or look up another identity downstream.
 5. Choose the initial policy from the latest serialized Budget or executor configuration.
-6. Update Translators to return separate final-resource and temporary-overhead estimates and to carry the supplied Handle in Meta.
+6. Update Translators to return separate resident, private-overhead and shared-overhead batch estimates and to carry the supplied Handle in Meta.
 7. Let CacheSlot register membership with `BindLoadingOverheadGroups()`, using conservative `max_runtime_unit` values for Budget/Executor policies.
 8. Use the same snapshotted Handle for every Reserve/Release and Unbind it at CacheSlot destruction.
 9. Apply runtime updates through one serialized owner using the expansion/tightening order in Section 8.

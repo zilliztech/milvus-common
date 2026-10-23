@@ -21,6 +21,12 @@
 
 namespace milvus::cachinglayer {
 
+struct LoadingResourceUsage {
+    ResourceUsage resident;          // Final cell resources, charged individually after loading.
+    ResourceUsage private_overhead;  // Request-local temporary resources, always reserved in full.
+    ResourceUsage shared_overhead;   // Temporary resources eligible for the bound group policies.
+};
+
 class LoadingOverheadGroup;
 using LoadingOverheadGroupHandle = std::shared_ptr<LoadingOverheadGroup>;
 
@@ -180,9 +186,9 @@ struct LoadingOverheadGroupBinding {
 /**
  * @brief Loading-overhead configuration for a Translator.
  *
- * Each resource dimension binds independently to a Group. An absent dimension is
- * not assigned to a Group; its request-local loading overhead passes through
- * unchanged and remains subject to DList admission limits.
+ * Each shared_overhead dimension binds independently to a Group. An absent dimension
+ * passes through unchanged and remains subject to DList admission limits.
+ * Resident and private_overhead never participate in these Groups.
  */
 struct LoadingOverheadConfig {
     /** @brief Memory-dimension binding, or std::nullopt for request-local passthrough. */

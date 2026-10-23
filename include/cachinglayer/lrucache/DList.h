@@ -158,20 +158,19 @@ class DList : public std::enable_shared_from_this<DList> {
                                       OpContext* ctx = nullptr);
 
     // Reserve with loading-overhead Group integration.
-    // Group-managed overhead is capped across the bound Group before the
+    // Only shared overhead is capped across the bound Group before the
     // request total is scaled by loading_resource_factor.
     // A successful reservation may reserve zero bytes, so success is explicit.
     // The same timeout and executor requirements apply as for the overload above.
     folly::SemiFuture<LoadingResourceReservationResult>
-    ReserveLoadingResourceWithTimeout(const ResourceUsage& loaded, const ResourceUsage& overhead,
-                                      const LoadingOverheadConfig* config, std::chrono::milliseconds timeout,
-                                      OpContext* ctx = nullptr);
+    ReserveLoadingResourceWithTimeout(const LoadingResourceUsage& usage, const LoadingOverheadConfig* config,
+                                      std::chrono::milliseconds timeout, OpContext* ctx = nullptr);
 
     // Release with loading-overhead Group integration.
-    // Returns the actual unscaled size released (loaded + Group delta).
+    // Pass the original admitted estimate, not the reservation's Group delta.
+    // Returns the actual unscaled size released (request-local resource + Group delta).
     ResourceUsage
-    ReleaseLoadingResource(const ResourceUsage& loaded, const ResourceUsage& overhead,
-                           const LoadingOverheadConfig* config);
+    ReleaseLoadingResource(const LoadingResourceUsage& usage, const LoadingOverheadConfig* config);
 
     // Release resource used for loading, called after loading a cell.
     void
@@ -219,8 +218,7 @@ class DList : public std::enable_shared_from_this<DList> {
     // Waiting request for timeout-based memory reservation
     struct WaitingRequest {
         ResourceUsage required_size;  // initial policy-derived scaled requirement used for queue ordering
-        ResourceUsage loaded;         // loaded portion (for Group-aware path)
-        ResourceUsage overhead;       // overhead portion (for Group-aware path)
+        LoadingResourceUsage usage;   // original estimate, retained for Group-aware retries
         // Queued requests own a copy so they never retain a pointer into Translator Meta.
         std::optional<LoadingOverheadConfig> loading_overhead_config;
         std::chrono::steady_clock::time_point deadline;
@@ -241,12 +239,11 @@ class DList : public std::enable_shared_from_this<DList> {
         }
 
         // Group-aware constructor.
-        WaitingRequest(ResourceUsage required_size, ResourceUsage loaded, ResourceUsage overhead,
-                       const LoadingOverheadConfig* config, std::chrono::steady_clock::time_point dl,
-                       folly::Promise<LoadingResourceReservationResult> p, uint64_t id)
+        WaitingRequest(ResourceUsage required_size, LoadingResourceUsage usage, const LoadingOverheadConfig* config,
+                       std::chrono::steady_clock::time_point dl, folly::Promise<LoadingResourceReservationResult> p,
+                       uint64_t id)
             : required_size(required_size),
-              loaded(loaded),
-              overhead(overhead),
+              usage(usage),
               loading_overhead_config(config ? std::make_optional(*config) : std::nullopt),
               deadline(dl),
               bool_promise(folly::Promise<bool>::makeEmpty()),
@@ -331,8 +328,7 @@ class DList : public std::enable_shared_from_this<DList> {
     // Reserve with Groups under lock using the factor-adjusted target transition.
     // Returns the explicit result and the checked scaled requirement attempted.
     LoadingResourceReservationAttempt
-    reserveResourceInternalWithOverhead(const ResourceUsage& loaded, const ResourceUsage& overhead,
-                                        const LoadingOverheadConfig* config);
+    reserveResourceInternalWithOverhead(const LoadingResourceUsage& usage, const LoadingOverheadConfig* config);
 
     void
     evictionLoop();
