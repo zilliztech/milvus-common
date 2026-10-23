@@ -312,9 +312,8 @@ class CacheSlotBatchEstimateTest : public ::testing::Test {
 };
 
 TEST_F(CacheSlotBatchEstimateTest, EstimatesWholeBatchAndChargesCellsIndividually) {
-    translator->SetLoadStartCallback([&] {
-        EXPECT_EQ(DListTestFriend::get_loading_memory(*dlist), (ResourceUsage{90, 10}));
-    });
+    translator->SetLoadStartCallback(
+        [&] { EXPECT_EQ(DListTestFriend::get_loading_memory(*dlist), (ResourceUsage{90, 10})); });
     auto cells = slot->PinCellsDirect(nullptr, {0, 1});
     ASSERT_EQ(translator->estimated_batches.size(), 1);
     auto estimated = translator->estimated_batches.front();
@@ -328,9 +327,8 @@ TEST_F(CacheSlotBatchEstimateTest, EstimatesWholeBatchAndChargesCellsIndividuall
 
 TEST_F(CacheSlotBatchEstimateTest, ReestimatesEssentialBatchAfterBonusReservationFails) {
     translator->SetExtraReturnCids({{0, {2}}});
-    translator->SetLoadStartCallback([&] {
-        EXPECT_EQ(DListTestFriend::get_loading_memory(*dlist), (ResourceUsage{70, 10}));
-    });
+    translator->SetLoadStartCallback(
+        [&] { EXPECT_EQ(DListTestFriend::get_loading_memory(*dlist), (ResourceUsage{70, 10})); });
     auto cell = slot->PinOneCellDirect(nullptr, 0);
     EXPECT_EQ(translator->estimated_batches, (std::vector<std::vector<cid_t>>{{0, 2}, {0}}));
     EXPECT_EQ(translator->GetRequestedCids(), (std::vector<std::vector<cid_t>>{{0}}));
@@ -339,9 +337,8 @@ TEST_F(CacheSlotBatchEstimateTest, ReestimatesEssentialBatchAfterBonusReservatio
 }
 
 TEST_F(CacheSlotBatchEstimateTest, LoadFailureReleasesAllThreeResourceCategories) {
-    translator->SetLoadStartCallback([&] {
-        EXPECT_EQ(DListTestFriend::get_loading_memory(*dlist), (ResourceUsage{70, 10}));
-    });
+    translator->SetLoadStartCallback(
+        [&] { EXPECT_EQ(DListTestFriend::get_loading_memory(*dlist), (ResourceUsage{70, 10})); });
     translator->SetShouldThrow(true);
     EXPECT_THROW(slot->PinOneCellDirect(nullptr, 0), std::runtime_error);
     EXPECT_EQ(DListTestFriend::get_using_memory(*dlist), ResourceUsage{});
