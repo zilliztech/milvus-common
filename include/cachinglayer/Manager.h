@@ -31,6 +31,13 @@ class Manager {
     static Manager&
     GetInstance();
 
+    // Configure the dedicated shared-load pool from the application's load concurrency.
+    // Call on a control thread before issuing loads; threads must be positive.
+    // Without configuration it grows on demand up to 5 * hardware_concurrency().
+    // Do not reuse a pool whose workers synchronously wait for cache loads.
+    static void
+    SetLoadPoolThreads(size_t threads);
+
     // Must be called exactly once before any CacheSlot is created.
     static void
     ConfigureTieredStorage(CacheWarmupPolicies warmup_policies, CacheLimit cache_limit,

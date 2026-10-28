@@ -510,7 +510,9 @@ TEST_F(CacheSlotTest, LoadTaskAllocationFailureAllowsRetry) {
 
             auto retry = folly::coro::co_withExecutor(folly::getKeepAliveToken(&folly::InlineExecutor::instance()),
                                                       AwaitPin(cache_slot_->PinCells(nullptr, {10})))
-                             .start();
+                             .start()
+                             .via(&folly::InlineExecutor::instance());
+            retry.wait(std::chrono::seconds(5));
             ASSERT_TRUE(retry.isReady());
             EXPECT_NE(std::move(retry).get()->get_cell_of(10), nullptr);
             EXPECT_TRUE(cache_slot_->ManualEvict(0));
@@ -862,11 +864,14 @@ TEST_F(CoroutineCacheTest, CancelledLoadDrainsBeforeReleasingReservation) {
     folly::CPUThreadPoolExecutor executor(1);
     auto unblock = folly::makeGuard([gate] { gate->finish.post(); });
     auto pending =
-        folly::coro::co_withExecutor(folly::getKeepAliveToken(&executor), AwaitPin(slot->PinCells(&ctx, {0}))).start();
+        folly::coro::co_withExecutor(folly::getKeepAliveToken(&executor), AwaitPin(slot->PinCells(&ctx, {0})))
+            .start()
+            .via(&folly::InlineExecutor::instance());
     ASSERT_EQ(gate->started.wait_for(std::chrono::seconds(5)), std::future_status::ready);
     cancellation.requestCancellation();
     ExpectExecutorProgress(executor);
-    EXPECT_FALSE(pending.isReady());
+    pending.wait(std::chrono::seconds(5));
+    EXPECT_TRUE(pending.isReady());
     EXPECT_GT(DListTestFriend::get_loading_memory(*dlist).memory_bytes, 0);
     gate->finish.post();
     try {
@@ -875,6 +880,7 @@ TEST_F(CoroutineCacheTest, CancelledLoadDrainsBeforeReleasingReservation) {
     } catch (const milvus::SegcoreError& error) {
         EXPECT_EQ(error.get_error_code(), milvus::ErrorCode::FollyCancel);
     }
+    SemiInlineGet(slot->WaitForLoads());
     EXPECT_EQ(DListTestFriend::get_loading_memory(*dlist), ResourceUsage{});
     EXPECT_NE(folly::coro::blockingWait(slot->PinCells(nullptr, {0})), nullptr);
 }
@@ -900,6 +906,7 @@ TEST_F(CoroutineCacheTest, ResourceWaitCancellationLeavesNoClaim) {
     EXPECT_EQ(DListTestFriend::get_waiting_request_count(*dlist), 1);
     cancellation.requestCancellation();
     EXPECT_THROW(std::move(pending).get(), milvus::SegcoreError);
+    SemiInlineGet(slot->WaitForLoads());
     EXPECT_EQ(DListTestFriend::get_waiting_request_count(*dlist), 0);
     EXPECT_EQ(DListTestFriend::get_loading_memory(*dlist), held);
     EXPECT_EQ(gate->calls, 0);
@@ -921,10 +928,14 @@ TEST_F(CoroutineCacheTest, InlineReservationCompletionCanFinishLoad) {
         auto slot = MakeSlot(gate);
         auto pending = slot->PinCells(nullptr, {0}).via(&folly::InlineExecutor::instance());
         ASSERT_FALSE(pending.isReady());
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (DListTestFriend::get_waiting_request_count(*dlist) == 0 && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::yield();
         ASSERT_EQ(DListTestFriend::get_waiting_request_count(*dlist), 1);
 
         // The resumed load immediately releases its reservation and reacquires the DList lock.
         dlist->ReleaseLoadingResource(held);
+        pending.wait(std::chrono::seconds(5));
         ASSERT_TRUE(pending.isReady());
         if (fail) {
             EXPECT_THROW(std::move(pending).get(), std::runtime_error);
@@ -940,7 +951,7 @@ TEST_F(CoroutineCacheTest, InlineReservationCompletionCanFinishLoad) {
     }
 }
 
-TEST_F(CoroutineCacheTest, SemiInlineGetKeepsQueuedLegacyLoadsOnCaller) {
+TEST_F(CoroutineCacheTest, QueuedLegacyLoadsRunIndependentlyOfCaller) {
     for (const bool pin_all : {false, true}) {
         for (const bool fail : {false, true}) {
             SCOPED_TRACE(pin_all);
@@ -985,7 +996,7 @@ TEST_F(CoroutineCacheTest, SemiInlineGetKeepsQueuedLegacyLoadsOnCaller) {
             notifier = std::async(std::launch::async, [&] { dlist->ReleaseLoadingResource(held); });
             release_started = true;
             ASSERT_EQ(loading_id.wait_for(std::chrono::seconds(2)), std::future_status::ready);
-            EXPECT_EQ(loading_id.get(), caller_id.get());
+            EXPECT_NE(loading_id.get(), caller_id.get());
             // A slow synchronous fetch must not hold up the thread publishing its reservation.
             EXPECT_EQ(notifier.wait_for(std::chrono::seconds(1)), std::future_status::ready);
             EXPECT_EQ(caller.wait_for(std::chrono::milliseconds(0)), std::future_status::timeout);
@@ -2398,8 +2409,8 @@ TEST(ManagerCreateCacheSlotTest, ValidCtxWorksNormally) {
     EXPECT_EQ(cache_slot->num_cells(), 2);
 }
 
-// Test that Warmup passes ctx to PinCellsDirect which passes it to get_cells
-TEST(WarmupTest, WarmupPassesCtxToGetCells) {
+// Warmup gives the producer its own context and cancellation token.
+TEST(WarmupTest, WarmupUsesIndependentLoadContext) {
     auto limit = ResourceUsage{10000, 0};
     auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
 
@@ -2419,8 +2430,9 @@ TEST(WarmupTest, WarmupPassesCtxToGetCells) {
 
     // Verify that get_cells was called (warmup loaded the cells)
     EXPECT_EQ(translator_ptr->GetCellsCallCount(), 1);
-    // Verify that the ctx was passed through to get_cells
-    EXPECT_EQ(translator_ptr->GetLastCtx(), op_ctx.get());
+    // The producer owns a separate context.
+    EXPECT_NE(translator_ptr->GetLastCtx(), op_ctx.get());
+    EXPECT_NE(translator_ptr->GetLastCtx(), nullptr);
 }
 
 TEST(WarmupTraceContextTest, SyncWarmupPassesTraceContext) {
@@ -2447,7 +2459,8 @@ TEST(WarmupTraceContextTest, SyncWarmupPassesTraceContext) {
 
     folly::coro::blockingWait(cache_slot->Warmup(op_ctx.get()));
 
-    EXPECT_EQ(translator_ptr->GetLastCtx(), op_ctx.get());
+    EXPECT_NE(translator_ptr->GetLastCtx(), op_ctx.get());
+    EXPECT_NE(translator_ptr->GetLastCtx(), nullptr);
     EXPECT_TRUE(translator_ptr->LastCtxHasTrace());
     ASSERT_TRUE(translator_ptr->LastTraceIdHex().has_value());
     EXPECT_EQ(*translator_ptr->LastTraceIdHex(), "0123456789abcdeffedcba9876543210");
@@ -2499,8 +2512,8 @@ TEST(WarmupTest, WarmupWithNullCtxAndEveryLoadPolicyWorks) {
 
     // Verify that get_cells was called
     EXPECT_EQ(translator_ptr->GetCellsCallCount(), 1);
-    // ctx should be nullptr
-    EXPECT_EQ(translator_ptr->GetLastCtx(), nullptr);
+    // A null caller context still produces an owned load context.
+    EXPECT_NE(translator_ptr->GetLastCtx(), nullptr);
 }
 
 // Test that CacheSlot construction handles exceptions in CacheCell initialization gracefully.
@@ -2894,7 +2907,8 @@ TEST(AsyncWarmupTest, SyncWarmupStillWorks) {
 
     // Cells should be loaded immediately after Warmup returns
     EXPECT_EQ(translator_ptr->GetCellsCallCount(), 1);
-    EXPECT_EQ(translator_ptr->GetLastCtx(), op_ctx.get());  // ctx should be passed for sync
+    EXPECT_NE(translator_ptr->GetLastCtx(), op_ctx.get());
+    EXPECT_NE(translator_ptr->GetLastCtx(), nullptr);  // sync warmup also uses an owned context
 
     // Access should be immediate (no waiting)
     auto accessor = cache_slot->PinCellsDirect(op_ctx.get(), {0, 1});
@@ -3453,4 +3467,24 @@ TEST(CacheSlotBorrowTest, TryBorrowCellReturnsResidentCellAfterWarmup) {
         auto accessor = cache_slot->PinOneCellDirect(nullptr, uid);
         EXPECT_EQ(borrowed, accessor->get_cell_of(uid));
     }
+}
+
+TEST_F(CacheSlotTest, CancelledLoadPreservesErrorCodeAndAllowsRetry) {
+    folly::CancellationSource source;
+    milvus::OpContext cancelled_context(source.getToken());
+    source.requestCancellation();
+    translator_->ResetCounters();
+    try {
+        cache_slot_->PinOneCellDirect(&cancelled_context, 30);
+        FAIL() << "Expected a typed cancellation before invoking the translator";
+    } catch (const milvus::SegcoreError& error) {
+        EXPECT_EQ(error.get_error_code(), milvus::ErrorCode::FollyCancel);
+    }
+    EXPECT_EQ(translator_->GetCellsCallCount(), 0);
+    EXPECT_EQ(DListTestFriend::get_loading_memory(*dlist_), ResourceUsage{});
+
+    milvus::OpContext active_context;
+    auto accessor = cache_slot_->PinOneCellDirect(&active_context, 30);
+    ASSERT_NE(accessor, nullptr);
+    EXPECT_EQ(translator_->GetCellsCallCount(), 1);
 }

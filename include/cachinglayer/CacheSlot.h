@@ -35,6 +35,7 @@
 
 #include "cachinglayer/LoadingOverhead.h"
 #include "cachinglayer/Metrics.h"
+#include "cachinglayer/SharedLoad.h"
 #include "cachinglayer/Translator.h"
 #include "cachinglayer/Utils.h"
 #include "cachinglayer/lrucache/DList.h"
@@ -50,7 +51,8 @@ class CellAccessor;
 /**
  * @brief Cache cells and coordinate their loading, pinning and eviction.
  * Pin and warmup tasks retain the slot and own their ID arguments before starting.
- * The caller keeps the borrowed OpContext and DList alive until completion.
+ * The caller keeps OpContext alive until its pin request completes. The DList
+ * must be managed by shared_ptr; the slot retains it until background work drains.
  * Returned accessors retain the slot and prevent eviction of their pinned cells.
  */
 template <typename CellT>
@@ -69,6 +71,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
           cell_data_type_(translator_->meta()->cell_data_type),
           storage_type_(translator_->meta()->storage_type),
           dlist_(dlist),
+          dlist_owner_(dlist->shared_from_this()),
           evictable_(evictable),
           self_reserve_(self_reserve),
           storage_usage_tracking_enabled_(storage_usage_tracking_enabled),
@@ -82,6 +85,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             shard_memory_usage_metric_ = monitor::create_cache_shard_usage_metric_handle(
                 cell_data_type_, metric_attribution->shard, StorageType::MEMORY);
         }
+        active_loads_.resize(translator_->num_cells());
         cells_.reserve(translator_->num_cells());
         for (cid_t i = 0; i < static_cast<cid_t>(translator_->num_cells()); ++i) {
             cells_.push_back(std::make_unique<CacheCell>(this, i));
@@ -168,7 +172,10 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         }
         return folly::makeSemiFutureWith([&] {
             RecordAccessEvent();
-            return PinCellsImpl(this->shared_from_this(), ctx, ResolveCellIds(uids), loading_timeout_).semi();
+            auto cids = ResolveCellIds(uids);
+            if (auto resident = TryPinResident(ctx, cids))
+                return folly::makeSemiFuture(std::move(resident));
+            return PinCellsImpl(this->shared_from_this(), ctx, std::move(cids), loading_timeout_).semi();
         });
     }
 
@@ -193,38 +200,10 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                 cid = cell_id_of(uid);
             }
         }
-        auto [need_load, result] = cells_[cid]->pin();
-        auto cell_storage_bytes = translator_->cells_storage_bytes({cid});
-        if (need_load) {
-            monitor::cache_cell_access_miss_bytes_total(cell_data_type_, storage_type_).Increment(cell_storage_bytes);
-        } else {
-            monitor::cache_cell_access_hit_bytes_total(cell_data_type_, storage_type_).Increment(cell_storage_bytes);
-        }
-        if (std::holds_alternative<internal::ListNode::NodePin>(result)) {
-            std::vector<internal::ListNode::NodePin> pins;
-            pins.push_back(std::get<internal::ListNode::NodePin>(std::move(result)));
-            if (ctx && storage_usage_tracking_enabled_) {
-                ctx->storage_usage.scanned_total_bytes.fetch_add(cell_storage_bytes);
-            }
-            return std::make_shared<CellAccessor<CellT>>(this->shared_from_this(), std::move(pins));
-        } else {
-            auto pin_future = std::get<folly::SemiFuture<internal::ListNode::NodePin>>(std::move(result));
-            if (need_load) {
-                try {
-                    folly::coro::blockingWait(RunLoad(ctx, {cid}, loading_timeout_));
-                } catch (...) {
-                    monitor::cache_load_event_fail_total(cell_data_type_, storage_type_).Increment();
-                    cells_[cid]->set_error(folly::exception_wrapper(std::current_exception()));
-                }
-            }
-            std::vector<internal::ListNode::NodePin> pins;
-            pins.push_back(SemiInlineGet(std::move(pin_future)));
-            if (ctx && storage_usage_tracking_enabled_) {
-                ctx->storage_usage.scanned_cold_bytes.fetch_add(cell_storage_bytes);
-                ctx->storage_usage.scanned_total_bytes.fetch_add(cell_storage_bytes);
-            }
-            return std::make_shared<CellAccessor<CellT>>(this->shared_from_this(), std::move(pins));
-        }
+        std::vector<cid_t> cids{cid};
+        if (auto resident = TryPinResident(ctx, cids))
+            return resident;
+        return folly::coro::blockingWait(PinInternal(ctx, std::move(cids), loading_timeout_, true));
     }
 
     /// Synchronous adapter: do not call on an executor needed by this load.
@@ -235,8 +214,26 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             return std::make_shared<CellAccessor<CellT>>(this->shared_from_this(),
                                                          std::vector<internal::ListNode::NodePin>());
         }
-        return folly::coro::blockingWait(PinCellsImpl(this->shared_from_this(), ctx, ResolveCellIds(uids),
-                                                      timeout_override.value_or(loading_timeout_)));
+        auto cids = ResolveCellIds(uids);
+        if (auto resident = TryPinResident(ctx, cids))
+            return resident;
+        return folly::coro::blockingWait(
+            PinCellsImpl(this->shared_from_this(), ctx, std::move(cids), timeout_override.value_or(loading_timeout_)));
+    }
+
+    // Wait for currently issued loads to release their resources, including
+    // background work still draining after a request has been cancelled.
+    folly::SemiFuture<folly::Unit>
+    WaitForLoads() {
+        std::vector<folly::SemiFuture<folly::Unit>> drains;
+        {
+            std::lock_guard lock(loads_mutex_);
+            for (const auto& load : active_loads_)
+                if (load)
+                    drains.push_back(load->drained.getSemiFuture());
+        }
+        return folly::collectAll(drains).deferValue(
+            [self = this->shared_from_this()](auto&&) { return folly::Unit{}; });
     }
 
     // Manually evicts the cell if it is LOADED and not pinned.
@@ -286,6 +283,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     }
 
     ~CacheSlot() {
+        cells_.clear();
         if (loading_overhead_config_) {
             dlist_->UnbindLoadingOverheadGroups(*loading_overhead_config_);
         }
@@ -295,6 +293,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
 
  private:
     friend class CellAccessor<CellT>;
+    friend class SharedLoadTestFriend;
 
     // Normalize borrowed UIDs before creating a task so it only retains unique cell IDs.
     [[nodiscard]] std::vector<cid_t>
@@ -349,7 +348,17 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             co_return;
         }
         OpContext ctx(token);
-        co_await self->PinInternal(&ctx, self->AllCellIds(), self->warmup_loading_timeout_);
+        std::exception_ptr error;
+        try {
+            co_await self->PinInternal(&ctx, self->AllCellIds(), self->warmup_loading_timeout_);
+        } catch (...) {
+            error = std::current_exception();
+        }
+        // A cancelled background waiter must not release its prefetch concurrency
+        // permit while its issued I/O is still draining.
+        co_await self->WaitForLoads();
+        if (error)
+            std::rethrow_exception(error);
         self->skip_pin_.store(!self->evictable_, std::memory_order_release);
     }
 
@@ -402,80 +411,44 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
 
     // The owning pin task retains the slot while this operation is suspended.
     folly::coro::Task<std::shared_ptr<CellAccessor<CellT>>>
-    PinInternal(OpContext* ctx, std::vector<cid_t> cids, std::chrono::milliseconds timeout) {
-        std::vector<folly::SemiFuture<internal::ListNode::NodePin>> futures;
-        std::vector<internal::ListNode::NodePin> ready_pins;
-        std::unordered_set<cid_t> need_load_cids;
-        futures.reserve(cids.size());
-        ready_pins.reserve(cids.size());
-        need_load_cids.reserve(cids.size());
-        for (const auto& cid : cids) {
-            if (cid >= static_cast<cid_t>(cells_.size())) {
-                ThrowInfo(ErrorCode::OutOfRange, "cid {} out of range, slot has {} cells. key={}", cid, cells_.size(),
-                          translator_->key());
-            }
-        }
-
-        for (const auto& cid : cids) {
-            auto [need_load, result] = cells_[cid]->pin();
-            if (std::holds_alternative<internal::ListNode::NodePin>(result)) {
-                ready_pins.push_back(std::get<internal::ListNode::NodePin>(std::move(result)));
-            } else {
-                futures.push_back(std::get<folly::SemiFuture<internal::ListNode::NodePin>>(std::move(result)));
-            }
-            if (need_load) {
-                need_load_cids.insert(cid);
-                monitor::cache_cell_access_miss_bytes_total(cell_data_type_, storage_type_)
-                    .Increment(cells_[cid]->local_storage_bytes());
-            } else {
-                monitor::cache_cell_access_hit_bytes_total(cell_data_type_, storage_type_)
-                    .Increment(cells_[cid]->local_storage_bytes());
-            }
-        }
-
-        if (!need_load_cids.empty()) {
-            // The claim owner also handles failures while allocating the load task.
-            try {
-                co_await RunLoad(ctx, need_load_cids, timeout);
-            } catch (...) {
-                auto error = folly::exception_wrapper(std::current_exception());
-                monitor::cache_load_event_fail_total(cell_data_type_, storage_type_).Increment();
-                for (auto cid : need_load_cids) {
-                    cells_[cid]->set_error(error);
-                }
-            }
-        }
-
-        std::vector<internal::ListNode::NodePin> all_pins;
-        all_pins.reserve(cids.size());
-
-        for (auto& pin : ready_pins) {
-            all_pins.push_back(std::move(pin));
-        }
-
-        std::exception_ptr first_error;
-        for (auto& future : futures) {
-            try {
-                all_pins.push_back(co_await std::move(future));
-            } catch (...) {
-                if (!first_error) {
-                    first_error = std::current_exception();
-                }
-            }
-        }
-        if (first_error) {
-            std::rethrow_exception(first_error);
-        }
-
+    PinInternal(OpContext* ctx, std::vector<cid_t> cids, std::chrono::milliseconds timeout, bool single = false) {
+        if (auto resident = TryPinResident(ctx, cids))
+            co_return resident;
+        auto pin_result = co_await PinShared(ctx, cids, timeout, single);
+        auto all_pins = std::move(pin_result.first);
         if (ctx && storage_usage_tracking_enabled_) {
-            if (!need_load_cids.empty()) {
-                std::vector<cid_t> need_load_cids_vec(need_load_cids.begin(), need_load_cids.end());
-                ctx->storage_usage.scanned_cold_bytes.fetch_add(translator_->cells_storage_bytes(need_load_cids_vec));
-            }
+            ctx->storage_usage.scanned_cold_bytes.fetch_add(pin_result.second);
             ctx->storage_usage.scanned_total_bytes.fetch_add(translator_->cells_storage_bytes(cids));
         }
 
         co_return std::make_shared<CellAccessor<CellT>>(this->shared_from_this(), std::move(all_pins));
+    }
+
+    std::shared_ptr<CellAccessor<CellT>>
+    TryPinResident(OpContext* ctx, const std::vector<cid_t>& cids) {
+        if (ctx && ctx->cancellation_token.isCancellationRequested())
+            ThrowInfo(ErrorCode::FollyCancel, "Cache wait cancelled");
+        // An external reservation owner must still wait for any producer to drain.
+        if (!self_reserve_)
+            return nullptr;
+        for (auto cid : cids) {
+            if (cid < 0 || cid >= static_cast<cid_t>(cells_.size()))
+                ThrowInfo(ErrorCode::OutOfRange, "cid {} out of range, slot has {} cells", cid, cells_.size());
+        }
+        std::vector<internal::ListNode::NodePin> pins;
+        pins.reserve(cids.size());
+        for (auto cid : cids) {
+            auto pin = cells_[cid]->try_pin();
+            if (!pin)
+                return nullptr;  // Release partial pins before entering the coordinated miss path.
+            pins.push_back(std::move(*pin));
+        }
+        for (auto cid : cids)
+            monitor::cache_cell_access_hit_bytes_total(cell_data_type_, storage_type_)
+                .Increment(cells_[cid]->local_storage_bytes());
+        if (ctx && storage_usage_tracking_enabled_)
+            ctx->storage_usage.scanned_total_bytes.fetch_add(translator_->cells_storage_bytes(cids));
+        return std::make_shared<CellAccessor<CellT>>(this->shared_from_this(), std::move(pins));
     }
 
     // Counts one cell-access request.
@@ -527,6 +500,9 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             }
             start = std::chrono::steady_clock::now();
             auto results = co_await translator_->get_cells_async(ctx, loading_cids);
+            if (ctx && ctx->cancellation_token.isCancellationRequested()) {
+                ThrowInfo(ErrorCode::FollyCancel, "Shared cache load cancelled");
+            }
             auto latency =
                 std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start);
             for (auto& result : results) {
@@ -640,6 +616,188 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             actual_dlist_reserve.ToString(), translator_->key());
 
         co_await run_load_internal();
+    }
+
+    using SharedLoad = internal::SharedLoad;
+    using Pins = std::vector<internal::ListNode::NodePin>;
+    using PinResult = std::pair<Pins, int64_t>;
+
+    void
+    ReleaseLoadWaiters(const std::vector<std::shared_ptr<SharedLoad>>& loads, bool cancelled) {
+        for (const auto& load : loads) {
+            bool cancel = false;
+            {
+                std::lock_guard lock(loads_mutex_);
+                --load->waiters;
+                if (cancelled && load->waiters == 0 && !load->finished && !load->closing) {
+                    load->closing = true;
+                    cancel = true;
+                }
+            }
+            // Callbacks may finish a load inline; never cancel under loads_mutex_.
+            if (cancel)
+                load->cancellation.requestCancellation();
+        }
+    }
+
+    void
+    FinishSharedLoad(const std::shared_ptr<SharedLoad>& load, folly::exception_wrapper error) {
+        {
+            std::lock_guard lock(loads_mutex_);
+            // Keep the registry entry until errors have been published outside the lock.
+            load->closing = true;
+        }
+        if (error) {
+            monitor::cache_load_event_fail_total(cell_data_type_, storage_type_).Increment();
+            for (auto cid : load->cids) cells_[cid]->set_error(error);
+        }
+        {
+            std::lock_guard lock(loads_mutex_);
+            load->finished = true;
+            for (auto cid : load->cids) active_loads_[cid].reset();
+        }
+        // RunLoad's resource guards have already run. Only now may a new generation start.
+        load->drained.setValue(folly::Unit{});
+    }
+
+    void
+    StartSharedLoad(std::shared_ptr<SharedLoad> load, std::chrono::milliseconds timeout) {
+        auto self = this->shared_from_this();
+        try {
+            // timeout applies only to resource admission, as before shared loading.
+            // The last departing waiter cancels the producer; no new I/O deadline.
+            folly::coro::co_withExecutor(folly::getKeepAliveToken(&internal::SharedLoadExecutor()),
+                                         folly::coro::co_withCancellation(load->cancellation.getToken(),
+                                                                          RunLoad(&load->context, load->cids, timeout)))
+                .start([self, load](folly::Try<void>&& result) {
+                    self->FinishSharedLoad(load,
+                                           result.hasException() ? result.exception() : folly::exception_wrapper{});
+                });
+        } catch (...) {
+            FinishSharedLoad(load, folly::exception_wrapper(std::current_exception()));
+        }
+    }
+
+    folly::SemiFuture<PinResult>
+    PinShared(OpContext* ctx, const std::vector<cid_t>& cids, std::chrono::milliseconds timeout, bool single) {
+        auto self = this->shared_from_this();
+        auto token = ctx ? ctx->cancellation_token : folly::CancellationToken{};
+        if (token.isCancellationRequested())
+            ThrowInfo(ErrorCode::FollyCancel, "Cache wait cancelled");
+        std::vector<folly::SemiFuture<internal::ListNode::NodePin>> futures;
+        std::vector<folly::SemiFuture<folly::Unit>> drains;
+        std::vector<std::shared_ptr<SharedLoad>> loads;
+        std::vector<cid_t> claimed;
+        std::vector<cid_t> cold;
+        cold.reserve(cids.size());
+        auto released = std::make_shared<std::atomic<bool>>(false);
+        int64_t cold_bytes = 0;
+        futures.reserve(cids.size());
+        drains.reserve(cids.size());
+        loads.reserve(cids.size());
+        claimed.reserve(cids.size());
+        std::shared_ptr<SharedLoad> created;
+        std::unique_lock lock(loads_mutex_);
+        for (auto cid : cids) {
+            if (cid < 0 || cid >= static_cast<cid_t>(cells_.size())) {
+                ThrowInfo(ErrorCode::OutOfRange, "cid {} out of range, slot has {} cells", cid, cells_.size());
+            }
+        }
+        for (auto cid : cids) {
+            auto load = active_loads_[cid];
+            if (load && load->closing) {
+                auto drained = load->drained.getSemiFuture();
+                lock.unlock();
+                // A cancelled generation is draining, not available for joining. Do
+                // not start another download until it has released all its resources.
+                return internal::WaitForSharedLoad(std::move(drained), token, self)
+                    .deferValue([self, ctx, cids, timeout, single](auto&&) {
+                        return self->PinShared(ctx, cids, timeout, single);
+                    });
+            }
+        }
+        try {
+            for (auto cid : cids) {
+                auto [need_load, pin] = cells_[cid]->pin();
+                if (need_load)
+                    claimed.push_back(cid);
+                if (need_load ||
+                    (single && std::holds_alternative<folly::SemiFuture<internal::ListNode::NodePin>>(pin)))
+                    cold.push_back(cid);
+                if (std::holds_alternative<internal::ListNode::NodePin>(pin)) {
+                    futures.push_back(folly::makeSemiFuture(std::get<internal::ListNode::NodePin>(std::move(pin))));
+                } else {
+                    futures.push_back(std::get<folly::SemiFuture<internal::ListNode::NodePin>>(std::move(pin)));
+                }
+                auto load = active_loads_[cid];
+                if (load && std::find(loads.begin(), loads.end(), load) == loads.end())
+                    loads.push_back(load);
+                if (need_load) {
+                    monitor::cache_cell_access_miss_bytes_total(cell_data_type_, storage_type_)
+                        .Increment(cells_[cid]->local_storage_bytes());
+                } else {
+                    monitor::cache_cell_access_hit_bytes_total(cell_data_type_, storage_type_)
+                        .Increment(cells_[cid]->local_storage_bytes());
+                }
+            }
+            if (!claimed.empty()) {
+                created = std::make_shared<SharedLoad>(ctx);
+                created->cids.insert(claimed.begin(), claimed.end());
+                loads.push_back(created);
+            }
+            for (const auto& load : loads) drains.push_back(load->drained.getSemiFuture());
+            if (ctx && storage_usage_tracking_enabled_ && !cold.empty())
+                cold_bytes = translator_->cells_storage_bytes(cold);
+        } catch (...) {
+            auto error = folly::exception_wrapper(std::current_exception());
+            lock.unlock();
+            for (auto cid : claimed) cells_[cid]->set_error(error);
+            throw;
+        }
+        for (auto cid : claimed) active_loads_[cid] = created;
+        for (const auto& load : loads) ++load->waiters;
+        lock.unlock();
+
+        // Aggregation retains NodePins and the slot until every producer is drained.
+        // An early-cancelled waiter receives a separate result without destroying them.
+        auto unsubscribe = folly::makeGuard([&] {
+            if (!released->exchange(true))
+                ReleaseLoadWaiters(loads, true);
+        });
+        bool launched = false;
+        auto fail_unlaunched = folly::makeGuard([&] {
+            if (created && !launched)
+                FinishSharedLoad(created, folly::make_exception_wrapper<std::bad_alloc>());
+        });
+        auto pins = folly::collectAll(futures).deferValue(
+            [drains = folly::collectAll(drains),
+             cold_bytes](std::vector<folly::Try<internal::ListNode::NodePin>>&& results) mutable {
+                return std::move(drains).deferValue([results = std::move(results), cold_bytes](auto&&) mutable {
+                    Pins pins;
+                    pins.reserve(results.size());
+                    for (auto& result : results) pins.push_back(std::move(result).value());
+                    return PinResult{std::move(pins), cold_bytes};
+                });
+            });
+        auto result =
+            internal::WaitForSharedLoad(std::move(pins), token, self, [self, loads, released](bool cancelled) {
+                if (!released->exchange(true))
+                    self->ReleaseLoadWaiters(loads, cancelled);
+            });
+        if (!self_reserve_) {
+            // The external owner may release its reservation when this call returns.
+            // End our subscription immediately, but retain that owner's call until drain.
+            result = std::move(result).defer([self](folly::Try<PinResult>&& value) {
+                return self->WaitForLoads().deferValue(
+                    [value = std::move(value)](auto&&) mutable { return std::move(value).value(); });
+            });
+        }
+        unsubscribe.dismiss();
+        if (created) {
+            launched = true;
+            StartSharedLoad(created, timeout);
+        }
+        return result;
     }
 
     struct CacheCell : internal::ListNode {
@@ -774,6 +932,9 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     CellDataType cell_data_type_;
     StorageType storage_type_;
     internal::DList* dlist_;
+    std::shared_ptr<internal::DList> dlist_owner_;
+    std::mutex loads_mutex_;
+    std::vector<std::shared_ptr<SharedLoad>> active_loads_;
     const bool evictable_;
     const bool self_reserve_;
     const bool storage_usage_tracking_enabled_;

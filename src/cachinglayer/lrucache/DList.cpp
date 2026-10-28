@@ -57,7 +57,15 @@ RequestLocalLoading(const LoadingResourceUsage& usage, const LoadingOverheadConf
 void
 DList::completeWaitingRequests(std::vector<WaitingRequestCompletion>& completions) {
     for (auto& completion : completions) {
-        if (completion.resource_promise.valid()) {
+        if (completion.cancelled) {
+            auto exception = folly::make_exception_wrapper<SegcoreError>(ErrorCode::FollyCancel,
+                                                                         "Loading resource reservation cancelled");
+            if (completion.resource_promise.valid()) {
+                completion.resource_promise.setException(std::move(exception));
+            } else if (completion.bool_promise.valid()) {
+                completion.bool_promise.setException(std::move(exception));
+            }
+        } else if (completion.resource_promise.valid()) {
             completion.resource_promise.setValue(completion.result);
         } else if (completion.bool_promise.valid()) {
             completion.bool_promise.setValue(completion.result.success);
@@ -195,7 +203,7 @@ DList::ReserveLoadingResourceWithTimeout(const LoadingResourceUsage& usage, cons
                     auto complete = folly::makeGuard([&] { completeWaitingRequests(completions); });
                     {
                         std::unique_lock<std::mutex> lock(self->list_mtx_);
-                        self->failWaitingRequest(request_id, "timed out", completions);
+                        self->failWaitingRequest(request_id, WaitingRequestFailure::Timeout, completions);
                     }
                 },
                 static_cast<uint32_t>(timeout.count()));
@@ -217,7 +225,7 @@ DList::ReserveLoadingResourceWithTimeout(const LoadingResourceUsage& usage, cons
                 auto complete = folly::makeGuard([&] { completeWaitingRequests(completions); });
                 {
                     std::unique_lock<std::mutex> lock(self->list_mtx_);
-                    self->failWaitingRequest(request_id, "cancelled", completions);
+                    self->failWaitingRequest(request_id, WaitingRequestFailure::Cancelled, completions);
                 }
             });
         });
@@ -289,7 +297,7 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std
                     auto complete = folly::makeGuard([&] { completeWaitingRequests(completions); });
                     {
                         std::unique_lock<std::mutex> lock(self->list_mtx_);
-                        self->failWaitingRequest(request_id, "timed out", completions);
+                        self->failWaitingRequest(request_id, WaitingRequestFailure::Timeout, completions);
                     }
                 },
                 static_cast<uint32_t>(timeout.count()));
@@ -314,7 +322,7 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std
                 auto complete = folly::makeGuard([&] { completeWaitingRequests(completions); });
                 {
                     std::unique_lock<std::mutex> lock(self->list_mtx_);
-                    self->failWaitingRequest(request_id, "cancelled", completions);
+                    self->failWaitingRequest(request_id, WaitingRequestFailure::Cancelled, completions);
                 }
             });
         });
@@ -1137,13 +1145,15 @@ DList::handleWaitingRequests(std::vector<WaitingRequestCompletion>& completions)
 }
 
 void
-DList::failWaitingRequest(uint64_t request_id, const char* reason, std::vector<WaitingRequestCompletion>& completions) {
+DList::failWaitingRequest(uint64_t request_id, WaitingRequestFailure reason,
+                          std::vector<WaitingRequestCompletion>& completions) {
     auto it = waiting_requests_map_.find(request_id);
     if (it == waiting_requests_map_.end()) {
         return;
     }
     auto& completion = completions.emplace_back();
-    LOG_WARN("[MCL] Waiting request {} {}.", request_id, reason);
+    completion.cancelled = reason == WaitingRequestFailure::Cancelled;
+    LOG_WARN("[MCL] Waiting request {} {}.", request_id, completion.cancelled ? "cancelled" : "timed out");
     completion.SetResult(*it->second, false);
     waiting_requests_map_.erase(it);
     handleWaitingRequests(completions);

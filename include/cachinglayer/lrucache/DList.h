@@ -265,6 +265,7 @@ class DList : public std::enable_shared_from_this<DList> {
         folly::Promise<LoadingResourceReservationResult> resource_promise{
             folly::Promise<LoadingResourceReservationResult>::makeEmpty()};
         LoadingResourceReservationResult result;
+        bool cancelled{false};
 
         // Claim a result without running the waiting caller under list_mtx_.
         void
@@ -354,8 +355,11 @@ class DList : public std::enable_shared_from_this<DList> {
 
     // Fail one queued request and immediately retry requests behind it.
     // Must be called with list_mtx_ held; completions must outlive the lock.
+    enum class WaitingRequestFailure { Timeout, Cancelled };
+
     void
-    failWaitingRequest(uint64_t request_id, const char* reason, std::vector<WaitingRequestCompletion>& completions);
+    failWaitingRequest(uint64_t request_id, WaitingRequestFailure reason,
+                       std::vector<WaitingRequestCompletion>& completions);
 
     // Publish claimed results outside list_mtx_, including when a scope guard unwinds.
     static void
