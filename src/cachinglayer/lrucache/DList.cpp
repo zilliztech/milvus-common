@@ -145,7 +145,8 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, con
                         return;
                     }
                     LOG_WARN("[MCL] Request {} cancelled, notifying failure.", request_id);
-                    it->second->promise.setValue(false);
+                    it->second->promise.setException(folly::make_exception_wrapper<SegcoreError>(
+                        ErrorCode::FollyCancel, "Loading resource reservation cancelled"));
                     self->waiting_requests_map_.erase(it);
                     to_destroy = self->handleWaitingRequests();
                 }

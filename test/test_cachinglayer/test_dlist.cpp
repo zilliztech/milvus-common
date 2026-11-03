@@ -24,6 +24,21 @@ using milvus::cachinglayer::internal::MockListNode;
 using ::testing::StrictMock;
 using DLF = DListTestFriend;
 
+namespace {
+
+template <typename Future>
+void
+ExpectCancelled(Future&& future) {
+    try {
+        std::move(future).get(std::chrono::seconds(2));
+        FAIL() << "Expected a typed cancellation";
+    } catch (const milvus::SegcoreError& error) {
+        EXPECT_EQ(error.get_error_code(), milvus::ErrorCode::FollyCancel);
+    }
+}
+
+}  // namespace
+
 class DListTest : public ::testing::Test {
  protected:
     ResourceUsage initial_limit{100, 50};
@@ -812,8 +827,8 @@ TEST_F(DListTest, ReserveWithCancellationTokenCancelledWhileWaiting) {
     // Cancel the request
     cancel_source.requestCancellation();
 
-    // The future should return false due to cancellation
-    EXPECT_FALSE(std::move(future).get());
+    // The future should throw a typed cancellation
+    ExpectCancelled(std::move(future));
     EXPECT_EQ(get_loading_memory(), ResourceUsage{});
 }
 
@@ -861,11 +876,11 @@ TEST_F(DListTest, ReserveWithCancellationTokenMultipleRequests) {
     cancel_source1.requestCancellation();
 
     // First request should fail
-    EXPECT_FALSE(std::move(future1).get());
+    ExpectCancelled(std::move(future1));
 
     // Cancel the second request too
     cancel_source2.requestCancellation();
-    EXPECT_FALSE(std::move(future2).get());
+    ExpectCancelled(std::move(future2));
 
     EXPECT_EQ(get_loading_memory(), ResourceUsage{});
 }
@@ -895,7 +910,7 @@ TEST_F(DListTest, ReserveWithCancellationTokenResourceFreedAfterCancel) {
 
     // Cancel the request
     cancel_source.requestCancellation();
-    EXPECT_FALSE(std::move(future).get());
+    ExpectCancelled(std::move(future));
 
     // Resource should not be reserved after cancellation
     EXPECT_EQ(get_loading_memory(), ResourceUsage{});
@@ -979,8 +994,8 @@ TEST_F(DListTest, ReserveWithCancellationTokenCancelledQuickly) {
     // Cancel the request
     cancel_source.requestCancellation();
 
-    // The future should return false due to cancellation
-    EXPECT_FALSE(std::move(future).get());
+    // The future should throw a typed cancellation
+    ExpectCancelled(std::move(future));
 
     auto duration = std::chrono::steady_clock::now() - start;
 
@@ -994,7 +1009,7 @@ TEST_F(DListTest, ReserveWithCancellationTokenCancelledQuickly) {
 }
 
 TEST_F(DListTest, ReserveWithAlreadyCancelledToken) {
-    // Test that a pre-cancelled token returns false quickly without waiting for timeout.
+    // Test that a pre-cancelled token throws a typed cancellation quickly without waiting for timeout.
     // This specifically catches the bug where isCancellationRequested() was used instead
     // of canBeCancelled() - with that bug, a pre-cancelled token would still register
     // the callback (since isCancellationRequested() returns true), but a token cancelled
@@ -1021,8 +1036,8 @@ TEST_F(DListTest, ReserveWithAlreadyCancelledToken) {
     auto future =
         dlist->ReserveLoadingResourceWithTimeout(reserve_size, std::chrono::milliseconds(60000), op_ctx.get());
 
-    // The future should return false due to cancellation
-    EXPECT_FALSE(std::move(future).get());
+    // The future should throw a typed cancellation
+    ExpectCancelled(std::move(future));
 
     auto duration = std::chrono::steady_clock::now() - start;
 
@@ -1071,8 +1086,8 @@ TEST_F(DListTest, ReserveWithNegativeTimeoutWaitsIndefinitelyUntilCancelled) {
         cancel_source.requestCancellation();
     });
 
-    // The future should return false due to cancellation (not timeout)
-    EXPECT_FALSE(std::move(future).get());
+    // The future should throw a typed cancellation (not timeout)
+    ExpectCancelled(std::move(future));
 
     auto duration = std::chrono::steady_clock::now() - start;
 
@@ -1408,7 +1423,7 @@ TEST_F(DListTest, CancelledHeadWakesFittingFollower) {
 
     no_eviction_dlist->ReleaseLoadingResource({20, 0});
     cancel_source.requestCancellation();
-    EXPECT_FALSE(std::move(head).get());
+    ExpectCancelled(std::move(head));
 
     auto follower_result =
         std::async(std::launch::async, [future = std::move(follower)]() mutable { return std::move(future).get(); });

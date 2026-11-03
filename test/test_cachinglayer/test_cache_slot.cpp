@@ -1291,8 +1291,8 @@ TEST(ManagerCreateCacheSlotTest, ValidCtxWorksNormally) {
     EXPECT_EQ(cache_slot->num_cells(), 2);
 }
 
-// Test that Warmup passes ctx to PinCellsDirect which passes it to get_cells
-TEST(WarmupTest, WarmupPassesCtxToGetCells) {
+// Warmup gives the producer its own context and cancellation token.
+TEST(WarmupTest, WarmupUsesIndependentLoadContext) {
     auto limit = ResourceUsage{10000, 0};
     auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
 
@@ -1311,8 +1311,9 @@ TEST(WarmupTest, WarmupPassesCtxToGetCells) {
 
     // Verify that get_cells was called (warmup loaded the cells)
     EXPECT_EQ(translator_ptr->GetCellsCallCount(), 1);
-    // Verify that the ctx was passed through to get_cells
-    EXPECT_EQ(translator_ptr->GetLastCtx(), op_ctx.get());
+    // The producer owns a separate context.
+    EXPECT_NE(translator_ptr->GetLastCtx(), op_ctx.get());
+    EXPECT_NE(translator_ptr->GetLastCtx(), nullptr);
 }
 
 // Test that Warmup with cancelled ctx during loading throws
@@ -1367,8 +1368,8 @@ TEST(WarmupTest, WarmupWithNullCtxAndEveryLoadPolicyWorks) {
 
     // Verify that get_cells was called
     EXPECT_EQ(translator_ptr->GetCellsCallCount(), 1);
-    // ctx should be nullptr
-    EXPECT_EQ(translator_ptr->GetLastCtx(), nullptr);
+    // A null caller context still produces an owned load context.
+    EXPECT_NE(translator_ptr->GetLastCtx(), nullptr);
 }
 
 // Test that CacheSlot construction handles exceptions in CacheCell initialization gracefully.
@@ -1508,7 +1509,7 @@ TEST(AsyncWarmupTest, AsyncWarmupDoesNotCaptureCtx) {
 
     // Verify get_cells was called with nullptr ctx (not the original ctx)
     EXPECT_EQ(translator_ptr->GetCellsCallCount(), 1);
-    EXPECT_EQ(translator_ptr->GetLastCtx(), nullptr);
+    EXPECT_NE(translator_ptr->GetLastCtx(), nullptr);
 
     prefetch_pool->join();
 }
@@ -1634,7 +1635,8 @@ TEST(AsyncWarmupTest, SyncWarmupStillWorks) {
 
     // Cells should be loaded immediately after Warmup returns
     EXPECT_EQ(translator_ptr->GetCellsCallCount(), 1);
-    EXPECT_EQ(translator_ptr->GetLastCtx(), op_ctx.get());  // ctx should be passed for sync
+    EXPECT_NE(translator_ptr->GetLastCtx(), op_ctx.get());
+    EXPECT_NE(translator_ptr->GetLastCtx(), nullptr);  // sync warmup also uses an owned context
 
     // Access should be immediate (no waiting)
     auto accessor = cache_slot->PinCellsDirect(op_ctx.get(), {0, 1});
@@ -1824,4 +1826,24 @@ TEST(WarmupTimeoutTest, SyncWarmupBestEffortResourceAvailable) {
         ASSERT_NE(cell, nullptr);
         EXPECT_EQ(cell->cid, cid);
     }
+}
+
+TEST_F(CacheSlotTest, CancelledLoadPreservesErrorCodeAndAllowsRetry) {
+    folly::CancellationSource source;
+    milvus::OpContext cancelled_context(source.getToken());
+    source.requestCancellation();
+    translator_->ResetCounters();
+    try {
+        cache_slot_->PinOneCellDirect(&cancelled_context, 30);
+        FAIL() << "Expected a typed cancellation before invoking the translator";
+    } catch (const milvus::SegcoreError& error) {
+        EXPECT_EQ(error.get_error_code(), milvus::ErrorCode::FollyCancel);
+    }
+    EXPECT_EQ(translator_->GetCellsCallCount(), 0);
+    EXPECT_EQ(DListTestFriend::get_loading_memory(*dlist_), ResourceUsage{});
+
+    milvus::OpContext active_context;
+    auto accessor = cache_slot_->PinOneCellDirect(&active_context, 30);
+    ASSERT_NE(accessor, nullptr);
+    EXPECT_EQ(translator_->GetCellsCallCount(), 1);
 }

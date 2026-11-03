@@ -10,6 +10,7 @@
 // or implied. See the License for the specific language governing permissions and limitations under the License
 #pragma once
 
+#include <fmt/ranges.h>
 #include <folly/Synchronized.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/futures/Future.h>
@@ -30,6 +31,7 @@
 #include <vector>
 
 #include "cachinglayer/Metrics.h"
+#include "cachinglayer/SharedLoad.h"
 #include "cachinglayer/Translator.h"
 #include "cachinglayer/Utils.h"
 #include "cachinglayer/lrucache/DList.h"
@@ -45,6 +47,7 @@ class CellAccessor;
 // - The action of pinning cells is not started until the returned SemiFuture is scheduled on an executor.
 // - Once the future is scheduled, CacheSlot must live until the future is ready.
 // - The returned CellAccessor stores a shared_ptr of CacheSlot, thus will keep CacheSlot alive.
+// - DList must be managed by shared_ptr; the slot retains it while background work drains.
 template <typename CellT>
 class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
  public:
@@ -61,11 +64,13 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
           cell_data_type_(translator_->meta()->cell_data_type),
           storage_type_(translator_->meta()->storage_type),
           dlist_(dlist),
+          dlist_owner_(dlist->shared_from_this()),
           evictable_(evictable),
           self_reserve_(self_reserve),
           storage_usage_tracking_enabled_(storage_usage_tracking_enabled),
           loading_timeout_(loading_timeout),
           warmup_loading_timeout_(warmup_loading_timeout) {
+        active_loads_.resize(translator_->num_cells());
         cells_.reserve(translator_->num_cells());
         for (cid_t i = 0; i < static_cast<cid_t>(translator_->num_cells()); ++i) {
             cells_.push_back(std::make_unique<CacheCell>(this, i));
@@ -105,6 +110,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                                 return;
                             }
                             // Note: ctx is not captured - async warmup doesn't track storage usage
+                            auto drain = folly::makeGuard([self] { SemiInlineGet(self->WaitForLoads()); });
                             self->PinCellsDirect(nullptr, cids, self->warmup_loading_timeout_);
                             // If the slot is not evictable, we don't need to pin the cells anymore after warmup.
                             self->skip_pin_.store(!self->evictable_, std::memory_order_release);
@@ -206,33 +212,7 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                 cid = cell_id_of(uid);
             }
         }
-        auto [need_load, result] = cells_[cid]->pin();
-        auto cell_storage_bytes = translator_->cells_storage_bytes({cid});
-        if (need_load) {
-            monitor::cache_cell_access_miss_bytes_total(cell_data_type_, storage_type_).Increment(cell_storage_bytes);
-        } else {
-            monitor::cache_cell_access_hit_bytes_total(cell_data_type_, storage_type_).Increment(cell_storage_bytes);
-        }
-        if (std::holds_alternative<internal::ListNode::NodePin>(result)) {
-            std::vector<internal::ListNode::NodePin> pins;
-            pins.push_back(std::get<internal::ListNode::NodePin>(std::move(result)));
-            if (ctx && storage_usage_tracking_enabled_) {
-                ctx->storage_usage.scanned_total_bytes.fetch_add(cell_storage_bytes);
-            }
-            return std::make_shared<CellAccessor<CellT>>(this->shared_from_this(), std::move(pins));
-        } else {
-            auto pin_future = std::get<folly::SemiFuture<internal::ListNode::NodePin>>(std::move(result));
-            if (need_load) {
-                RunLoad(ctx, {cid}, loading_timeout_);
-            }
-            std::vector<internal::ListNode::NodePin> pins;
-            pins.push_back(SemiInlineGet(std::move(pin_future)));
-            if (ctx && storage_usage_tracking_enabled_) {
-                ctx->storage_usage.scanned_cold_bytes.fetch_add(cell_storage_bytes);
-                ctx->storage_usage.scanned_total_bytes.fetch_add(cell_storage_bytes);
-            }
-            return std::make_shared<CellAccessor<CellT>>(this->shared_from_this(), std::move(pins));
-        }
+        return PinInternal(ctx, {cid}, loading_timeout_, true);
     }
 
     std::shared_ptr<CellAccessor<CellT>>
@@ -271,6 +251,21 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         return PinInternal(ctx, involved_cids_vec, timeout_override.value_or(loading_timeout_));
     }
 
+    // Wait for currently issued loads to release their resources, including
+    // background work still draining after a request has been cancelled.
+    folly::SemiFuture<folly::Unit>
+    WaitForLoads() {
+        std::vector<folly::SemiFuture<folly::Unit>> drains;
+        {
+            std::lock_guard lock(loads_mutex_);
+            for (const auto& load : active_loads_)
+                if (load)
+                    drains.push_back(load->drained.getSemiFuture());
+        }
+        return folly::collectAll(drains).deferValue(
+            [self = this->shared_from_this()](auto&&) { return folly::Unit{}; });
+    }
+
     // Manually evicts the cell if it is LOADED and not pinned.
     // Returns true if the eviction happened.
     bool
@@ -307,12 +302,14 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     }
 
     ~CacheSlot() {
+        cells_.clear();
         monitor::cache_slot_count(cell_data_type_, storage_type_).Decrement();
         monitor::cache_cell_count(cell_data_type_, storage_type_).Decrement(translator_->num_cells());
     }
 
  private:
     friend class CellAccessor<CellT>;
+    friend class SharedLoadTestFriend;
 
     [[nodiscard]] std::vector<cid_t>
     AllCellIds() const {
@@ -322,64 +319,45 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     }
 
     std::shared_ptr<CellAccessor<CellT>>
-    PinInternal(OpContext* ctx, const std::vector<cid_t>& cids, std::chrono::milliseconds timeout) {
-        std::vector<folly::SemiFuture<internal::ListNode::NodePin>> futures;
-        std::vector<internal::ListNode::NodePin> ready_pins;
-        std::unordered_set<cid_t> need_load_cids;
-        futures.reserve(cids.size());
-        ready_pins.reserve(cids.size());
-        need_load_cids.reserve(cids.size());
-        for (const auto& cid : cids) {
-            if (cid >= static_cast<cid_t>(cells_.size())) {
-                ThrowInfo(ErrorCode::OutOfRange, "cid {} out of range, slot has {} cells. key={}", cid, cells_.size(),
-                          translator_->key());
-            }
-        }
-
-        for (const auto& cid : cids) {
-            auto [need_load, result] = cells_[cid]->pin();
-            if (std::holds_alternative<internal::ListNode::NodePin>(result)) {
-                ready_pins.push_back(std::get<internal::ListNode::NodePin>(std::move(result)));
-            } else {
-                futures.push_back(std::get<folly::SemiFuture<internal::ListNode::NodePin>>(std::move(result)));
-            }
-            if (need_load) {
-                need_load_cids.insert(cid);
-                monitor::cache_cell_access_miss_bytes_total(cell_data_type_, storage_type_)
-                    .Increment(cells_[cid]->local_storage_bytes());
-            } else {
-                monitor::cache_cell_access_hit_bytes_total(cell_data_type_, storage_type_)
-                    .Increment(cells_[cid]->local_storage_bytes());
-            }
-        }
-
-        if (!need_load_cids.empty()) {
-            RunLoad(ctx, std::move(need_load_cids), timeout);
-        }
-
-        std::vector<internal::ListNode::NodePin> all_pins;
-        all_pins.reserve(cids.size());
-
-        for (auto& pin : ready_pins) {
-            all_pins.push_back(std::move(pin));
-        }
-
-        if (!futures.empty()) {
-            auto future_pins = SemiInlineGet(folly::collect(futures));
-            for (auto& pin : future_pins) {
-                all_pins.push_back(std::move(pin));
-            }
-        }
-
+    PinInternal(OpContext* ctx, const std::vector<cid_t>& cids, std::chrono::milliseconds timeout,
+                bool single = false) {
+        if (auto resident = TryPinResident(ctx, cids))
+            return resident;
+        auto pin_result = SemiInlineGet(PinShared(ctx, cids, timeout, single));
+        auto all_pins = std::move(pin_result.first);
         if (ctx && storage_usage_tracking_enabled_) {
-            if (!need_load_cids.empty()) {
-                std::vector<cid_t> need_load_cids_vec(need_load_cids.begin(), need_load_cids.end());
-                ctx->storage_usage.scanned_cold_bytes.fetch_add(translator_->cells_storage_bytes(need_load_cids_vec));
-            }
+            ctx->storage_usage.scanned_cold_bytes.fetch_add(pin_result.second);
             ctx->storage_usage.scanned_total_bytes.fetch_add(translator_->cells_storage_bytes(cids));
         }
 
         return std::make_shared<CellAccessor<CellT>>(this->shared_from_this(), std::move(all_pins));
+    }
+
+    std::shared_ptr<CellAccessor<CellT>>
+    TryPinResident(OpContext* ctx, const std::vector<cid_t>& cids) {
+        if (ctx && ctx->cancellation_token.isCancellationRequested())
+            ThrowInfo(ErrorCode::FollyCancel, "Cache wait cancelled");
+        // An external reservation owner must still wait for any producer to drain.
+        if (!self_reserve_)
+            return nullptr;
+        for (auto cid : cids) {
+            if (cid < 0 || cid >= static_cast<cid_t>(cells_.size()))
+                ThrowInfo(ErrorCode::OutOfRange, "cid {} out of range, slot has {} cells", cid, cells_.size());
+        }
+        std::vector<internal::ListNode::NodePin> pins;
+        pins.reserve(cids.size());
+        for (auto cid : cids) {
+            auto pin = cells_[cid]->try_pin();
+            if (!pin)
+                return nullptr;  // Release partial pins before entering the coordinated miss path.
+            pins.push_back(std::move(*pin));
+        }
+        for (auto cid : cids)
+            monitor::cache_cell_access_hit_bytes_total(cell_data_type_, storage_type_)
+                .Increment(cells_[cid]->local_storage_bytes());
+        if (ctx && storage_usage_tracking_enabled_)
+            ctx->storage_usage.scanned_total_bytes.fetch_add(translator_->cells_storage_bytes(cids));
+        return std::make_shared<CellAccessor<CellT>>(this->shared_from_this(), std::move(pins));
     }
 
     [[nodiscard]] cid_t
@@ -397,81 +375,82 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     void
     RunLoad(OpContext* ctx, std::unordered_set<cid_t>&& cids, std::chrono::milliseconds timeout) {
         std::vector<cid_t> loading_cids;
-        try {
-            auto start = std::chrono::steady_clock::now();
-            bool reservation_success = false;
+        auto start = std::chrono::steady_clock::now();
+        bool reservation_success = false;
 
-            loading_cids = std::vector<cid_t>(cids.begin(), cids.end());
+        loading_cids = std::vector<cid_t>(cids.begin(), cids.end());
 
-            auto run_load_internal = [&]() {
-                if (ctx && ctx->cancellation_token.isCancellationRequested()) {
-                    throw std::runtime_error("Operation cancelled, stop loading cache cells");
-                }
-                start = std::chrono::steady_clock::now();
-                auto results = translator_->get_cells(ctx, loading_cids);
-                auto latency =
-                    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start);
-                for (auto& result : results) {
-                    cells_[result.first]->set_cell(std::move(result.second), cids.count(result.first) > 0);
-                }
-                monitor::cache_load_latency_microseconds(cell_data_type_, storage_type_).Observe(latency.count());
-            };
-
-            // The caller owns loading-resource admission when self reservation is disabled.
-            // Skip DList reservation here to avoid accounting the same load twice.
-            if (!self_reserve_) {
-                run_load_internal();
-                return;
+        auto run_load_internal = [&]() {
+            if (ctx && ctx->cancellation_token.isCancellationRequested()) {
+                ThrowInfo(ErrorCode::FollyCancel, "Operation cancelled, stop loading cache cells");
             }
-
-            auto bonus_cids = translator_->bonus_cells_to_be_loaded(loading_cids);
-            loading_cids.insert(loading_cids.end(), bonus_cids.begin(), bonus_cids.end());
-
-            ResourceUsage estimated_loading_usage;
-            ResourceUsage estimated_loaded_usage;
-            auto reserve_loading_cids = [&](const std::vector<cid_t>& cids_to_load) {
-                auto estimate = translator_->estimated_loading_usage(cids_to_load);
-                estimated_loaded_usage = estimate.first;
-                estimated_loading_usage = estimate.second;
-                return SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(estimated_loading_usage,
-                                                                               estimated_loaded_usage, timeout, ctx));
-            };
-            reservation_success = reserve_loading_cids(loading_cids);
-
-            if (!bonus_cids.empty()) {
-                // if the reservation failed, try to reserve only the essential loading resource
-                if (!reservation_success) {
-                    LOG_WARN(
-                        "[MCL] CacheSlot reserve loading resource with bonus cells failed, try to reserve only "
-                        "essential "
-                        "loading resource");
-                    loading_cids.resize(loading_cids.size() - bonus_cids.size());
-                    reservation_success = reserve_loading_cids(loading_cids);
-                }
+            start = std::chrono::steady_clock::now();
+            auto results = translator_->get_cells(ctx, loading_cids);
+            if (ctx && ctx->cancellation_token.isCancellationRequested()) {
+                ThrowInfo(ErrorCode::FollyCancel, "Shared cache load cancelled");
             }
+            auto latency =
+                std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start);
+            for (auto& result : results) {
+                cells_[result.first]->set_cell(std::move(result.second), cids.count(result.first) > 0);
+            }
+            monitor::cache_load_latency_microseconds(cell_data_type_, storage_type_).Observe(latency.count());
+        };
 
+        // The caller owns loading-resource admission when self reservation is disabled.
+        // Skip DList reservation here to avoid accounting the same load twice.
+        if (!self_reserve_) {
+            run_load_internal();
+            return;
+        }
+
+        auto bonus_cids = translator_->bonus_cells_to_be_loaded(loading_cids);
+        loading_cids.insert(loading_cids.end(), bonus_cids.begin(), bonus_cids.end());
+
+        ResourceUsage estimated_loading_usage;
+        ResourceUsage estimated_loaded_usage;
+        auto reserve_loading_cids = [&](const std::vector<cid_t>& cids_to_load) {
+            auto estimate = translator_->estimated_loading_usage(cids_to_load);
+            estimated_loaded_usage = estimate.first;
+            estimated_loading_usage = estimate.second;
+            return SemiInlineGet(dlist_->ReserveLoadingResourceWithTimeout(estimated_loading_usage,
+                                                                           estimated_loaded_usage, timeout, ctx));
+        };
+        reservation_success = reserve_loading_cids(loading_cids);
+
+        if (!bonus_cids.empty()) {
+            // if the reservation failed, try to reserve only the essential loading resource
             if (!reservation_success) {
-                LOG_ERROR(
-                    "[MCL] CacheSlot failed to reserve resource for "
-                    "cells: key={}, cell_ids=[{}], total "
-                    "resource_needed_for_loading={}",
-                    translator_->key(), fmt::join(loading_cids, ","), estimated_loading_usage.ToString());
-                ThrowInfo(ErrorCode::InsufficientResource,
-                          "[MCL] CacheSlot failed to reserve resource for "
-                          "cells: key={}, cell_ids=[{}], total "
-                          "resource_needed_for_loading={}",
-                          translator_->key(), fmt::join(loading_cids, ","), estimated_loading_usage.ToString());
+                LOG_WARN(
+                    "[MCL] CacheSlot reserve loading resource with bonus cells failed, try to reserve only "
+                    "essential "
+                    "loading resource");
+                loading_cids.resize(loading_cids.size() - bonus_cids.size());
+                reservation_success = reserve_loading_cids(loading_cids);
             }
+        }
 
-            monitor::cache_loading_bytes(cell_data_type_, StorageType::MEMORY)
-                .Increment(estimated_loading_usage.memory_bytes);
-            monitor::cache_loading_bytes(cell_data_type_, StorageType::DISK)
-                .Increment(estimated_loading_usage.file_bytes);
-            monitor::cache_cell_loading_count(cell_data_type_, storage_type_).Increment(loading_cids.size());
+        if (!reservation_success) {
+            LOG_ERROR(
+                "[MCL] CacheSlot failed to reserve resource for "
+                "cells: key={}, cell_ids=[{}], total "
+                "resource_needed_for_loading={}",
+                translator_->key(), fmt::join(loading_cids, ","), estimated_loading_usage.ToString());
+            ThrowInfo(ErrorCode::InsufficientResource,
+                      "[MCL] CacheSlot failed to reserve resource for "
+                      "cells: key={}, cell_ids=[{}], total "
+                      "resource_needed_for_loading={}",
+                      translator_->key(), fmt::join(loading_cids, ","), estimated_loading_usage.ToString());
+        }
 
-            // Defer releasing the estimated loading usage.
-            auto defer_release = folly::makeGuard([this, &estimated_loading_usage, &estimated_loaded_usage,
-                                                   &loading_cids]() {
+        monitor::cache_loading_bytes(cell_data_type_, StorageType::MEMORY)
+            .Increment(estimated_loading_usage.memory_bytes);
+        monitor::cache_loading_bytes(cell_data_type_, StorageType::DISK).Increment(estimated_loading_usage.file_bytes);
+        monitor::cache_cell_loading_count(cell_data_type_, storage_type_).Increment(loading_cids.size());
+
+        // Defer releasing the estimated loading usage.
+        auto defer_release =
+            folly::makeGuard([this, &estimated_loading_usage, &estimated_loaded_usage, &loading_cids]() {
                 try {
                     dlist_->ReleaseLoadingResource(estimated_loading_usage, estimated_loaded_usage);
                     monitor::cache_cell_loading_count(cell_data_type_, storage_type_).Decrement(loading_cids.size());
@@ -491,25 +470,199 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
                 }
             });
 
-            LOG_TRACE(
-                "[MCL] CacheSlot reserveLoadingResourceWithTimeout {} sec "
-                "result: {} time: {} sec, resource_needed: {}, key: {}",
-                timeout.count() / 1000.0, reservation_success ? "success" : "failed",
-                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start)
-                        .count() *
-                    1.0 / 1000,
-                estimated_loading_usage.ToString(), translator_->key());
+        LOG_TRACE(
+            "[MCL] CacheSlot reserveLoadingResourceWithTimeout {} sec "
+            "result: {} time: {} sec, resource_needed: {}, key: {}",
+            timeout.count() / 1000.0, reservation_success ? "success" : "failed",
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count() *
+                1.0 / 1000,
+            estimated_loading_usage.ToString(), translator_->key());
 
-            run_load_internal();
-        } catch (...) {
-            auto exception = std::current_exception();
-            auto ew = folly::exception_wrapper(exception);
+        run_load_internal();
+    }
+
+    using SharedLoad = internal::SharedLoad;
+    using Pins = std::vector<internal::ListNode::NodePin>;
+    using PinResult = std::pair<Pins, int64_t>;
+
+    void
+    ReleaseLoadWaiters(const std::vector<std::shared_ptr<SharedLoad>>& loads, bool cancelled) {
+        for (const auto& load : loads) {
+            bool cancel = false;
+            {
+                std::lock_guard lock(loads_mutex_);
+                --load->waiters;
+                if (cancelled && load->waiters == 0 && !load->finished && !load->closing) {
+                    load->closing = true;
+                    cancel = true;
+                }
+            }
+            // Callbacks may finish a load inline; never cancel under loads_mutex_.
+            if (cancel)
+                load->cancellation.requestCancellation();
+        }
+    }
+
+    void
+    FinishSharedLoad(const std::shared_ptr<SharedLoad>& load, folly::exception_wrapper error) {
+        {
+            std::lock_guard lock(loads_mutex_);
+            // Keep the registry entry until errors have been published outside the lock.
+            load->closing = true;
+        }
+        if (error) {
             monitor::cache_load_event_fail_total(cell_data_type_, storage_type_).Increment();
-            // set_error should only be called on the cells that are actually loaded, bonus cells are not considered.
-            for (auto cid : cids) {
-                cells_[cid]->set_error(ew);
+            for (auto cid : load->cids) cells_[cid]->set_error(error);
+        }
+        {
+            std::lock_guard lock(loads_mutex_);
+            load->finished = true;
+            for (auto cid : load->cids) active_loads_[cid].reset();
+        }
+        // RunLoad's resource guards have already run. Only now may a new generation start.
+        load->drained.setValue(folly::Unit{});
+    }
+
+    void
+    StartSharedLoad(std::shared_ptr<SharedLoad> load, std::chrono::milliseconds timeout) {
+        auto self = this->shared_from_this();
+        try {
+            // timeout applies only to resource admission, as before shared loading.
+            // The last departing waiter cancels the producer; no new I/O deadline.
+            internal::SharedLoadExecutor().add([self, load, timeout] {
+                folly::exception_wrapper error;
+                try {
+                    self->RunLoad(&load->context, std::unordered_set<cid_t>(load->cids), timeout);
+                } catch (...) {
+                    error = folly::exception_wrapper(std::current_exception());
+                }
+                self->FinishSharedLoad(load, std::move(error));
+            });
+        } catch (...) {
+            FinishSharedLoad(load, folly::exception_wrapper(std::current_exception()));
+        }
+    }
+
+    folly::SemiFuture<PinResult>
+    PinShared(OpContext* ctx, const std::vector<cid_t>& cids, std::chrono::milliseconds timeout, bool single) {
+        auto self = this->shared_from_this();
+        auto token = ctx ? ctx->cancellation_token : folly::CancellationToken{};
+        if (token.isCancellationRequested())
+            ThrowInfo(ErrorCode::FollyCancel, "Cache wait cancelled");
+        std::vector<folly::SemiFuture<internal::ListNode::NodePin>> futures;
+        std::vector<folly::SemiFuture<folly::Unit>> drains;
+        std::vector<std::shared_ptr<SharedLoad>> loads;
+        std::vector<cid_t> claimed;
+        std::vector<cid_t> cold;
+        cold.reserve(cids.size());
+        auto released = std::make_shared<std::atomic<bool>>(false);
+        int64_t cold_bytes = 0;
+        futures.reserve(cids.size());
+        drains.reserve(cids.size());
+        loads.reserve(cids.size());
+        claimed.reserve(cids.size());
+        std::shared_ptr<SharedLoad> created;
+        std::unique_lock lock(loads_mutex_);
+        for (auto cid : cids) {
+            if (cid < 0 || cid >= static_cast<cid_t>(cells_.size())) {
+                ThrowInfo(ErrorCode::OutOfRange, "cid {} out of range, slot has {} cells", cid, cells_.size());
             }
         }
+        for (auto cid : cids) {
+            auto load = active_loads_[cid];
+            if (load && load->closing) {
+                auto drained = load->drained.getSemiFuture();
+                lock.unlock();
+                // A cancelled generation is draining, not available for joining. Do
+                // not start another download until it has released all its resources.
+                return internal::WaitForSharedLoad(std::move(drained), token, self)
+                    .deferValue([self, ctx, cids, timeout, single](auto&&) {
+                        return self->PinShared(ctx, cids, timeout, single);
+                    });
+            }
+        }
+        try {
+            for (auto cid : cids) {
+                auto [need_load, pin] = cells_[cid]->pin();
+                if (need_load)
+                    claimed.push_back(cid);
+                if (need_load ||
+                    (single && std::holds_alternative<folly::SemiFuture<internal::ListNode::NodePin>>(pin)))
+                    cold.push_back(cid);
+                if (std::holds_alternative<internal::ListNode::NodePin>(pin)) {
+                    futures.push_back(folly::makeSemiFuture(std::get<internal::ListNode::NodePin>(std::move(pin))));
+                } else {
+                    futures.push_back(std::get<folly::SemiFuture<internal::ListNode::NodePin>>(std::move(pin)));
+                }
+                auto load = active_loads_[cid];
+                if (load && std::find(loads.begin(), loads.end(), load) == loads.end())
+                    loads.push_back(load);
+                if (need_load) {
+                    monitor::cache_cell_access_miss_bytes_total(cell_data_type_, storage_type_)
+                        .Increment(cells_[cid]->local_storage_bytes());
+                } else {
+                    monitor::cache_cell_access_hit_bytes_total(cell_data_type_, storage_type_)
+                        .Increment(cells_[cid]->local_storage_bytes());
+                }
+            }
+            if (!claimed.empty()) {
+                created = std::make_shared<SharedLoad>(ctx);
+                created->cids.insert(claimed.begin(), claimed.end());
+                loads.push_back(created);
+            }
+            for (const auto& load : loads) drains.push_back(load->drained.getSemiFuture());
+            if (ctx && storage_usage_tracking_enabled_ && !cold.empty())
+                cold_bytes = translator_->cells_storage_bytes(cold);
+        } catch (...) {
+            auto error = folly::exception_wrapper(std::current_exception());
+            lock.unlock();
+            for (auto cid : claimed) cells_[cid]->set_error(error);
+            throw;
+        }
+        for (auto cid : claimed) active_loads_[cid] = created;
+        for (const auto& load : loads) ++load->waiters;
+        lock.unlock();
+
+        // Aggregation retains NodePins and the slot until every producer is drained.
+        // An early-cancelled waiter receives a separate result without destroying them.
+        auto unsubscribe = folly::makeGuard([&] {
+            if (!released->exchange(true))
+                ReleaseLoadWaiters(loads, true);
+        });
+        bool launched = false;
+        auto fail_unlaunched = folly::makeGuard([&] {
+            if (created && !launched)
+                FinishSharedLoad(created, folly::make_exception_wrapper<std::bad_alloc>());
+        });
+        auto pins = folly::collectAll(futures).deferValue(
+            [drains = folly::collectAll(drains),
+             cold_bytes](std::vector<folly::Try<internal::ListNode::NodePin>>&& results) mutable {
+                return std::move(drains).deferValue([results = std::move(results), cold_bytes](auto&&) mutable {
+                    Pins pins;
+                    pins.reserve(results.size());
+                    for (auto& result : results) pins.push_back(std::move(result).value());
+                    return PinResult{std::move(pins), cold_bytes};
+                });
+            });
+        auto result =
+            internal::WaitForSharedLoad(std::move(pins), token, self, [self, loads, released](bool cancelled) {
+                if (!released->exchange(true))
+                    self->ReleaseLoadWaiters(loads, cancelled);
+            });
+        if (!self_reserve_) {
+            // The external owner may release its reservation when this call returns.
+            // End our subscription immediately, but retain that owner's call until drain.
+            result = std::move(result).defer([self](folly::Try<PinResult>&& value) {
+                return self->WaitForLoads().deferValue(
+                    [value = std::move(value)](auto&&) mutable { return std::move(value).value(); });
+            });
+        }
+        unsubscribe.dismiss();
+        if (created) {
+            launched = true;
+            StartSharedLoad(created, timeout);
+        }
+        return result;
     }
 
     struct CacheCell : internal::ListNode {
@@ -626,6 +779,9 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     CellDataType cell_data_type_;
     StorageType storage_type_;
     internal::DList* dlist_;
+    std::shared_ptr<internal::DList> dlist_owner_;
+    std::mutex loads_mutex_;
+    std::vector<std::shared_ptr<SharedLoad>> active_loads_;
     const bool evictable_;
     const bool self_reserve_;
     const bool storage_usage_tracking_enabled_;

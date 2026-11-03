@@ -96,6 +96,19 @@ ListNode::loaded_size() const {
     return loaded_size_;
 }
 
+std::optional<ListNode::NodePin>
+ListNode::try_pin() {
+    std::shared_lock<std::shared_mutex> lock(mtx_);
+    if (state_ != State::LOADED && state_ != State::CACHED) {
+        return std::nullopt;
+    }
+    auto old_pin_count = pin_count_.fetch_add(1);
+    if (state_ == State::CACHED && old_pin_count == 0) {
+        dlist_->freezeItem(this, loaded_size_);
+    }
+    return NodePin(this);
+}
+
 std::pair<bool, std::variant<ListNode::NodePin, folly::SemiFuture<ListNode::NodePin>>>
 ListNode::pin() {
     // must be called with lock acquired, and state must not be NOT_LOADED.
