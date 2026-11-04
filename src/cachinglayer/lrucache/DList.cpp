@@ -501,7 +501,8 @@ DList::reserveResourceInternalImpl(const ResourceUsage& size, std::function<void
             return {false, {}};
         }
 
-        using_resources -= evicted_size;
+        // A keyed cache can also free its empty index during eviction.
+        using_resources = total_loaded_size_.load() + total_loading_size_.load();
         // logical limit is accurate, thus we can guarantee after one successful eviction, logical limit is satisfied.
         required_resources = using_resources + size;
         logical_limit_exceeded = !max_resource_limit_.load().CanHold(required_resources);
@@ -617,7 +618,7 @@ ResourceUsage
 DList::tryEvict(const ResourceUsage& expected_eviction, const ResourceUsage& min_eviction,
                 const bool evict_expired_items) {
     // Fast path: check if we have enough evictable resources
-    auto current_evictable = evictable_size_.load();
+    auto current_evictable = evictable_size_.load() + index_overhead_;
     if (!current_evictable.CanHold(min_eviction)) {
         LOG_INFO(
             "[MCL] evictable_size {} cannot satisfy min_eviction {}, giving up "
@@ -626,6 +627,9 @@ DList::tryEvict(const ResourceUsage& expected_eviction, const ResourceUsage& min
         return ResourceUsage{0, 0};
     }
 
+    // Declare ownership before locks: a detached node must outlive the mutex
+    // held by item_locks. Neither the list nor a keyed index owns it afterwards.
+    std::vector<std::unique_ptr<ListNode>> retired_nodes;
     std::vector<ListNode*> to_evict;
     to_evict.reserve(32);
     // items are evicted because they are not used for a while, thus it should be ok to lock them
@@ -634,6 +638,12 @@ DList::tryEvict(const ResourceUsage& expected_eviction, const ResourceUsage& min
     item_locks.reserve(32);
 
     ResourceUsage size_to_evict;
+    ResourceUsage index_to_evict;
+    auto clear_selection = folly::makeGuard([&] {
+        for (auto* node : to_evict) {
+            node->clear_eviction_selection();
+        }
+    });
 
     auto would_help = [&](const ResourceUsage& size) -> bool {
         auto need_memory = size_to_evict.memory_bytes < expected_eviction.memory_bytes;
@@ -676,6 +686,9 @@ DList::tryEvict(const ResourceUsage& expected_eviction, const ResourceUsage& min
         if (current_node_time < time_threshold || would_help(it->loaded_size())) {
             to_evict.push_back(it);
             size_to_evict += it->loaded_size();
+            const auto overhead = it->select_for_eviction();
+            index_to_evict += overhead;
+            size_to_evict += overhead;
         } else {
             // Release lock if node is neither expired nor helpful
             item_locks.pop_back();
@@ -700,11 +713,11 @@ DList::tryEvict(const ResourceUsage& expected_eviction, const ResourceUsage& min
     }
     if (!size_to_evict.CanHold(expected_eviction)) {
         if (!size_to_evict.CanHold(min_eviction)) {
-            LOG_ERROR(
+            // The early check includes an upper bound for index overhead. A
+            // pinned entry can prevent its whole index from being reclaimed.
+            LOG_DEBUG(
                 "[MCL] Cannot evict even min_eviction {}, max possible "
-                "eviction {}, giving up eviction. Current usage: {}. This "
-                "should have been rejected at entry of this function. "
-                "Something must be wrong",
+                "eviction {}, giving up eviction. Current usage: {}",
                 min_eviction.ToString(), size_to_evict.ToString(), usageInfo());
             LOG_TRACE("[MCL] DList chain: {}", chainString());
             return ResourceUsage{0, 0};
@@ -717,6 +730,11 @@ DList::tryEvict(const ResourceUsage& expected_eviction, const ResourceUsage& min
     }
 
     cachinglayer::monitor::cache_eviction_event_total(size_to_evict.storage_type()).Increment();
+    retired_nodes.reserve(to_evict.size());  // All allocations precede destructive changes.
+    for (auto* node : to_evict) {
+        node->clear_eviction_selection();
+    }
+    clear_selection.dismiss();
     for (auto* list_node : to_evict) {
         popItem(list_node);   // must succeed, otherwise the node is not in the list
         list_node->unload();  // NOTE: after unload(), the node's loaded_size() is reset to {0, 0} and state_ is reset
@@ -724,10 +742,15 @@ DList::tryEvict(const ResourceUsage& expected_eviction, const ResourceUsage& min
         // if this cell is evicted, loaded, pinned and unpinned within a single refresh window,
         // the cell should be inserted into the LRU list again.
         list_node->last_touch_ = std::chrono::steady_clock::now() - 2 * eviction_config_.cache_touch_window;
+        if (auto owner = list_node->detach_evicted()) {
+            retired_nodes.push_back(std::move(owner));
+        }
     }
     // Refund logically evicted resources manually, waiting requests notification is left to caller.
-    total_loaded_size_ -= size_to_evict;
-    evictable_size_ -= size_to_evict;
+    // Index owners already refunded their empty buckets while detaching nodes.
+    const auto node_size_to_evict = size_to_evict - index_to_evict;
+    total_loaded_size_ -= node_size_to_evict;
+    evictable_size_ -= node_size_to_evict;
     ClampNonNegative(total_loaded_size_, [&](const ResourceUsage& curr) {
         LOG_ERROR(
             "[MCL] total_loaded_size_ became negative after eviction: evicted_size={}, current_total_loaded={}, "

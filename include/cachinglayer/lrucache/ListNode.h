@@ -26,6 +26,7 @@
 namespace milvus::cachinglayer::internal {
 
 class DList;
+class LRUCacheCore;
 
 // ListNode is not movable/copyable.
 class ListNode {
@@ -114,6 +115,20 @@ class ListNode {
     virtual void
     unload();
 
+    // DList calls this under its lock after unload(). Slot nodes remain owned by
+    // their slot; keyed nodes transfer ownership until all eviction locks are gone.
+    virtual std::unique_ptr<ListNode>
+    detach_evicted();
+
+    // Optional shared index overhead becomes reclaimable only when an entire
+    // keyed cache is selected. Both hooks run under DList's lock; no per-node
+    // key or accounting fields are needed on ordinary Slot cells.
+    virtual ResourceUsage
+    select_for_eviction() noexcept;
+
+    virtual void
+    clear_eviction_selection() noexcept;
+
     virtual std::string
     key() const = 0;
 
@@ -201,6 +216,7 @@ class ListNode {
  private:
     friend class DList;
     friend class NodePin;
+    friend class LRUCacheCore;
 
     friend class MockListNode;
     friend class DListTest;

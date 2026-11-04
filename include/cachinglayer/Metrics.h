@@ -247,6 +247,9 @@ DECLARE_PROMETHEUS_GAUGE_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_cell_
 DECLARE_PROMETHEUS_GAUGE_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_cell_loaded_count);
 DECLARE_PROMETHEUS_GAUGE_FAMILY(internal_cache_shard_disk_usage_bytes);
 DECLARE_PROMETHEUS_GAUGE_FAMILY(internal_cache_shard_memory_usage_bytes);
+DECLARE_PROMETHEUS_GAUGE(cache_kv_entry_count);
+DECLARE_PROMETHEUS_GAUGE(cache_kv_metadata_bytes);
+DECLARE_PROMETHEUS_GAUGE_METRIC_WITH_LOCATION(internal_cache_kv_loaded_bytes);
 
 /* Metrics for Cache Cell Access */
 DECLARE_PROMETHEUS_COUNTER_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_access_event_total);
@@ -263,6 +266,7 @@ DECLARE_PROMETHEUS_COUNTER_METRIC_WITH_LOCATION(internal_cache_evicted_bytes_tot
 DECLARE_PROMETHEUS_HISTOGRAM_METRIC_WITH_DATA_TYPE_AND_LOCATION(internal_cache_cell_lifetime_seconds);
 
 DEFINE_METRIC_HELPER_WITH_LOCATION(prometheus::Gauge, cache_capacity_bytes);
+DEFINE_METRIC_HELPER_WITH_LOCATION(prometheus::Gauge, cache_kv_loaded_bytes);
 DEFINE_METRIC_HELPER_WITH_LOCATION(prometheus::Gauge, cache_high_watermark_bytes);
 DEFINE_METRIC_HELPER_WITH_LOCATION(prometheus::Gauge, cache_low_watermark_bytes);
 DEFINE_METRIC_HELPER_WITH_DATA_TYPE_AND_LOCATION(prometheus::Gauge, cache_slot_count);

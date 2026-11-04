@@ -233,6 +233,20 @@ ListNode::touch_to_dlist(bool update_evictable_memory) {
 }
 
 void
+ListNode::clear_eviction_selection() noexcept {
+}
+
+std::unique_ptr<ListNode>
+ListNode::detach_evicted() {
+    return nullptr;
+}
+
+ResourceUsage
+ListNode::select_for_eviction() noexcept {
+    return {};
+}
+
+void
 ListNode::unload() {
     switch (state_) {
         case State::CACHED:

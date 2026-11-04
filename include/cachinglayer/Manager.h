@@ -17,6 +17,7 @@
 #include <memory>
 
 #include "cachinglayer/CacheSlot.h"
+#include "cachinglayer/LRUCache.h"
 #include "cachinglayer/LoadingOverhead.h"
 #include "cachinglayer/TieredStorageConfig.h"
 #include "cachinglayer/Translator.h"
@@ -67,6 +68,14 @@ class Manager {
     Manager(Manager&&) = delete;
     Manager&
     operator=(Manager&&) = delete;
+
+    /// Create a separate key namespace sharing this Manager's eviction domain.
+    /// Requires ConfigureTieredStorage with eviction enabled; otherwise throws.
+    template <typename Key, typename Value>
+    std::shared_ptr<LRUCache<Key, Value>>
+    CreateLRUCache() {
+        return std::make_shared<LRUCache<Key, Value>>(dlist_);
+    }
 
     /// Synchronous creation and warmup; do not call on an executor needed by this load.
     template <typename CellT>
