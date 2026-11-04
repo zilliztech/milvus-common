@@ -214,6 +214,7 @@ class DList : public std::enable_shared_from_this<DList> {
  private:
     friend class DListTestFriend;
     friend class ListNode;
+    friend class LRUCacheCore;
 
     // Waiting request for timeout-based memory reservation
     struct WaitingRequest {
@@ -432,6 +433,9 @@ class DList : public std::enable_shared_from_this<DList> {
 
     // Total size of nodes that are loaded and unpinned, used for eviction.
     std::atomic<ResourceUsage> evictable_size_{};
+    // Upper bound for the eviction fast rejection, protected by list_mtx_.
+    // Selection hooks determine which shared index allocations can really go.
+    ResourceUsage index_overhead_{};
 
     // Total size of nodes that are loading and loaded, used for memory reservation.
     std::atomic<ResourceUsage> total_loading_size_{};
