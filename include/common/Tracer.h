@@ -31,6 +31,7 @@ struct TraceConfig {
     std::string otlpHeaders;
     bool oltpSecure;
 
+    std::string clusterID;
     int nodeID;
 };
 
