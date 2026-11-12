@@ -16,6 +16,7 @@ set(CACHINGLAYER_TEST_FILES
     ../init_gtest.cpp
     test_dlist.cpp
     test_cache_slot.cpp
+    test_cache_map.cpp
     test_tiered_storage_config.cpp
     test_loading_overhead_policy.cpp
     test_loading_overhead_group.cpp
