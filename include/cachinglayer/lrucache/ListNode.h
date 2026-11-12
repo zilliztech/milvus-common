@@ -23,6 +23,13 @@
 #include "cachinglayer/Utils.h"
 #include "common/EasyAssert.h"
 
+namespace milvus::cachinglayer {
+
+template <CacheMapKey Key, typename Value>
+class CacheMap;
+
+}  // namespace milvus::cachinglayer
+
 namespace milvus::cachinglayer::internal {
 
 class DList;
@@ -114,6 +121,11 @@ class ListNode {
     virtual void
     unload();
 
+    // DList calls this under its lock after unload(). Slot nodes remain owned by
+    // their slot; keyed nodes return a keepalive until their node lock is released.
+    virtual std::shared_ptr<ListNode>
+    detach_evicted();
+
     virtual std::string
     key() const = 0;
 
@@ -201,6 +213,8 @@ class ListNode {
  private:
     friend class DList;
     friend class NodePin;
+    template <CacheMapKey Key, typename Value>
+    friend class milvus::cachinglayer::CacheMap;
 
     friend class MockListNode;
     friend class DListTest;

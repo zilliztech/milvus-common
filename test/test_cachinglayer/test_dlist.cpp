@@ -175,6 +175,20 @@ TEST(DListNotificationTest, CachedUnpinDoesNotWaitForListLock) {
     EXPECT_EQ(node.test_get_pin_count(), 0);
 }
 
+TEST(DListNotificationTest, RefundWithoutWaitersDoesNotWaitForListLock) {
+    auto dlist = std::make_shared<DList>(true, ResourceUsage{100, 0}, ResourceUsage{80, 0}, ResourceUsage{90, 0},
+                                         EvictionConfig{});
+    dlist->ChargeLoadedResource({20, 0});
+    ASSERT_FALSE(DLF::test_notifications_needed(*dlist));
+
+    auto lock = DLF::test_lock_list(dlist.get());
+    auto refund = std::async(std::launch::async, [dlist] { dlist->RefundLoadedResource({20, 0}); });
+    EXPECT_EQ(refund.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    lock.unlock();
+    refund.get();
+    EXPECT_EQ(DLF::get_used_memory(*dlist), ResourceUsage{});
+}
+
 TEST(DListNotificationTest, ReservationExitsRestoreNotificationState) {
     for (const bool group_aware : {false, true}) {
         SCOPED_TRACE(group_aware);
@@ -277,16 +291,20 @@ TEST(DListNotificationTest, UnpinDuringReservationDoesNotLoseNotification) {
 
 // Inline callbacks probe lock release; they do not require recursive notification scheduling.
 TEST(DListInlineCompletionTest, NotificationsAllowReentry) {
-    enum class Trigger { Release, Cancel, Timeout, Clear, Shrink };
+    enum class Trigger { Release, Refund, Cancel, Timeout, Clear, Shrink };
     for (const bool group_aware : {false, true}) {
         for (const auto trigger :
-             {Trigger::Release, Trigger::Cancel, Trigger::Timeout, Trigger::Clear, Trigger::Shrink}) {
+             {Trigger::Release, Trigger::Refund, Trigger::Cancel, Trigger::Timeout, Trigger::Clear, Trigger::Shrink}) {
             SCOPED_TRACE(group_aware);
             SCOPED_TRACE(static_cast<int>(trigger));
             auto dlist = std::make_shared<DList>(true, ResourceUsage{100, 0}, ResourceUsage{5, 0}, ResourceUsage{10, 0},
                                                  EvictionConfig{});
-            ASSERT_TRUE(
-                std::move(dlist->ReserveLoadingResourceWithTimeout({100, 0}, std::chrono::milliseconds(0))).get());
+            if (trigger == Trigger::Refund) {
+                dlist->ChargeLoadedResource({100, 0});
+            } else {
+                ASSERT_TRUE(
+                    std::move(dlist->ReserveLoadingResourceWithTimeout({100, 0}, std::chrono::milliseconds(0))).get());
+            }
             folly::CancellationSource cancellation;
             milvus::OpContext ctx(cancellation.getToken());
             auto timeout = trigger == Trigger::Timeout ? std::chrono::milliseconds(10) : std::chrono::milliseconds(-1);
@@ -314,6 +332,9 @@ TEST(DListInlineCompletionTest, NotificationsAllowReentry) {
                 case Trigger::Release:
                     dlist->ReleaseLoadingResource({100, 0});
                     break;
+                case Trigger::Refund:
+                    dlist->RefundLoadedResource({100, 0});
+                    break;
                 case Trigger::Cancel:
                     cancellation.requestCancellation();
                     break;
@@ -327,11 +348,13 @@ TEST(DListInlineCompletionTest, NotificationsAllowReentry) {
                     ASSERT_TRUE(dlist->UpdateMaxLimit({20, 0}));
                     break;
             }
-            EXPECT_EQ(std::move(result).get(std::chrono::seconds(2)), trigger == Trigger::Release);
-            if (trigger != Trigger::Release && trigger != Trigger::Shrink) {
+            EXPECT_EQ(std::move(result).get(std::chrono::seconds(2)),
+                      trigger == Trigger::Release || trigger == Trigger::Refund);
+            if (trigger != Trigger::Release && trigger != Trigger::Refund && trigger != Trigger::Shrink) {
                 dlist->ReleaseLoadingResource({100, 0});
             }
             EXPECT_EQ(DLF::get_loading_memory(*dlist), ResourceUsage{});
+            EXPECT_EQ(DLF::get_used_memory(*dlist), ResourceUsage{});
         }
     }
 }

@@ -21,6 +21,7 @@
 #include <utility>
 #include <vector>
 
+#include "cachinglayer/CacheMap.h"
 #include "cachinglayer/CacheSlot.h"
 #include "cachinglayer/LoadingOverhead.h"
 #include "cachinglayer/Metrics.h"
@@ -480,6 +481,32 @@ class CacheSlotTest : public ::testing::Test {
 
 TEST_F(CacheSlotTest, Initialization) {
     ASSERT_EQ(cache_slot_->num_cells(), NUM_UNIQUE_CIDS);
+}
+
+TEST(CacheSlotKeyedCacheTest, BothEntryTypesEvictEachOtherWithoutRegisteringSlotKeys) {
+    const ResourceUsage limit{8192, 0};
+    auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{});
+    CacheMap<std::string, int> keyed(dlist);
+    auto value = std::make_unique<int>(7);
+    ASSERT_TRUE(keyed.Put("a", value, {6000, 0}));
+
+    auto translator =
+        std::make_unique<MockTranslator>(std::vector<std::pair<cid_t, int64_t>>{{0, 6000}},
+                                         std::unordered_map<cl_uid_t, cid_t>{{0, 0}}, "slot", StorageType::MEMORY);
+    auto slot = std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, false,
+                                                      std::chrono::milliseconds(0), std::chrono::milliseconds(0));
+    { auto pin = slot->PinCellsDirect(nullptr, {0}); }
+    EXPECT_TRUE(slot->IsCached(0));
+    EXPECT_FALSE(keyed.Get("a"));
+    EXPECT_EQ(keyed.Size(), 0);
+
+    value = std::make_unique<int>(9);
+    ASSERT_TRUE(keyed.Put("b", value, {6000, 0}));
+    EXPECT_FALSE(slot->IsCached(0));
+    EXPECT_EQ(*keyed.Get("b"), 9);
+    EXPECT_EQ(keyed.Size(), 1);
+    ASSERT_TRUE(keyed.Erase("b"));
+    EXPECT_EQ(DListTestFriend::get_used_memory(*dlist), (ResourceUsage{0, 0}));
 }
 
 #ifdef __linux__

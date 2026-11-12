@@ -16,6 +16,7 @@
 
 #include <memory>
 
+#include "cachinglayer/CacheMap.h"
 #include "cachinglayer/CacheSlot.h"
 #include "cachinglayer/LoadingOverhead.h"
 #include "cachinglayer/TieredStorageConfig.h"
@@ -67,6 +68,14 @@ class Manager {
     Manager(Manager&&) = delete;
     Manager&
     operator=(Manager&&) = delete;
+
+    /// Create a separate key namespace sharing this Manager's eviction domain.
+    /// Requires ConfigureTieredStorage with eviction enabled; otherwise throws.
+    template <CacheMapKey Key, typename Value>
+    std::shared_ptr<CacheMap<Key, Value>>
+    CreateCacheMap(const typename CacheMap<Key, Value>::IndexConfig index_config = {}) {
+        return std::make_shared<CacheMap<Key, Value>>(dlist_, index_config);
+    }
 
     /// Synchronous creation and warmup; do not call on an executor needed by this load.
     template <typename CellT>

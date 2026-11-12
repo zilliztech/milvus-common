@@ -688,7 +688,8 @@ DList::tryEvict(const ResourceUsage& expected_eviction, const ResourceUsage& min
             break;
         }
     }
-    if (!size_to_evict.AnyGTZero()) {
+    // Expired entries must still be removed when their declared payload size is zero.
+    if (to_evict.empty()) {
         // Do not spam log during eviction loop.
         if (!evict_expired_items && expected_eviction.AnyGTZero()) {
             LOG_DEBUG(
@@ -717,13 +718,20 @@ DList::tryEvict(const ResourceUsage& expected_eviction, const ResourceUsage& min
     }
 
     cachinglayer::monitor::cache_eviction_event_total(size_to_evict.storage_type()).Increment();
-    for (auto* list_node : to_evict) {
+    for (size_t i = 0; i < to_evict.size(); ++i) {
+        auto* const list_node = to_evict[i];
         popItem(list_node);   // must succeed, otherwise the node is not in the list
         list_node->unload();  // NOTE: after unload(), the node's loaded_size() is reset to {0, 0} and state_ is reset
                               // to NOT_LOADED.
         // if this cell is evicted, loaded, pinned and unpinned within a single refresh window,
         // the cell should be inserted into the LRU list again.
         list_node->last_touch_ = std::chrono::steady_clock::now() - 2 * eviction_config_.cache_touch_window;
+        if (auto owner = list_node->detach_evicted()) {
+            // Selected nodes and item_locks have matching indices. A detached KV
+            // node cannot reload: unlock it before this local owner can destroy it.
+            // Slot nodes return no owner and stay locked through batch accounting.
+            item_locks[i].unlock();
+        }
     }
     // Refund logically evicted resources manually, waiting requests notification is left to caller.
     total_loaded_size_ -= size_to_evict;
@@ -866,6 +874,21 @@ DList::ReleaseLoadingResource(const ResourceUsage& loading_size) {
 
 void
 DList::touchItem(ListNode* list_node, bool force_touch, std::optional<ResourceUsage> size) {
+    // Slot callers hold the node lock. Preserve the touch-window fast path,
+    // which restores evictable bytes without waiting for the list lock.
+    if (!force_touch &&
+        std::chrono::steady_clock::now() - list_node->last_touch_ <= eviction_config_.cache_touch_window) {
+        if (size.has_value()) {
+            evictable_size_ += size.value();
+        }
+        return;
+    }
+    std::lock_guard<std::mutex> list_lock(list_mtx_);
+    touchItemLocked(list_node, force_touch, size);
+}
+
+void
+DList::touchItemLocked(ListNode* list_node, bool force_touch, std::optional<ResourceUsage> size) {
     // update evictable_size_ if size is provided
     if (size.has_value()) {
         evictable_size_ += size.value();
@@ -876,7 +899,6 @@ DList::touchItem(ListNode* list_node, bool force_touch, std::optional<ResourceUs
         return;
     }
     // move the node to the head of the list
-    std::lock_guard<std::mutex> list_lock(list_mtx_);
     popItem(list_node);
     pushHead(list_node);
     list_node->last_touch_ = now;
@@ -885,6 +907,11 @@ DList::touchItem(ListNode* list_node, bool force_touch, std::optional<ResourceUs
 void
 DList::removeItem(ListNode* list_node, ResourceUsage size) {
     std::lock_guard<std::mutex> list_lock(list_mtx_);
+    removeItemLocked(list_node, size);
+}
+
+void
+DList::removeItemLocked(ListNode* list_node, ResourceUsage size) {
     if (popItem(list_node) && list_node->pin_count_ == 0) {
         evictable_size_ -= size;
         ClampNonNegative(evictable_size_, [&](const ResourceUsage& curr) {
@@ -961,6 +988,12 @@ DList::ChargeLoadedResource(const ResourceUsage& size) {
 
 void
 DList::RefundLoadedResource(const ResourceUsage& size) {
+    RefundLoadedResourceLocked(size);
+    notifyWaitingRequests();
+}
+
+void
+DList::RefundLoadedResourceLocked(const ResourceUsage& size) {
     total_loaded_size_ -= size;
     ClampNonNegative(total_loaded_size_, [&](const ResourceUsage& curr) {
         LOG_ERROR(
@@ -969,8 +1002,6 @@ DList::RefundLoadedResource(const ResourceUsage& size) {
             "usage_info={}",
             size.ToString(), curr.ToString(), usageInfo());
     });
-    // Notify waiting requests that resources are available
-    notifyWaitingRequests();
 }
 
 void

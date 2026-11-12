@@ -31,6 +31,9 @@ DEFINE_LABEL_MAP_WITH_LOCATION(disk);
 DEFINE_LABEL_MAP_WITH_LOCATION(mixed);
 
 /* Metrics for Cache Resource Usage */
+DEFINE_PROMETHEUS_GAUGE_FAMILY(internal_cache_kv_entry_count, "[cpp]keyed cache entry count");
+DEFINE_PROMETHEUS_GAUGE(cache_kv_entry_count, internal_cache_kv_entry_count, {});
+DEFINE_PROMETHEUS_GAUGE_METRIC_WITH_LOCATION(internal_cache_kv_loaded_bytes, "[cpp]keyed cache payload bytes");
 DEFINE_PROMETHEUS_GAUGE_METRIC_WITH_LOCATION(internal_cache_capacity_bytes, "[cpp]cache capacity bytes");
 DEFINE_PROMETHEUS_GAUGE_METRIC_WITH_LOCATION(internal_cache_high_watermark_bytes, "[cpp]cache high watermark bytes");
 DEFINE_PROMETHEUS_GAUGE_METRIC_WITH_LOCATION(internal_cache_low_watermark_bytes, "[cpp]cache low watermark bytes");
