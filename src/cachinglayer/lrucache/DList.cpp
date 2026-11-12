@@ -1169,39 +1169,6 @@ DList::clearWaitingQueue() {
 }
 
 ResourceUsage
-DList::checkPhysicalResourceLimit(const ResourceUsage& size) const {
-    static SystemResourceInfo infinity = {std::numeric_limits<int64_t>::max(), 0};
-    auto sys_mem = size.memory_bytes > 0 ? getSystemMemoryInfo() : infinity;
-    auto sys_disk = size.file_bytes > 0 ? getSystemDiskInfo(eviction_config_.disk_path) : infinity;
-
-    auto used = ResourceUsage{sys_mem.used_bytes, sys_disk.used_bytes};
-    auto current_loading = total_loading_size_.load();
-    auto projected_usage = current_loading + size + used;
-
-    auto limit = ResourceUsage{
-        static_cast<int64_t>(sys_mem.total_bytes * eviction_config_.overloaded_memory_threshold_percentage),
-        static_cast<int64_t>(sys_disk.total_bytes * eviction_config_.max_disk_usage_percentage)};
-
-    auto eviction_needed = projected_usage - limit;
-    if (eviction_needed.memory_bytes < 0) {
-        eviction_needed.memory_bytes = 0;
-    }
-    if (eviction_needed.file_bytes < 0) {
-        eviction_needed.file_bytes = 0;
-    }
-
-    LOG_TRACE(
-        "[MCL] Physical resource check: "
-        "projected_usage={}(used={}, loading={}, requesting={}), limit={} "
-        "(mem {}% disk {}% of total {}), eviction_needed={}",
-        projected_usage.ToString(), used.ToString(), current_loading.ToString(), size.ToString(), limit.ToString(),
-        eviction_config_.overloaded_memory_threshold_percentage * 100, eviction_config_.max_disk_usage_percentage * 100,
-        ResourceUsage{sys_mem.total_bytes, sys_disk.total_bytes}.ToString(), eviction_needed.ToString());
-
-    return eviction_needed;
-}
-
-ResourceUsage
 DList::checkPhysicalMemoryLimit(const ResourceUsage& size) const {
     if (size.memory_bytes <= 0) {
         return ResourceUsage{0, 0};

@@ -288,7 +288,6 @@ struct EvictionConfig {
     float overloaded_memory_threshold_percentage;
     // Max disk usage percentage - limits disk cache usage to this percentage of total disk space (not used yet)
     float max_disk_usage_percentage;
-    std::string disk_path;
     // Loading resource factor to reserve more resources, preventing poor resource estimation during the loading
     // process.
     float loading_resource_factor;
@@ -300,7 +299,6 @@ struct EvictionConfig {
           cache_cell_unaccessed_survival_time(std::chrono::seconds(0)),
           overloaded_memory_threshold_percentage(0.9),
           max_disk_usage_percentage(0.95),
-          disk_path(""),
           loading_resource_factor(1.0f) {
     }
 
@@ -311,20 +309,18 @@ struct EvictionConfig {
           cache_cell_unaccessed_survival_time(std::chrono::seconds(0)),
           overloaded_memory_threshold_percentage(0.9),
           max_disk_usage_percentage(0.95),
-          disk_path(""),
           loading_resource_factor(1.0f) {
     }
 
     EvictionConfig(int64_t cache_touch_window_ms, bool background_eviction_enabled, int64_t eviction_interval_ms,
                    int64_t cache_cell_unaccessed_survival_time, float overloaded_memory_threshold_percentage,
-                   float max_disk_usage_percentage, const std::string& disk_path, float loading_resource_factor)
+                   float max_disk_usage_percentage, float loading_resource_factor)
         : cache_touch_window(std::chrono::milliseconds(cache_touch_window_ms)),
           background_eviction_enabled(background_eviction_enabled),
           eviction_interval(std::chrono::milliseconds(eviction_interval_ms)),
           cache_cell_unaccessed_survival_time(std::chrono::seconds(cache_cell_unaccessed_survival_time)),
           overloaded_memory_threshold_percentage(overloaded_memory_threshold_percentage),
           max_disk_usage_percentage(max_disk_usage_percentage),
-          disk_path(disk_path),
           loading_resource_factor(loading_resource_factor) {
     }
 };
