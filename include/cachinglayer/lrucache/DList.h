@@ -51,6 +51,7 @@ class DList : public std::enable_shared_from_this<DList> {
           low_watermark_(low_watermark),
           high_watermark_(high_watermark),
           eviction_config_(eviction_config),
+          system_memory_snapshot_(getSystemMemoryInfo()),
           next_request_id_(1) {
         // if eviction is disabled, we don't need to initialize the event base and thread
         if (!eviction_enabled) {
@@ -72,10 +73,7 @@ class DList : public std::enable_shared_from_this<DList> {
         // Initialize event base and thread
         event_base_thread_ = std::make_unique<folly::ScopedEventBaseThread>("cache-eb");
 
-        if (eviction_config_.background_eviction_enabled) {
-            LOG_INFO("[MCL] Starting periodic background eviction loop thread");
-            bg_eviction_thread_ = std::thread(&DList::evictionLoop, this);
-        }
+        bg_eviction_thread_ = std::thread(&DList::evictionLoop, this);
     }
 
     void
@@ -95,7 +93,15 @@ class DList : public std::enable_shared_from_this<DList> {
     UpdateLoadingOverheadGroup(const LoadingOverheadGroupHandle& group, LoadingOverheadPolicy policy);
 
     ~DList() {
-        // waiting requests should be cleared before event base thread is stopped
+        // Stop the producer before clearing requests and draining result delivery on EventBase.
+        {
+            std::lock_guard lock(bg_eviction_mtx_);
+            stop_bg_eviction_loop_ = true;
+        }
+        bg_eviction_thread_cv_.notify_one();
+        if (bg_eviction_thread_.joinable()) {
+            bg_eviction_thread_.join();
+        }
         clearWaitingQueue();
 
         if (event_base_thread_) {
@@ -115,15 +121,6 @@ class DList : public std::enable_shared_from_this<DList> {
                 event_base_thread_.reset();
             }
         }
-
-        // stop eviction loop thread
-        if (eviction_config_.background_eviction_enabled) {
-            stop_bg_eviction_loop_ = true;
-            bg_eviction_thread_cv_.notify_all();
-            if (bg_eviction_thread_.joinable()) {
-                bg_eviction_thread_.join();
-            }
-        }
     }
 
     // If after evicting all unpinned items, the used_resources_ is still larger than new_limit, false will be returned
@@ -132,8 +129,8 @@ class DList : public std::enable_shared_from_this<DList> {
     bool
     UpdateMaxLimit(const ResourceUsage& new_limit);
 
-    // Updating a watermark retries queued reservations and may evict cache
-    // entries while satisfying them. Validation failure is reported by exception.
+    // Updating a watermark schedules queued reservations for retry in the background.
+    // Validation failure is reported by exception.
     void
     UpdateLowWatermark(const ResourceUsage& new_low_watermark);
 
@@ -342,17 +339,19 @@ class DList : public std::enable_shared_from_this<DList> {
     tryEvict(const ResourceUsage& expected_eviction, const ResourceUsage& min_eviction,
              const bool evict_expired_items = false);
 
-    // Called after releasing node locks; skip locking only when neither a reservation attempt nor queued work exists.
+    // Coalesce retry notifications without taking list_mtx_; safe while holding it or node locks.
     void
     notifyWaitingRequests();
 
-    // Handle waiting requests when resources are available.
-    // This method should be called with list_mtx_ already held.
-    // Completions must outlive the lock so promises and callbacks complete outside it.
-    void
-    handleWaitingRequests(std::vector<WaitingRequestCompletion>& completions);
+    // Process at most one batch under list_mtx_. Deferred peers stay owned by the background
+    // loop across batches so a blocked heap prefix cannot starve later equal-deadline requests.
+    // Returns true when another batch remains in this scan.
+    bool
+    handleWaitingRequests(std::vector<WaitingRequestCompletion>& completions,
+                          std::vector<std::unique_ptr<WaitingRequest>>& deferred_requests,
+                          std::optional<std::chrono::steady_clock::time_point>& blocked_deadline);
 
-    // Fail one queued request and immediately retry requests behind it.
+    // Fail one queued request and schedule retries for requests behind it.
     // Must be called with list_mtx_ held; completions must outlive the lock.
     void
     failWaitingRequest(uint64_t request_id, const char* reason, std::vector<WaitingRequestCompletion>& completions);
@@ -402,9 +401,15 @@ class DList : public std::enable_shared_from_this<DList> {
     std::atomic<ResourceUsage> high_watermark_;
     const EvictionConfig eviction_config_;
 
+    // Snapshot and refresh guard are protected by list_mtx_. OS reads happen outside it.
+    SystemResourceInfo system_memory_snapshot_;
+    bool physical_eviction_pending_refresh_{false};
+
     std::thread bg_eviction_thread_;
+    std::mutex bg_eviction_mtx_;
     std::condition_variable bg_eviction_thread_cv_;
-    std::atomic<bool> stop_bg_eviction_loop_{false};
+    bool stop_bg_eviction_loop_{false};
+    bool waiting_requests_pending_{false};  // Protected by bg_eviction_mtx_.
 
     // Waiting queue for timeout-based memory reservation
     std::priority_queue<std::unique_ptr<WaitingRequest>, std::vector<std::unique_ptr<WaitingRequest>>,

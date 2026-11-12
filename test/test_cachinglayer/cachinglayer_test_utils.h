@@ -27,6 +27,12 @@ using namespace cachinglayer;
 namespace cachinglayer::internal {
 class DListTestFriend {
  public:
+    static void
+    set_memory_snapshot(DList& dlist, SystemResourceInfo snapshot) {
+        std::lock_guard lock(dlist.list_mtx_);
+        dlist.system_memory_snapshot_ = snapshot;
+    }
+
     static size_t
     get_waiting_request_count(const DList& dlist) {
         std::lock_guard lock(dlist.list_mtx_);
