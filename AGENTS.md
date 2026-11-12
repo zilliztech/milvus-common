@@ -5,6 +5,8 @@
 - This is a shared C++20 library used by Milvus and Knowhere. Public headers are in `include/`, implementations in `src/`, and unit tests in `test/`.
 - Read the relevant design documents under `docs/design-docs/` before changing interfaces or behavior. Follow links to detailed documents relevant to the task; an overview alone may not explain the required invariants. Cross-check the design against the implementation and its callers.
 - Prefer existing abstractions and the smallest complete change. Preserve unrelated workspace changes. Consider downstream source and binary compatibility when changing public headers, virtual functions, or dependencies.
+- Prefer idiomatic modern C++ within the project's C++20 baseline and follow the [C++ Core Guidelines](https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines), especially RAII, explicit ownership, type safety, const-correctness, and simple interfaces. Reuse project facilities and standard-library types; do not introduce newer language features or dependencies merely to modernize syntax. Apply guidelines in context without unrelated rewrites.
+- Follow KISS (Keep It Simple) and YAGNI (You Aren't Gonna Need It): expose only the interfaces and parameters required by current use cases. Avoid speculative abstractions, pass-through wrappers, redundant overloads, and configuration for hypothetical needs. Keep ownership and error behavior clear; simplicity must not remove necessary validation or cleanup.
 - **If a change alters behavior described by an existing design document, update that document in the same PR.** Keep current behavior separate from proposals and unresolved questions.
 - Follow `.clang-format` and `.pre-commit-config.yaml`. Do not hand-edit generated files.
 
@@ -34,6 +36,8 @@ make test NPROC=16 CMAKE_EXTRA="-DENABLE_SYNCPOINT=ON"
 ```
 
 Preserve existing extra configuration arguments. Run checks appropriate to the change. Documentation-only changes need content, link, and whitespace checks, not a build.
+
+Use test-driven development (TDD) for nontrivial behavior changes and bug fixes: first add a focused test that demonstrates the missing behavior or reproduces the defect, confirm it fails for the intended reason, implement the smallest fix, then refactor while keeping the tests green. Test observable contracts rather than mirroring implementation details. Documentation-only and trivial mechanical changes do not need new tests. If a meaningful automated reproduction is impractical, state the limitation and use an appropriate alternative check rather than adding a superficial test. This applies to implementation work, not review-only tasks.
 
 For behavior changes, verify the intended failure and concurrency paths, not only successful execution. When changing error propagation or classification, check the values produced by relevant callers and preserve their types and codes across wrappers. Passing a helper's unit tests does not establish that its real inputs or downstream handling are correct. Before submitting, inspect the final diff and report what was verified and what remains unverified; do not claim benefits beyond the evidence.
 
