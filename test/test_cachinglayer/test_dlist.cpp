@@ -2351,3 +2351,49 @@ TEST(DListBackgroundSchedulingTest, CompletionCanReleaseLastOwner) {
     EXPECT_TRUE(std::move(result).get(std::chrono::seconds(2)));
     EXPECT_TRUE(weak.expired());
 }
+
+TEST(DListMemorySnapshotTest, CompletedLoadsRemainChargedUntilNextSample) {
+    for (const bool group_aware : {false, true}) {
+        SCOPED_TRACE(group_aware);
+        // No worker: keep one sample fixed across successive completed loads.
+        auto dlist = std::make_shared<DList>(false, ResourceUsage{1000, 1000}, ResourceUsage{800, 800},
+                                             ResourceUsage{900, 900}, EvictionConfig{});
+        auto reserve = [&] {
+            return group_aware
+                       ? std::move(dlist->ReserveLoadingResourceWithTimeout({{150, 0}, {}, {}}, nullptr,
+                                                                            std::chrono::milliseconds(0)))
+                             .get()
+                             .success
+                       : std::move(dlist->ReserveLoadingResourceWithTimeout({150, 0}, std::chrono::milliseconds(0)))
+                             .get();
+        };
+        auto release = [&] {
+            if (group_aware) {
+                dlist->ReleaseLoadingResource({{150, 0}, {}, {}}, nullptr);
+            } else {
+                dlist->ReleaseLoadingResource({150, 0});
+            }
+        };
+        DLF::set_memory_snapshot(*dlist, {1000, 700});
+        // Disk residency must not consume physical-memory headroom.
+        dlist->ChargeLoadedResource({0, 500});
+        ASSERT_TRUE(reserve());
+        dlist->ChargeLoadedResource({150, 0});
+        release();
+        EXPECT_EQ(DLF::get_loading_memory(*dlist), ResourceUsage{});
+        const bool admitted = reserve();
+        EXPECT_FALSE(admitted);
+        if (admitted) {
+            release();
+        }
+        dlist->RefundLoadedResource({150, 500});
+        const bool admitted_before_sample = reserve();
+        EXPECT_FALSE(admitted_before_sample);
+        if (admitted_before_sample) {
+            release();
+        }
+        DLF::set_memory_snapshot(*dlist, {1000, 700});
+        EXPECT_TRUE(reserve());
+        release();
+    }
+}

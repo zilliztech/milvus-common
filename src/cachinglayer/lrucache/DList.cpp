@@ -552,7 +552,10 @@ DList::evictionLoop() {
         {
             std::unique_lock lock(list_mtx_);
             if (sample) {
-                system_memory_snapshot_ = *sample;
+                system_memory_total_bytes_ = sample->total_bytes;
+                // shortcut: Sampling may overwrite concurrent charges; use generations if stricter accounting is
+                // needed.
+                estimated_memory_usage_.store(sample->used_bytes);
                 physical_eviction_pending_refresh_ = false;
             }
             if (std::chrono::steady_clock::now() >= next_eviction) {
@@ -980,6 +983,8 @@ DList::IsEmpty() const {
 void
 DList::ChargeLoadedResource(const ResourceUsage& size) {
     total_loaded_size_ += size;
+    // Keep completed loads accounted for before callers release their loading reservation.
+    estimated_memory_usage_.fetch_add(size.memory_bytes);
 }
 
 void
@@ -1194,8 +1199,8 @@ DList::checkPhysicalMemoryLimit(const ResourceUsage& size) const {
     if (size.memory_bytes <= 0) {
         return ResourceUsage{0, 0};
     }
-    const auto& sys_mem = system_memory_snapshot_;
     auto current_loading_mem = total_loading_size_.load().memory_bytes;
+    const SystemResourceInfo sys_mem{system_memory_total_bytes_, estimated_memory_usage_.load()};
     auto projected_mem_usage = current_loading_mem + size.memory_bytes + sys_mem.used_bytes;
 
     auto eviction_mem_needed =
