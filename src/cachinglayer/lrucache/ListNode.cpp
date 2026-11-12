@@ -232,6 +232,11 @@ ListNode::touch_to_dlist(bool update_evictable_memory) {
     state_ = State::CACHED;
 }
 
+std::shared_ptr<ListNode>
+ListNode::detach_evicted() {
+    return nullptr;
+}
+
 void
 ListNode::unload() {
     switch (state_) {

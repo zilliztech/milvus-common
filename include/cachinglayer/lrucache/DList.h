@@ -181,6 +181,7 @@ class DList : public std::enable_shared_from_this<DList> {
     ChargeLoadedResource(const ResourceUsage& size);
 
     // Called only when a cell is manually released, eviction handle it internally, so it should not call this.
+    // Accounting is atomic; only pending reservation notifications may acquire list_mtx_.
     void
     RefundLoadedResource(const ResourceUsage& size);
 
@@ -214,6 +215,19 @@ class DList : public std::enable_shared_from_this<DList> {
  private:
     friend class DListTestFriend;
     friend class ListNode;
+    template <CacheMapKey Key, typename Value>
+    friend class milvus::cachinglayer::CacheMap;
+
+    // Caller holds list_mtx_. Slot callers also hold list_node->mtx_.
+    void
+    touchItemLocked(ListNode* list_node, bool force_touch, std::optional<ResourceUsage> size);
+    void
+    removeItemLocked(ListNode* list_node, ResourceUsage size);
+
+    // Atomic accounting only, safe with or without list_mtx_; does not notify waiters.
+    // Callers holding cache locks must notify waiting requests after releasing them.
+    void
+    RefundLoadedResourceLocked(const ResourceUsage& size);
 
     // Waiting request for timeout-based memory reservation
     struct WaitingRequest {
