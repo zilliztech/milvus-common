@@ -106,7 +106,7 @@ These responsibilities do not require copying CacheSlot's internal structure, bu
 
 ### Choosing a Keyed-Cache Interface
 
-Fixed cell arrays and dynamic key caches need different indexing, but both must support obtaining and safely using data. For immutable, lazily read data such as footers, evaluate the following semantics before choosing container operations:
+Fixed cell arrays and dynamic key caches need different indexing, but both must support obtaining and safely using data. For on-demand loading, the following conceptual flow illustrates how acquisition and lifetime protection fit together:
 
 ```text
 GetOrCreate(key, loader) -> Pin protecting the use lifetime
@@ -115,11 +115,11 @@ GetOrCreate(key, loader) -> Pin protecting the use lifetime
   failure: clean up intermediate state, notify waiters, and define subsequent retries
 ```
 
-This is not a declaration of an existing API. An implementation must specify estimation, cancellation propagation, shared failures, and retries. Different-key loaders should run concurrently within the budget, rather than performing I/O under a whole-map write lock. Keys must identify the actual file and any necessary version; the same field does not automatically mean the same footer.
+The flow above is a design model, not an existing API. Define resource estimation, ownership transfer, cancellation, failure delivery, and retry behavior as part of the interface contract. Cache keys should identify the reusable data and include version information when needed. Independent loads should be able to make progress concurrently within resource limits.
 
-A separate `Put(key, value)` can publish caller-owned data or perform best-effort prewarming, but needs a concrete consumer. Without a returned Pin, immediate eviction is possible and a subsequent Get can miss. Put alone does not satisfy a request that must use the newly loaded data. Immutable data does not inherently require replacement and its conflict-handling machinery.
+Distinguish acquisition for immediate use from admission for future reuse. Acquisition must protect the returned data throughout its use; admission alone need not guarantee that data remains resident. Expose insertion, replacement, invalidation, or prewarming only when required by consumers, and document their effects on active readers and resource accounting.
 
-If a hash index is introduced, its bucket chains and DList's LRU links are separate structures. Bucket order does not follow access recency and is not always the reverse of LRU order. If removal of a known Entry scans a bucket, evaluate entry count, bucket count, eviction batch size, and lock scope. A singly linked chain alone is not a defect, and a hypothetical million-entry workload is not evidence of actual production cardinality.
+Choose index structures based on expected cardinality and access patterns. Evaluate lookup, insertion, removal, and bulk cleanup costs, including metadata memory and time spent holding shared locks. Index membership and eviction order serve different purposes; changes must preserve their consistency without assuming that their traversal orders match. Use workload estimates or measurements to justify capacity settings and performance trade-offs.
 
 ## 7. Changes and Validation
 
