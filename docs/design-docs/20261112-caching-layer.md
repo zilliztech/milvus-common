@@ -4,7 +4,7 @@
 - Implementation baseline: `a88c21f` on `master`
 - Scope: current architecture, usage contracts, and considerations for extending the caching layer
 
-Update this document when the corresponding implementation or contract changes. Source links point to repository files rather than fixed line numbers. The current implementation uses CacheSlot; the keyed-cache / `GetOrCreate` discussion below describes extension requirements, not an existing API.
+Update this document when the corresponding implementation or contract changes. Source links point to repository files rather than fixed line numbers. The current implementation uses CacheSlot; the acquisition-interface discussion below describes extension requirements, not an additional existing API.
 
 ## 1. Components and Ownership
 
@@ -96,7 +96,7 @@ Dynamic keys or an entry set that cannot be determined in advance may justify by
 | --- | --- | --- |
 | Same-key loading | Share one in-flight load and its result; define failure, cancellation, and retry behavior. | Loading independently and serializing Put afterward: duplicate I/O and allocations have already occurred. |
 | Admission before allocation | Reserve conservative resident and temporary-peak estimates before the controlled allocations. | Constructing Value before Reserve: this controls cache admission, not loading peaks. |
-| Publication and access protection | Return a Pin on successful acquisition, with no eviction gap between publication and delivery; retain protection throughout use. | Put followed by Get: the value can be evicted between them or before Put returns. |
+| Publication and access protection | Return a handle/accessor that retains a pin on successful acquisition, with no eviction gap between publication and delivery; retain protection throughout use. | Put followed by Get: the value can be evicted between them or before Put returns. |
 | Lifetime and shutdown | Keep values, nodes, and final-release dependencies alive; define unlinking, accounting handoff, and destruction order. | Keeping only Value/Entry alive, or skipping cleanup when a weak reference expires. |
 | Accounting and failure cleanup | Charge actual residency, release reservations on success/failure/cancellation, and assign accounting responsibility for surviving data. | Refunding only on success, or refunding at cache destruction while Pins retain the data. |
 | Index and eviction consistency | Coordinate index ownership, DList membership, node locks, and pin counts; keep nodes alive until locks are released and prevent detached entries from rejoining accidentally. | Dropping the last index reference while still using the node/lock, or updating only one structure. |
@@ -104,18 +104,22 @@ Dynamic keys or an entry set that cannot be determined in advance may justify by
 
 These responsibilities do not require copying CacheSlot's internal structure, but they require explicit implementation and verification. An API providing only best-effort prewarming or resident-cache admission must state that narrower contract; it is not a complete on-demand acquisition interface.
 
-### Choosing a Keyed-Cache Interface
+### Acquisition and Access Handles
 
 Fixed cell arrays and dynamic key caches need different indexing, but both must support obtaining and safely using data. For on-demand loading, the following conceptual flow illustrates how acquisition and lifetime protection fit together:
 
 ```text
-GetOrCreate(key, loader) -> Pin protecting the use lifetime
-  hit: pin the existing value and return
-  miss: coalesce same-key requests -> estimate and reserve -> load -> publish and return Pin
+Pin(identity) -> Handle / Accessor protecting the use lifetime
+  hit: pin the resident data and return its access handle
+  miss: coalesce requests -> estimate and reserve -> load -> publish and return a pinned handle
   failure: clean up intermediate state, notify waiters, and define subsequent retries
 ```
 
-The flow above is a design model, not an existing API. Define resource estimation, ownership transfer, cancellation, failure delivery, and retry behavior as part of the interface contract. Cache keys should identify the reusable data and include version information when needed. Independent loads should be able to make progress concurrently within resource limits.
+The flow above is a conceptual contract, not an additional existing API. Pinning may include loading nonresident data; it need not mean only incrementing a counter. Loading behavior can be supplied by a Translator or a registered object rather than passed as a callback on every acquisition. The existing `PinCells()` / `CellAccessor` interface follows this separation.
+
+An identity or metadata handle identifies reusable data but does not necessarily keep it resident. The returned access handle retains the pin throughout use and releases it when the handle is destroyed or explicitly released, according to the API contract. Pinning prevents eviction; it does not by itself provide read/write exclusion for mutable data. Define that synchronization separately.
+
+Define resource estimation, ownership transfer, cancellation, failure delivery, and retry behavior as part of the interface contract. Cache keys should identify the reusable data and include version information when needed. Independent loads should be able to make progress concurrently within resource limits.
 
 Distinguish acquisition for immediate use from admission for future reuse. Acquisition must protect the returned data throughout its use; admission alone need not guarantee that data remains resident. Expose insertion, replacement, invalidation, or prewarming only when required by consumers, and document their effects on active readers and resource accounting.
 
