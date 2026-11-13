@@ -366,6 +366,8 @@ TEST(Utils, ProcessMemoryUsageHandlesVariableFieldOffsets) {
     for (const auto& [content, expected] : std::vector<std::pair<std::string, int64_t>>{
              {"Name:\tqn\nVmRSS:\t100 kB\nRssAnon:\t50 kB\nRssFile:\t30 kB\nRssShmem:\t20 kB\n", 70 * 1024},
              {"Name:\tlonger-process-name\nVmSize:\t123456789 kB\nRssFile: 300 kB\nVmRSS: 1000 kB\n", 700 * 1024},
+             {"Name:\tVmRSS: 999 kB\nFakeRssFile: 999 kB\nVmRSS: 100 kB\nRssFile: 30 kB\n", 70 * 1024},
+             {std::string(4092, 'x') + "\nVmRSS: 10000 kB\nRssFile: 3000 kB\n", 7000 * 1024},
              {std::string(4080, 'x') + "\nVmRSS: 10000 kB\nRssFile: 3000 kB\n", 7000 * 1024}}) {
         std::ofstream(path) << content;
         EXPECT_EQ(getCurrentProcessMemoryUsage(), expected);

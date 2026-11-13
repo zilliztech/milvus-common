@@ -351,20 +351,22 @@ getCurrentProcessMemoryUsage() {
         return 0;
     }
     const auto parse = [](std::string_view text) -> std::optional<int64_t> {
-        std::optional<int64_t> rss;
-        std::optional<int64_t> file_rss;
-        while (!text.empty()) {
-            const auto end = text.find('\n');
+        int64_t usage = 0;
+        for (const std::string_view key : {"\nVmRSS:", "\nRssFile:"}) {
+            size_t position = 0;
+            if (!text.starts_with(key.substr(1))) {
+                position = text.find(key);
+                if (position == std::string_view::npos) {
+                    return std::nullopt;
+                }
+                ++position;  // Skip the newline anchoring the field name.
+            }
+            const auto end = text.find('\n', position);
             if (end == std::string_view::npos) {
-                break;  // A short read may end inside a number.
+                return std::nullopt;  // A short read may end inside a number.
             }
-            const auto field = text.substr(0, end);
-            text.remove_prefix(end + 1);
-            const bool is_rss = field.starts_with("VmRSS:");
-            if (!is_rss && !field.starts_with("RssFile:")) {
-                continue;
-            }
-            const auto start = field.find_first_not_of(" \t", is_rss ? 6 : 8);
+            const auto field = text.substr(position, end - position);
+            const auto start = field.find_first_not_of(" \t", key.size() - 1);
             if (start == std::string_view::npos) {
                 return 0;
             }
@@ -373,12 +375,9 @@ getCurrentProcessMemoryUsage() {
             if (result.ec != std::errc{} || value < 0 || value > std::numeric_limits<int64_t>::max() / 1024) {
                 return 0;
             }
-            (is_rss ? rss : file_rss) = value * 1024;
-            if (rss && file_rss) {
-                return *rss - *file_rss;
-            }
+            usage += key == "\nVmRSS:" ? value * 1024 : -value * 1024;
         }
-        return std::nullopt;
+        return usage;
     };
     std::array<char, 4096> buffer;
     std::string partial;
