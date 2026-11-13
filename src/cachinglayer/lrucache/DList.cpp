@@ -489,13 +489,18 @@ DList::reserveResourceInternalImpl(const ResourceUsage& size, std::function<void
     const auto required_resources = using_resources + size;
 
     // Combined logical and physical memory limit check
-    const bool logical_limit_exceeded = !max_resource_limit_.load().CanHold(required_resources);
-    const auto physical_eviction_needed = checkPhysicalMemoryLimit(size);
+    bool logical_limit_exceeded = !max_resource_limit_.load().CanHold(required_resources);
+    auto physical_eviction_needed = checkPhysicalMemoryLimit(size);
     if (physical_eviction_needed.AnyGTZero() && !logical_limit_exceeded) {
         waiting_for_physical_memory_ = true;
     }
 
-    if (logical_limit_exceeded || physical_eviction_needed.AnyGTZero()) {
+    // Try once, then retry at most twice if actual memory usage is still too high.
+    // A fixed bound prevents this request from holding list_mtx_ through unlimited eviction rounds.
+    constexpr int kMaxEvictionRetries = 2;
+    for (int attempt = 0;
+         attempt <= kMaxEvictionRetries && (logical_limit_exceeded || physical_eviction_needed.AnyGTZero());
+         ++attempt) {
         ResourceUsage eviction_target;
         ResourceUsage min_eviction;
 
@@ -539,11 +544,18 @@ DList::reserveResourceInternalImpl(const ResourceUsage& size, std::function<void
             return {false, {}};
         }
 
-        if (physical_eviction_needed.AnyGTZero() && checkPhysicalMemoryLimit(size).AnyGTZero()) {
-            waiting_for_physical_memory_ = true;
-            rollback();
-            return {false, {}};
+        // Successful eviction freed at least min_eviction, so the logical quota is now sufficient.
+        // Further rounds must use the newly read physical deficit, not the original logical deficit.
+        logical_limit_exceeded = false;
+        if (physical_eviction_needed.AnyGTZero()) {
+            physical_eviction_needed = checkPhysicalMemoryLimit(size);
+            waiting_for_physical_memory_ |= physical_eviction_needed.AnyGTZero();
         }
+    }
+
+    if (physical_eviction_needed.AnyGTZero()) {
+        rollback();
+        return {false, {}};
     }
 
     total_loading_size_ += size;

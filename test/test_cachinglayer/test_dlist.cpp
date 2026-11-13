@@ -2363,6 +2363,47 @@ TEST(DListBackgroundSchedulingTest, PhysicalEvictionRechecksLiveUsage) {
     sync->Reset();
 }
 
+TEST(DListBackgroundSchedulingTest, PhysicalEvictionRetriesAtMostTwice) {
+    for (const int rounds_needed : {2, 3, 4}) {
+        SCOPED_TRACE(rounds_needed);
+        auto dlist = std::make_shared<DList>(true, ResourceUsage{100, 0}, ResourceUsage{80, 0}, ResourceUsage{90, 0},
+                                             EvictionConfig{});
+        auto* sync = milvus::SyncPoint::GetInstance();
+        sync->Reset();
+        auto reset = folly::makeGuard([&] { sync->Reset(); });
+        int reads = 0;
+        sync->SetCallBack("DList::PhysicalMemoryInfo", [&](void* value) {
+            ++reads;
+            *static_cast<milvus::cachinglayer::internal::SystemResourceInfo*>(value) = {
+                100, reads <= rounds_needed ? 95 : 75};
+        });
+        sync->EnableProcessing();
+        const int expected_evictions = std::min(rounds_needed, 3);
+        std::vector<std::unique_ptr<::testing::NiceMock<MockListNode>>> nodes;
+        nodes.reserve(4);
+        for (int i = 0; i < 4; ++i) {
+            auto node = std::make_unique<::testing::NiceMock<MockListNode>>(dlist.get(), std::to_string(i));
+            node->test_set_loaded_size({20, 0});
+            node->test_set_state(ListNode::State::CACHED);
+            dlist->ChargeLoadedResource({20, 0});
+            dlist->touchItem(node.get(), true, ResourceUsage{20, 0});
+            EXPECT_CALL(*node, unload()).Times(i < expected_evictions ? 1 : 0);
+            nodes.push_back(std::move(node));
+        }
+
+        // Even a non-waiting caller can succeed on a retry. If a fourth round would be needed,
+        // stop after three rounds although another evictable node remains.
+        const bool success =
+            std::move(dlist->ReserveLoadingResourceWithTimeout({1, 0}, std::chrono::milliseconds(0))).get();
+        EXPECT_EQ(success, rounds_needed <= 3);
+        EXPECT_EQ(reads, expected_evictions + 1);
+        if (success) {
+            dlist->ReleaseLoadingResource({1, 0});
+        }
+        sync->Reset();
+    }
+}
+
 TEST(DListBackgroundSchedulingTest, TimeoutRunsBetweenBackgroundBatches) {
     auto dlist = std::make_shared<DList>(true, ResourceUsage{1000, 0}, ResourceUsage{800, 0}, ResourceUsage{900, 0},
                                          EvictionConfig{});
