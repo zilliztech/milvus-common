@@ -451,7 +451,7 @@ DList::reserveResourceInternalImpl(const ResourceUsage& size, std::function<void
 
     // Combined logical and physical memory limit check
     const bool logical_limit_exceeded = !max_resource_limit_.load().CanHold(required_resources);
-    const auto physical_eviction_needed = checkPhysicalResourceLimit(size);
+    const auto physical_eviction_needed = checkPhysicalMemoryLimit(size);
     if (physical_eviction_needed.AnyGTZero() && !logical_limit_exceeded) {
         waiting_for_physical_memory_ = true;
     }
@@ -500,7 +500,7 @@ DList::reserveResourceInternalImpl(const ResourceUsage& size, std::function<void
             return {false, {}};
         }
 
-        if (physical_eviction_needed.AnyGTZero() && checkPhysicalResourceLimit(size).AnyGTZero()) {
+        if (physical_eviction_needed.AnyGTZero() && checkPhysicalMemoryLimit(size).AnyGTZero()) {
             waiting_for_physical_memory_ = true;
             rollback();
             return {false, {}};
@@ -1197,7 +1197,7 @@ DList::clearWaitingQueue() {
 }
 
 ResourceUsage
-DList::checkPhysicalResourceLimit(const ResourceUsage& size) const {
+DList::checkPhysicalMemoryLimit(const ResourceUsage& size) const {
     if (size.memory_bytes <= 0) {
         return ResourceUsage{0, 0};
     }

@@ -381,7 +381,7 @@ class DList : public std::enable_shared_from_this<DList> {
     // Returns the amount of memory that needs to be evicted to satisfy physical memory limit.
     // Returns 0 if no eviction needed, positive value if eviction needed.
     ResourceUsage
-    checkPhysicalResourceLimit(const ResourceUsage& size) const;
+    checkPhysicalMemoryLimit(const ResourceUsage& size) const;
 
     // not thread safe, use for debug only
     std::string
