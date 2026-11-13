@@ -568,7 +568,7 @@ DList::reserveResourceInternalImpl(const ResourceUsage& size, std::function<void
 }
 
 void
-DList::evictionLoop() {
+DList::backgroundLoop() {
     // Use 500ms for a nonpositive interval so physical-memory waiters still get periodic retries.
     const auto eviction_interval = eviction_config_.eviction_interval.count() > 0 ? eviction_config_.eviction_interval
                                                                                   : std::chrono::milliseconds(500);
@@ -584,17 +584,17 @@ DList::evictionLoop() {
         // 1. When no batch is in progress, wait for a notification or the next periodic check.
         // Between batches, continue immediately but still check whether shutdown was requested.
         {
-            std::unique_lock lock(bg_eviction_mtx_);
+            std::unique_lock lock(background_mtx_);
             if (!scanning && !restoring) {
-                bg_eviction_thread_cv_.wait_until(lock, next_eviction, [this, &retry_requested] {
-                    return stop_bg_eviction_loop_ || waiting_requests_pending_ || retry_requested;
+                background_cv_.wait_until(lock, next_eviction, [this, &retry_requested] {
+                    return stop_background_worker_ || waiting_requests_pending_ || retry_requested;
                 });
                 // Several notifications need only one scan. Notifications received during a scan
                 // stay in waiting_requests_pending_ and cause another scan after the current one.
                 retry_requested |= waiting_requests_pending_;
                 waiting_requests_pending_ = false;
             }
-            if (stop_bg_eviction_loop_) {
+            if (stop_background_worker_) {
                 break;
             }
         }
@@ -608,7 +608,7 @@ DList::evictionLoop() {
             if (std::chrono::steady_clock::now() >= next_eviction) {
                 // shortcut: Physical retries scan the shared queue; split it if mixed-queue retries become costly.
                 retry_requested |= waiting_for_physical_memory_;
-                if (eviction_config_.background_eviction_enabled) {
+                if (eviction_enabled_ && eviction_config_.background_eviction_enabled) {
                     // At or above the high watermark, try to evict down to the low watermark.
                     // If eviction frees resources, also retry the waiting requests.
                     const auto using_resources = total_loaded_size_.load() + total_loading_size_.load();
@@ -726,6 +726,9 @@ DList::chainString() const {
 ResourceUsage
 DList::tryEvict(const ResourceUsage& expected_eviction, const ResourceUsage& min_eviction,
                 const bool evict_expired_items) {
+    if (!eviction_enabled_) {
+        return {};
+    }
     // Fast path: check if we have enough evictable resources
     auto current_evictable = evictable_size_.load();
     if (!current_evictable.CanHold(min_eviction)) {
@@ -1081,10 +1084,10 @@ DList::notifyWaitingRequests() {
         return;
     }
     {
-        std::lock_guard lock(bg_eviction_mtx_);
+        std::lock_guard lock(background_mtx_);
         waiting_requests_pending_ = true;
     }
-    bg_eviction_thread_cv_.notify_one();
+    background_cv_.notify_one();
 }
 
 bool

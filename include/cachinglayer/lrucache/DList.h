@@ -50,29 +50,29 @@ class DList : public std::enable_shared_from_this<DList> {
         : max_resource_limit_(max_memory),
           low_watermark_(low_watermark),
           high_watermark_(high_watermark),
+          eviction_enabled_(eviction_enabled),
           eviction_config_(eviction_config),
           next_request_id_(1) {
-        // if eviction is disabled, we don't need to initialize the event base and thread
-        if (!eviction_enabled) {
-            return;
+        if (eviction_enabled_) {
+            AssertInfo(low_watermark.AllGEZero(), "[MCL] low watermark must be greater than or equal to 0");
+            AssertInfo((high_watermark - low_watermark).AllGEZero(),
+                       "[MCL] high watermark must be greater than low watermark");
+            AssertInfo((max_memory - high_watermark).AllGEZero(),
+                       "[MCL] max memory must be greater than high watermark");
+
+            monitor::cache_capacity_bytes(StorageType::MEMORY).Set(max_memory.memory_bytes);
+            monitor::cache_capacity_bytes(StorageType::DISK).Set(max_memory.file_bytes);
+            monitor::cache_high_watermark_bytes(StorageType::MEMORY).Set(high_watermark.memory_bytes);
+            monitor::cache_high_watermark_bytes(StorageType::DISK).Set(high_watermark.file_bytes);
+            monitor::cache_low_watermark_bytes(StorageType::MEMORY).Set(low_watermark.memory_bytes);
+            monitor::cache_low_watermark_bytes(StorageType::DISK).Set(low_watermark.file_bytes);
         }
 
-        AssertInfo(low_watermark.AllGEZero(), "[MCL] low watermark must be greater than or equal to 0");
-        AssertInfo((high_watermark - low_watermark).AllGEZero(),
-                   "[MCL] high watermark must be greater than low watermark");
-        AssertInfo((max_memory - high_watermark).AllGEZero(), "[MCL] max memory must be greater than high watermark");
-
-        monitor::cache_capacity_bytes(StorageType::MEMORY).Set(max_memory.memory_bytes);
-        monitor::cache_capacity_bytes(StorageType::DISK).Set(max_memory.file_bytes);
-        monitor::cache_high_watermark_bytes(StorageType::MEMORY).Set(high_watermark.memory_bytes);
-        monitor::cache_high_watermark_bytes(StorageType::DISK).Set(high_watermark.file_bytes);
-        monitor::cache_low_watermark_bytes(StorageType::MEMORY).Set(low_watermark.memory_bytes);
-        monitor::cache_low_watermark_bytes(StorageType::DISK).Set(low_watermark.file_bytes);
-
-        // Initialize event base and thread
+        // Reservations can wait even when eviction is disabled. Always start both threads:
+        // the worker retries reservations, and EventBase handles results, timeouts, and cancellation.
         event_base_thread_ = std::make_unique<folly::ScopedEventBaseThread>("cache-eb");
 
-        bg_eviction_thread_ = std::thread(&DList::evictionLoop, this);
+        background_worker_ = std::thread(&DList::backgroundLoop, this);
     }
 
     void
@@ -94,12 +94,12 @@ class DList : public std::enable_shared_from_this<DList> {
     ~DList() {
         // Stop the producer before clearing requests and draining result delivery on EventBase.
         {
-            std::lock_guard lock(bg_eviction_mtx_);
-            stop_bg_eviction_loop_ = true;
+            std::lock_guard lock(background_mtx_);
+            stop_background_worker_ = true;
         }
-        bg_eviction_thread_cv_.notify_one();
-        if (bg_eviction_thread_.joinable()) {
-            bg_eviction_thread_.join();
+        background_cv_.notify_one();
+        if (background_worker_.joinable()) {
+            background_worker_.join();
         }
         clearWaitingQueue();
 
@@ -326,8 +326,9 @@ class DList : public std::enable_shared_from_this<DList> {
     LoadingResourceReservationAttempt
     reserveResourceInternalWithOverhead(const LoadingResourceUsage& usage, const LoadingOverheadConfig* config);
 
+    // Retry waiting reservations and perform periodic eviction when enabled.
     void
-    evictionLoop();
+    backgroundLoop();
 
     // Try to evict some items so that the resources of evicted items are larger than expected_eviction.
     // If we cannot achieve the goal, but we can evict min_eviction, we will still perform eviction.
@@ -398,15 +399,16 @@ class DList : public std::enable_shared_from_this<DList> {
     std::atomic<ResourceUsage> max_resource_limit_;
     std::atomic<ResourceUsage> low_watermark_;
     std::atomic<ResourceUsage> high_watermark_;
+    const bool eviction_enabled_;
     const EvictionConfig eviction_config_;
 
     bool waiting_for_physical_memory_{false};  // Protected by list_mtx_.
 
-    std::thread bg_eviction_thread_;
-    std::mutex bg_eviction_mtx_;
-    std::condition_variable bg_eviction_thread_cv_;
-    bool stop_bg_eviction_loop_{false};
-    bool waiting_requests_pending_{false};  // Protected by bg_eviction_mtx_.
+    std::thread background_worker_;
+    std::mutex background_mtx_;
+    std::condition_variable background_cv_;
+    bool stop_background_worker_{false};
+    bool waiting_requests_pending_{false};  // Protected by background_mtx_.
 
     // Waiting queue for timeout-based memory reservation
     std::priority_queue<std::unique_ptr<WaitingRequest>, std::vector<std::unique_ptr<WaitingRequest>>,
@@ -429,7 +431,7 @@ class DList : public std::enable_shared_from_this<DList> {
     std::atomic<ResourceUsage> total_loading_size_{};
     std::atomic<ResourceUsage> total_loaded_size_{};
 
-    // EventBase and thread for handling timeout operations
+    // Delivers reservation results and handles timeouts and cancellation.
     std::unique_ptr<folly::ScopedEventBaseThread> event_base_thread_;
 };
 

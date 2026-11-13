@@ -29,7 +29,7 @@ class DListTestFriend {
  public:
     static std::thread::id
     background_thread_id(const DList& dlist) {
-        return dlist.bg_eviction_thread_.get_id();
+        return dlist.background_worker_.get_id();
     }
 
     static size_t

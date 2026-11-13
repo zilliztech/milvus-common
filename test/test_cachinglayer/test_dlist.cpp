@@ -2245,7 +2245,70 @@ TEST(DListBackgroundSchedulingTest, ReleaseDoesNotWaitForListLockWithQueuedReque
     dlist->ReleaseLoadingResource({40, 0});
 }
 
+TEST(DListBackgroundSchedulingTest, DisabledEvictionStillRetriesAfterRelease) {
+    auto dlist = std::make_shared<DList>(false, ResourceUsage{0, 100}, ResourceUsage{0, 80}, ResourceUsage{0, 90},
+                                         EvictionConfig{});
+    ASSERT_TRUE(std::move(dlist->ReserveLoadingResourceWithTimeout({0, 100}, std::chrono::milliseconds(0))).get());
+    auto pending = dlist->ReserveLoadingResourceWithTimeout({0, 30}, std::chrono::milliseconds(-1));
+    ASSERT_FALSE(pending.isReady());
+    dlist->ReleaseLoadingResource({0, 100});
+    EXPECT_TRUE(std::move(pending).get(std::chrono::seconds(2)));
+    EXPECT_EQ(DLF::get_loading_memory(*dlist), (ResourceUsage{0, 30}));
+    dlist->ReleaseLoadingResource({0, 30});
+}
+
+TEST(DListBackgroundSchedulingTest, DisabledEvictionHandlesTimeoutCancellationAndShutdown) {
+    auto dlist = std::make_shared<DList>(false, ResourceUsage{0, 100}, ResourceUsage{0, 80}, ResourceUsage{0, 90},
+                                         EvictionConfig{});
+    ASSERT_TRUE(std::move(dlist->ReserveLoadingResourceWithTimeout({0, 100}, std::chrono::milliseconds(0))).get());
+
+    auto timed = dlist->ReserveLoadingResourceWithTimeout({0, 30}, std::chrono::milliseconds(20));
+    EXPECT_FALSE(std::move(timed).get(std::chrono::seconds(2)));
+
+    folly::CancellationSource cancellation;
+    milvus::OpContext ctx(cancellation.getToken());
+    auto cancelled = dlist->ReserveLoadingResourceWithTimeout({0, 30}, std::chrono::milliseconds(-1), &ctx);
+    ASSERT_FALSE(cancelled.isReady());
+    cancellation.requestCancellation();
+    EXPECT_FALSE(std::move(cancelled).get(std::chrono::seconds(2)));
+
+    auto pending = dlist->ReserveLoadingResourceWithTimeout({0, 30}, std::chrono::milliseconds(-1));
+    ASSERT_FALSE(pending.isReady());
+    dlist.reset();
+    EXPECT_FALSE(std::move(pending).get(std::chrono::seconds(2)));
+}
+
 #ifdef ENABLE_SYNCPOINT
+TEST(DListBackgroundSchedulingTest, DisabledEvictionDoesNotEvictFromReservationsOrPeriodicChecks) {
+    auto dlist = std::make_shared<DList>(false, ResourceUsage{0, 100}, ResourceUsage{0, 80}, ResourceUsage{0, 90},
+                                         EvictionConfig{0, true, 20});
+    ::testing::NiceMock<MockListNode> node(dlist.get(), "evictable");
+    node.test_set_loaded_size({0, 100});
+    node.test_set_state(ListNode::State::CACHED);
+    dlist->ChargeLoadedResource({0, 100});
+    dlist->touchItem(&node, true, ResourceUsage{0, 100});
+    EXPECT_CALL(node, unload()).Times(0);
+
+    // The global switch must override the periodic eviction setting and on-demand eviction.
+    EXPECT_FALSE(std::move(dlist->ReserveLoadingResourceWithTimeout({0, 1}, std::chrono::milliseconds(0))).get());
+    const auto worker = DLF::background_thread_id(*dlist);
+    std::promise<void> checked;
+    auto future = checked.get_future();
+    int ticks = 0;
+    auto* sync = milvus::SyncPoint::GetInstance();
+    sync->Reset();
+    auto reset = folly::makeGuard([&] { sync->Reset(); });
+    sync->SetCallBack("DList::WaitingBatchComplete", [&](void*) {
+        if (std::this_thread::get_id() == worker && ++ticks == 2) {
+            checked.set_value();
+        }
+    });
+    sync->EnableProcessing();
+    EXPECT_EQ(future.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    sync->Reset();
+    EXPECT_EQ(DLF::get_used_memory(*dlist), (ResourceUsage{0, 100}));
+}
+
 TEST(DListBackgroundSchedulingTest, PeriodicRetriesOnlyForPhysicalBlockers) {
     for (const bool physical : {false, true}) {
         SCOPED_TRACE(physical);
@@ -2527,7 +2590,7 @@ TEST(DListBackgroundSchedulingTest, CompletionCanReleaseLastOwner) {
 TEST(DListPhysicalMemoryTest, EachReservationReadsCurrentUsage) {
     for (const bool group_aware : {false, true}) {
         SCOPED_TRACE(group_aware);
-        // No worker: usage changes must be visible without a periodic refresh.
+        // Usage changes must be visible on the next reservation without waiting for a periodic check.
         auto dlist = std::make_shared<DList>(false, ResourceUsage{1000, 1000}, ResourceUsage{800, 800},
                                              ResourceUsage{900, 900}, EvictionConfig{});
         auto reserve = [&] {
