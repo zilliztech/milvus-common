@@ -2297,6 +2297,53 @@ TEST(DListBackgroundSchedulingTest, PeriodicRetriesOnlyForPhysicalBlockers) {
     }
 }
 
+TEST(DListBackgroundSchedulingTest, CombinedLimitFailureRetriesAfterPhysicalRecovery) {
+    for (const bool background_eviction : {false, true}) {
+        SCOPED_TRACE(background_eviction);
+        EvictionConfig config{0, background_eviction, 20};
+        auto dlist =
+            std::make_shared<DList>(true, ResourceUsage{100, 0}, ResourceUsage{80, 0}, ResourceUsage{90, 0}, config);
+        std::atomic<int64_t> used{930};
+        auto* sync = milvus::SyncPoint::GetInstance();
+        sync->Reset();
+        auto reset = folly::makeGuard([&] { sync->Reset(); });
+        sync->SetCallBack("DList::PhysicalMemoryInfo", [&](void* value) {
+            *static_cast<milvus::cachinglayer::internal::SystemResourceInfo*>(value) = {1000, used.load()};
+        });
+        sync->EnableProcessing();
+
+        // 60 bytes are in use and cannot be evicted; another 20 are evictable.
+        // No load is in progress, and usage is below the periodic eviction watermark.
+        dlist->ChargeLoadedResource({60, 0});
+        ::testing::NiceMock<MockListNode> node(dlist.get(), "evictable");
+        node.test_set_loaded_size({20, 0});
+        node.test_set_state(ListNode::State::CACHED);
+        dlist->ChargeLoadedResource({20, 0});
+        dlist->touchItem(&node, true, ResourceUsage{20, 0});
+        EXPECT_CALL(node, unload()).Times(1);
+
+        // Logical capacity needs 10 bytes freed, but the physical deficit is over 20.
+        // The first attempt therefore cannot evict anything and must wait.
+        auto pending = dlist->ReserveLoadingResourceWithTimeout({30, 0}, std::chrono::milliseconds(-1));
+        EXPECT_FALSE(pending.isReady());
+        EXPECT_EQ(DLF::get_used_memory(*dlist), (ResourceUsage{80, 0}));
+        EXPECT_EQ(DLF::get_loading_memory(*dlist), ResourceUsage{});
+
+        // Simulate another part of the process freeing memory, without notifying DList.
+        // A periodic retry must evict the node and admit the request.
+        used = 800;
+        const bool ready = WaitUntilReady(pending);
+        EXPECT_TRUE(ready);
+        if (ready) {
+            EXPECT_TRUE(std::move(pending).get());
+            EXPECT_EQ(DLF::get_used_memory(*dlist), (ResourceUsage{60, 0}));
+            EXPECT_EQ(DLF::get_loading_memory(*dlist), (ResourceUsage{30, 0}));
+            dlist->ReleaseLoadingResource({30, 0});
+        }
+        sync->Reset();
+    }
+}
+
 TEST(DListBackgroundSchedulingTest, DeferredRequestsAreRestoredInBatches) {
     auto dlist = std::make_shared<DList>(true, ResourceUsage{100, 0}, ResourceUsage{80, 0}, ResourceUsage{90, 0},
                                          EvictionConfig{});

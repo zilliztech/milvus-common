@@ -491,7 +491,9 @@ DList::reserveResourceInternalImpl(const ResourceUsage& size, std::function<void
     // Combined logical and physical memory limit check
     bool logical_limit_exceeded = !max_resource_limit_.load().CanHold(required_resources);
     auto physical_eviction_needed = checkPhysicalMemoryLimit(size);
-    if (physical_eviction_needed.AnyGTZero() && !logical_limit_exceeded) {
+    // Even if the logical quota is also exceeded, eviction may satisfy it once physical memory recovers.
+    // Request periodic retries now: tryEvict() can fail before reaching the post-eviction check below.
+    if (physical_eviction_needed.AnyGTZero()) {
         waiting_for_physical_memory_ = true;
     }
 
