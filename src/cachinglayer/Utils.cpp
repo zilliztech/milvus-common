@@ -12,10 +12,12 @@
 #include "cachinglayer/Utils.h"
 
 #include <algorithm>
+#include <charconv>
 #include <cstring>
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "log/Log.h"
@@ -291,48 +293,51 @@ getSystemDiskInfo(const std::string& disk_path) {
 int64_t
 getCurrentProcessMemoryUsage() {
 #ifdef __linux__
+#ifdef MCL_ENABLE_TEST_CGROUP_OVERRIDE
+    const char* status_path = std::getenv("MCL_PROC_STATUS");
+    std::ifstream status(status_path ? status_path : "/proc/self/status");
+#else
     std::ifstream status("/proc/self/status");
+#endif
     if (!status.is_open()) {
         LOG_WARN("[MCL] Failed to open /proc/self/status, returning 0");
         return 0;
     }
 
     int64_t rss = 0;
-    int64_t shared = 0;
+    int64_t file_rss = 0;
+    bool have_rss = false;
+    bool have_file_rss = false;
     std::string line;
-
+    // Reuse line storage and parse in place; proc field offsets can change between reads.
     while (std::getline(status, line)) {
-        if (line.find("VmRSS:") == 0) {
-            std::istringstream iss(line);
-            std::string key;
-            int64_t value;
-            std::string unit;
-
-            if (iss >> key >> value >> unit) {
-                // Convert kB to bytes
-                if (unit == "kB") {
-                    value *= 1024;
-                }
-                rss = value;
-            }
-        } else if (line.find("RssFile:") == 0) {
-            std::istringstream iss(line);
-            std::string key;
-            int64_t value;
-            std::string unit;
-
-            if (iss >> key >> value >> unit) {
-                // Convert kB to bytes
-                if (unit == "kB") {
-                    value *= 1024;
-                }
-                shared = value;
-            }
+        const std::string_view field(line);
+        const bool is_rss = field.starts_with("VmRSS:");
+        const bool is_file_rss = field.starts_with("RssFile:");
+        if (!is_rss && !is_file_rss) {
+            continue;
+        }
+        const auto start = field.find_first_not_of(" \t", is_rss ? 6 : 8);
+        if (start == std::string_view::npos) {
+            return 0;
+        }
+        int64_t value = 0;
+        const auto result = std::from_chars(field.data() + start, field.data() + field.size(), value);
+        if (result.ec != std::errc{} || value < 0 || value > std::numeric_limits<int64_t>::max() / 1024) {
+            return 0;
+        }
+        if (is_rss) {
+            rss = value * 1024;
+            have_rss = true;
+        } else {
+            file_rss = value * 1024;
+            have_file_rss = true;
+        }
+        if (have_rss && have_file_rss) {
+            return rss - file_rss;
         }
     }
-
-    // Return RSS - Shared (file-backed memory) to match Go implementation
-    return rss - shared;
+    return 0;
 #elif defined(__APPLE__)
     task_vm_info_data_t vm_info;
     mach_msg_type_number_t count = TASK_VM_INFO_COUNT;

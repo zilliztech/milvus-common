@@ -2246,6 +2246,95 @@ TEST(DListBackgroundSchedulingTest, ReleaseDoesNotWaitForListLockWithQueuedReque
 }
 
 #ifdef ENABLE_SYNCPOINT
+TEST(DListBackgroundSchedulingTest, SamplesOnlyRetryPhysicalBlockers) {
+    for (const bool physical : {false, true}) {
+        SCOPED_TRACE(physical);
+        auto dlist = std::make_shared<DList>(true, ResourceUsage{100, 0}, ResourceUsage{80, 0}, ResourceUsage{90, 0},
+                                             EvictionConfig{});
+        if (physical) {
+            DLF::set_memory_snapshot(*dlist, {100, 95});
+        } else {
+            ASSERT_TRUE(
+                std::move(dlist->ReserveLoadingResourceWithTimeout({100, 0}, std::chrono::milliseconds(0))).get());
+        }
+        auto pending = dlist->ReserveLoadingResourceWithTimeout({1, 0}, std::chrono::milliseconds(-1));
+        ASSERT_FALSE(pending.isReady());
+        auto* sync = milvus::SyncPoint::GetInstance();
+        sync->Reset();
+        auto reset = folly::makeGuard([&] { sync->Reset(); });
+        std::atomic<int> attempts{0};
+        int samples = 0;
+        std::promise<void> sampled;
+        auto sampled_future = sampled.get_future();
+        sync->SetCallBack("DList::ReserveResourceInternal", [&](void*) { ++attempts; });
+        sync->SetCallBack("DList::MemorySnapshot", [&](void* value) {
+            *static_cast<milvus::cachinglayer::internal::SystemResourceInfo*>(value) = {1000, 0};
+            ++samples;
+        });
+        sync->SetCallBack("DList::WaitingBatchComplete", [&](void*) {
+            if (samples == 2) {
+                ++samples;
+                sampled.set_value();
+            }
+        });
+        sync->EnableProcessing();
+        EXPECT_EQ(sampled_future.wait_for(std::chrono::seconds(3)), std::future_status::ready);
+        sync->Reset();
+        if (physical) {
+            EXPECT_TRUE(std::move(pending).get(std::chrono::seconds(1)));
+            EXPECT_EQ(attempts, 1);
+        } else {
+            EXPECT_FALSE(pending.isReady());
+            EXPECT_EQ(attempts, 0);
+            dlist->ReleaseLoadingResource({100, 0});
+            EXPECT_TRUE(std::move(pending).get(std::chrono::seconds(1)));
+        }
+        dlist->ReleaseLoadingResource({1, 0});
+    }
+}
+
+TEST(DListBackgroundSchedulingTest, DeferredRequestsAreRestoredInBatches) {
+    auto dlist = std::make_shared<DList>(true, ResourceUsage{100, 0}, ResourceUsage{80, 0}, ResourceUsage{90, 0},
+                                         EvictionConfig{});
+    ASSERT_TRUE(std::move(dlist->ReserveLoadingResourceWithTimeout({100, 0}, std::chrono::milliseconds(0))).get());
+    std::vector<folly::SemiFuture<bool>> pending;
+    pending.reserve(130);
+    for (int i = 0; i < 130; ++i) {
+        pending.push_back(dlist->ReserveLoadingResourceWithTimeout({1, 0}, std::chrono::milliseconds(-1)));
+    }
+    auto* sync = milvus::SyncPoint::GetInstance();
+    sync->Reset();
+    auto reset = folly::makeGuard([&] { sync->Reset(); });
+    const auto worker = DLF::background_thread_id(*dlist);
+    size_t previous_size = 130;
+    int restore_batches = 0;
+    std::promise<void> finished;
+    auto finish = finished.get_future();
+    bool completed = false;
+    sync->SetCallBack("DList::WaitingBatchComplete", [&](void* value) {
+        if (std::this_thread::get_id() != worker || completed) {
+            return;
+        }
+        // Taking the lock here also verifies that the worker releases it between batches.
+        const auto size = DLF::waiting_queue_size(*dlist);
+        if (size > previous_size) {
+            EXPECT_LE(size - previous_size, 64);
+            ++restore_batches;
+        }
+        previous_size = size;
+        if (!*static_cast<bool*>(value)) {
+            completed = true;
+            finished.set_value();
+        }
+    });
+    sync->EnableProcessing();
+    dlist->ReleaseLoadingResource({0, 0});
+    EXPECT_EQ(finish.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    sync->Reset();
+    EXPECT_EQ(restore_batches, 3);
+    EXPECT_EQ(DLF::waiting_queue_size(*dlist), 130);
+}
+
 TEST(DListBackgroundSchedulingTest, PhysicalEvictionWaitsForFreshSnapshot) {
     auto dlist = std::make_shared<DList>(true, ResourceUsage{100, 0}, ResourceUsage{80, 0}, ResourceUsage{90, 0},
                                          EvictionConfig{});

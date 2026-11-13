@@ -445,12 +445,16 @@ DList::reserveResourceInternalWithOverhead(const LoadingResourceUsage& usage, co
 
 std::pair<bool, ResourceUsage>
 DList::reserveResourceInternalImpl(const ResourceUsage& size, std::function<void()> rollback) {
+    TEST_SYNC_POINT("DList::ReserveResourceInternal");
     const auto using_resources = total_loaded_size_.load() + total_loading_size_.load();
     const auto required_resources = using_resources + size;
 
     // Combined logical and physical memory limit check
     const bool logical_limit_exceeded = !max_resource_limit_.load().CanHold(required_resources);
     const auto physical_eviction_needed = checkPhysicalMemoryLimit(size);
+    if (physical_eviction_needed.AnyGTZero() && (!logical_limit_exceeded || physical_eviction_pending_refresh_)) {
+        waiting_for_memory_sample_ = true;
+    }
     if (physical_eviction_needed.AnyGTZero() && physical_eviction_pending_refresh_) {
         rollback();
         return {false, {}};
@@ -505,6 +509,7 @@ DList::reserveResourceInternalImpl(const ResourceUsage& size, std::function<void
             // The cached RSS cannot reflect this eviction. Retry after the next sample instead
             // of evicting repeatedly against the same measurement or admitting on a guessed RSS.
             physical_eviction_pending_refresh_ = true;
+            waiting_for_memory_sample_ = true;
             rollback();
             return {false, {}};
         }
@@ -520,21 +525,31 @@ DList::reserveResourceInternalImpl(const ResourceUsage& size, std::function<void
 void
 DList::evictionLoop() {
     constexpr auto kSampleInterval = std::chrono::milliseconds(500);
+    constexpr auto kLimitInterval = std::chrono::seconds(5);
     const auto eviction_interval = std::max(eviction_config_.eviction_interval, std::chrono::milliseconds(1));
     auto next_sample = std::chrono::steady_clock::now() + kSampleInterval;
     auto next_eviction = eviction_config_.background_eviction_enabled
                              ? std::chrono::steady_clock::now() + eviction_interval
                              : std::chrono::steady_clock::time_point::max();
+    auto next_limit_sample = std::chrono::steady_clock::now() + kLimitInterval;
+    int64_t cached_memory_limit;
+    {
+        std::lock_guard lock(list_mtx_);
+        cached_memory_limit = system_memory_total_bytes_;
+    }
     bool scanning = false;
+    bool restoring = false;
+    bool retry_requested = false;
     std::vector<std::unique_ptr<WaitingRequest>> deferred_requests;
     std::optional<std::chrono::steady_clock::time_point> blocked_deadline;
     while (true) {
         {
             std::unique_lock lock(bg_eviction_mtx_);
-            if (!scanning) {
-                bg_eviction_thread_cv_.wait_until(lock, std::min(next_sample, next_eviction), [this] {
-                    return stop_bg_eviction_loop_ || waiting_requests_pending_;
+            if (!scanning && !restoring) {
+                bg_eviction_thread_cv_.wait_until(lock, std::min(next_sample, next_eviction), [this, &retry_requested] {
+                    return stop_bg_eviction_loop_ || waiting_requests_pending_ || retry_requested;
                 });
+                retry_requested |= waiting_requests_pending_;
                 waiting_requests_pending_ = false;
             }
             if (stop_bg_eviction_loop_) {
@@ -544,7 +559,13 @@ DList::evictionLoop() {
 
         std::optional<SystemResourceInfo> sample;
         if (std::chrono::steady_clock::now() >= next_sample) {
-            sample = getSystemMemoryInfo();
+            if (std::chrono::steady_clock::now() >= next_limit_sample) {
+                sample = getSystemMemoryInfo();
+                cached_memory_limit = sample->total_bytes;
+                next_limit_sample = std::chrono::steady_clock::now() + kLimitInterval;
+            } else {
+                sample = SystemResourceInfo{cached_memory_limit, getCurrentProcessMemoryUsage()};
+            }
             TEST_SYNC_POINT_CALLBACK("DList::MemorySnapshot", &*sample);
             next_sample = std::chrono::steady_clock::now() + kSampleInterval;
         }
@@ -552,6 +573,8 @@ DList::evictionLoop() {
         {
             std::unique_lock lock(list_mtx_);
             if (sample) {
+                // shortcut: Physical retries scan the shared queue; split it if mixed-queue retries become costly.
+                retry_requested |= waiting_for_memory_sample_;
                 system_memory_total_bytes_ = sample->total_bytes;
                 // shortcut: Sampling may overwrite concurrent charges; use generations if stricter accounting is
                 // needed.
@@ -568,15 +591,30 @@ DList::evictionLoop() {
                         ? using_resources.file_bytes - low_watermark_.load().file_bytes
                         : 0,
                 };
-                tryEvict(eviction_target, {}, eviction_config_.cache_cell_unaccessed_survival_time.count() > 0);
+                retry_requested |=
+                    tryEvict(eviction_target, {}, eviction_config_.cache_cell_unaccessed_survival_time.count() > 0)
+                        .AnyGTZero();
                 next_eviction = std::chrono::steady_clock::now() + eviction_interval;
             }
-            scanning = handleWaitingRequests(completions, deferred_requests, blocked_deadline);
-            if (!scanning) {
-                for (auto& request : deferred_requests) {
-                    waiting_queue_.push(std::move(request));
+            if (!scanning && !restoring && retry_requested) {
+                retry_requested = false;
+                waiting_for_memory_sample_ = false;
+                scanning = true;
+            }
+            if (restoring) {
+                // Restore separately so both scanning and reinsertion release the lock every 64 requests.
+                for (size_t i = 0; i < 64 && !deferred_requests.empty(); ++i) {
+                    waiting_queue_.push(std::move(deferred_requests.back()));
+                    deferred_requests.pop_back();
                 }
-                deferred_requests.clear();
+                restoring = !deferred_requests.empty();
+            } else if (scanning) {
+                scanning = handleWaitingRequests(completions, deferred_requests, blocked_deadline);
+                if (!scanning) {
+                    restoring = !deferred_requests.empty();
+                }
+            }
+            if (!scanning && !restoring) {
                 blocked_deadline.reset();
             }
             reservation_notifications_needed_ = !waiting_requests_map_.empty();
@@ -587,7 +625,8 @@ DList::evictionLoop() {
             event_base_thread_->getEventBase()->runInEventBaseThread(
                 [completions = std::move(completions)]() mutable { completeWaitingRequests(completions); });
         }
-        TEST_SYNC_POINT_CALLBACK("DList::WaitingBatchComplete", &scanning);
+        bool more_batches = scanning || restoring;
+        TEST_SYNC_POINT_CALLBACK("DList::WaitingBatchComplete", &more_batches);
     }
     // Shutdown joins this thread before clearing the queue, including deferred requests.
     std::lock_guard lock(list_mtx_);

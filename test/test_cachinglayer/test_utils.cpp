@@ -9,6 +9,7 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
+#include <folly/ScopeGuard.h>
 #include <gtest/gtest.h>
 
 #include <chrono>
@@ -16,11 +17,17 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "cachinglayer/Utils.h"
+#include "cachinglayer/lrucache/DList.h"
+#include "cachinglayer_test_utils.h"
+#include "syncpoint/sync_point.h"
 
 namespace fs = std::filesystem;
 using milvus::cachinglayer::internal::getContainerMemLimit;
@@ -340,3 +347,73 @@ TEST(Utils, GetCurrentProcessMemoryUsageNonNegative) {
     int64_t usage = getCurrentProcessMemoryUsage();
     EXPECT_GE(usage, 0);
 }
+
+TEST(Utils, ProcessMemoryUsageHandlesVariableFieldOffsets) {
+#ifdef __linux__
+    const auto root = CreateTempDir("mcl_status_");
+    const auto path = root / "status";
+    EnvGuard guard("MCL_PROC_STATUS", path.c_str());
+    for (const auto& [content, expected] : std::vector<std::pair<std::string, int64_t>>{
+             {"Name:\tqn\nVmRSS:\t100 kB\nRssAnon:\t50 kB\nRssFile:\t30 kB\nRssShmem:\t20 kB\n", 70 * 1024},
+             {"Name:\tlonger-process-name\nVmSize:\t123456789 kB\nRssFile: 300 kB\nVmRSS: 1000 kB\n", 700 * 1024}}) {
+        std::ofstream(path) << content;
+        EXPECT_EQ(getCurrentProcessMemoryUsage(), expected);
+    }
+    for (const auto& content :
+         {"VmRSS: invalid kB\nRssFile: 1 kB\n", "VmRSS: 10 kB\n", "VmRSS: 9223372036854775807 kB\nRssFile: 1 kB\n"}) {
+        std::ofstream(path) << content;
+        EXPECT_EQ(getCurrentProcessMemoryUsage(), 0);
+    }
+    fs::remove_all(root);
+#else
+    GTEST_SKIP() << "proc status is Linux-specific";
+#endif
+}
+
+#if defined(__linux__) && defined(ENABLE_SYNCPOINT)
+TEST(Utils, DListCachesMemoryLimitForFiveSeconds) {
+    const auto root = CreateTempDir("mcl_limit_cache_");
+    const auto proc = root / "cgroup";
+    std::ofstream(proc) << "0::/test.slice\n";
+    const auto limit_path = root / "memory.max";
+    std::ofstream(limit_path) << "67108864\n";
+    EnvGuard root_guard("MCL_CGROUP_ROOT", root.c_str());
+    EnvGuard proc_guard("MCL_PROC_CGROUP", proc.c_str());
+    EnvGuard mem_guard("MEM_LIMIT", nullptr);
+    auto cleanup = folly::makeGuard([&] { fs::remove_all(root); });
+    auto dlist = std::make_shared<milvus::cachinglayer::internal::DList>(
+        true, milvus::cachinglayer::ResourceUsage{100, 0}, milvus::cachinglayer::ResourceUsage{80, 0},
+        milvus::cachinglayer::ResourceUsage{90, 0}, milvus::cachinglayer::EvictionConfig{});
+    const auto worker = milvus::cachinglayer::internal::DListTestFriend::background_thread_id(*dlist);
+    std::promise<int64_t> first_sample;
+    auto first = first_sample.get_future();
+    std::promise<void> refreshed;
+    auto refresh = refreshed.get_future();
+    bool saw_first = false;
+    bool saw_refresh = false;
+    auto* sync = milvus::SyncPoint::GetInstance();
+    sync->Reset();
+    auto reset = folly::makeGuard([&] { sync->Reset(); });
+    sync->SetCallBack("DList::MemorySnapshot", [&](void* value) {
+        if (std::this_thread::get_id() != worker) {
+            return;
+        }
+        const auto total = static_cast<SystemResourceInfo*>(value)->total_bytes;
+        if (!saw_first) {
+            saw_first = true;
+            first_sample.set_value(total);
+        }
+        if (total == 134217728 && !saw_refresh) {
+            saw_refresh = true;
+            refreshed.set_value();
+        }
+    });
+    sync->EnableProcessing();
+    const auto start = std::chrono::steady_clock::now();
+    std::ofstream(limit_path) << "134217728\n";
+    ASSERT_EQ(first.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    EXPECT_EQ(first.get(), 67108864);
+    EXPECT_EQ(refresh.wait_until(start + std::chrono::seconds(4)), std::future_status::timeout);
+    EXPECT_EQ(refresh.wait_until(start + std::chrono::seconds(7)), std::future_status::ready);
+}
+#endif

@@ -407,6 +407,7 @@ class DList : public std::enable_shared_from_this<DList> {
     int64_t system_memory_total_bytes_;
     std::atomic<int64_t> estimated_memory_usage_;
     bool physical_eviction_pending_refresh_{false};
+    bool waiting_for_memory_sample_{false};  // Protected by list_mtx_.
 
     std::thread bg_eviction_thread_;
     std::mutex bg_eviction_mtx_;
