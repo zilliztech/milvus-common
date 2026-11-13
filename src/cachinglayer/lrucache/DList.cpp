@@ -555,8 +555,9 @@ DList::reserveResourceInternalImpl(const ResourceUsage& size, std::function<void
 
 void
 DList::evictionLoop() {
+    // Use 500ms for a nonpositive interval so physical-memory waiters still get periodic retries.
     const auto eviction_interval = eviction_config_.eviction_interval.count() > 0 ? eviction_config_.eviction_interval
-                                                                                  : std::chrono::milliseconds(1000);
+                                                                                  : std::chrono::milliseconds(500);
     auto next_eviction = std::chrono::steady_clock::now() + eviction_interval;
     bool scanning = false;
     bool restoring = false;
