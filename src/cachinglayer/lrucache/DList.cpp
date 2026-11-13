@@ -135,23 +135,25 @@ DList::UpdateLoadingOverheadGroup(const LoadingOverheadGroupHandle& group, Loadi
 folly::SemiFuture<LoadingResourceReservationResult>
 DList::ReserveLoadingResourceWithTimeout(const LoadingResourceUsage& usage, const LoadingOverheadConfig* config,
                                          std::chrono::milliseconds timeout, OpContext* ctx) {
-    // 1. Protect the transition from an immediate attempt to a queued request with one lock.
-    // Arm notifications before checking resources: ReleaseLoadingResource can run without list_mtx_.
+    // 1. Hold the lock until we have reserved resources or added this request to the queue.
+    // This prevents the background worker from checking the queue before our request is in it.
     std::unique_lock<std::mutex> lock(list_mtx_);
+    // Resource releases do not always take this lock. Enable notifications before checking
+    // resources, so a concurrent release wakes the worker even if we have not queued the request yet.
     reservation_notifications_needed_ = true;
-    // On every exit, keep notifications enabled only if requests remain; this guard runs before unlock.
+    // Before returning and unlocking, disable notifications if no requests are left waiting.
     auto restore_notifications =
         folly::makeGuard([&] { reservation_notifications_needed_ = !waiting_requests_map_.empty(); });
     TEST_SYNC_POINT("DList::Reserve:BeforeAttempt");
-    // 2. Try immediately, reconciling shared Group overhead under the same lock.
-    // A failed attempt rolls back its Group reservation before we consider waiting.
+    // 2. Try to reserve now, evicting cached data if needed. The helper accounts for overhead
+    // shared with other requests in the same Group. On failure, it undoes that overhead reservation.
     auto attempt = reserveResourceInternalWithOverhead(usage, config);
     if (attempt.result.success) {
         return folly::makeSemiFuture(attempt.result);
     }
 
-    // Only the request-local minimum can prove the request impossible: shared overhead may shrink
-    // before a retry, so the current Group delta must not be used to reject it permanently.
+    // Fail without waiting if this request alone exceeds capacity. Do not include the extra
+    // shared overhead here: another request may reserve it for the Group before we retry.
     const auto minimum_required_size = RequestLocalLoading(usage, config) * eviction_config_.loading_resource_factor;
     if (!max_resource_limit_.load().CanHold(minimum_required_size)) {
         LOG_ERROR(
@@ -161,13 +163,15 @@ DList::ReserveLoadingResourceWithTimeout(const LoadingResourceUsage& usage, cons
         return folly::makeSemiFuture(LoadingResourceReservationResult{});
     }
 
-    // Zero timeout is best-effort: return failure instead of enqueueing.
+    // timeout == 0 means the caller does not want to wait after the attempt above fails.
     if (timeout.count() == 0) {
         return folly::makeSemiFuture(LoadingResourceReservationResult{});
     }
 
-    // 3. Enqueue while still holding list_mtx_. A negative timeout has no expiry and sorts last.
-    // The queue owns the request; the map indexes active requests and arbitrates completion races.
+    // 3. Resources are unavailable, so add the request to the waiting queue before unlocking.
+    // The queue decides retry order. The map records which requests still need a result;
+    // once a request is removed from the map, later timeout/cancel callbacks must ignore it.
+    // A negative timeout means wait indefinitely, behind requests with a finite deadline.
     TEST_SYNC_POINT("DList::Reserve:BeforeEnqueue");
     auto deadline =
         timeout.count() > 0 ? std::chrono::steady_clock::now() + timeout : std::chrono::steady_clock::time_point::max();
@@ -179,11 +183,13 @@ DList::ReserveLoadingResourceWithTimeout(const LoadingResourceUsage& usage, cons
     WaitingRequest* request_ptr = waiting_request.get();
     waiting_requests_map_[request_id] = request_ptr;
     waiting_queue_.push(std::move(waiting_request));
+    // A pending callback must not keep DList alive; it exits if DList has been destroyed.
     std::weak_ptr<DList> weak_self = shared_from_this();
 
-    // 4. Schedule finite timeouts on EventBase. Weak captures do not keep DList alive.
-    // The handler removes the active request under list_mtx_, then fulfills its promise after unlock;
-    // if reservation/cancellation already claimed it, failWaitingRequest does nothing.
+    // 4. For a positive timeout, ask the EventBase thread to fail the request after the delay.
+    // If the request has already succeeded or been cancelled, failWaitingRequest does nothing.
+    // Record failure under the lock, then deliver the result after unlocking: delivering a result
+    // can run caller code that needs this same lock.
     if (timeout.count() > 0) {
         LOG_DEBUG("[MCL] Request {} resident={} private={} shared={} added to waiting queue, timeout={}ms", request_id,
                   usage.resident.ToString(), usage.private_overhead.ToString(), usage.shared_overhead.ToString(),
@@ -211,8 +217,9 @@ DList::ReserveLoadingResourceWithTimeout(const LoadingResourceUsage& usage, cons
         });
     }
 
-    // 5. Register cancellation after publishing the request. Registration may invoke the callback
-    // immediately, so dispatch to EventBase instead of reacquiring the list_mtx_ held here.
+    // 5. Let the caller cancel while waiting. If the token is already cancelled, emplace()
+    // may run this callback immediately while we still hold list_mtx_. Send the work to EventBase
+    // so the callback does not try to take the same lock again and deadlock.
     if (ctx && ctx->cancellation_token.canBeCancelled()) {
         request_ptr->cancel_cb.emplace(ctx->cancellation_token, [weak_self, request_id]() {
             auto self = weak_self.lock();
@@ -234,8 +241,9 @@ DList::ReserveLoadingResourceWithTimeout(const LoadingResourceUsage& usage, cons
         });
     }
 
-    // 6. Return the pending result without waiting. The background worker retries reservations;
-    // success, timeout, cancellation, or shutdown completes the promise outside list_mtx_.
+    // 6. Return a future now; this function does not wait for resources.
+    // The background worker retries the queued request. The caller receives success when resources
+    // are reserved, or failure if the request times out, is cancelled, or DList shuts down.
     return std::move(future);
 }
 
@@ -246,16 +254,18 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std
     // loading_resource_factor to avoid potential problems from bad resource estimation.
     const auto size = original_size * eviction_config_.loading_resource_factor;
 
-    // 1. Protect the transition from an immediate attempt to a queued request with one lock.
-    // Arm notifications before checking resources: ReleaseLoadingResource can run without list_mtx_.
+    // 1. Hold the lock until we have reserved resources or added this request to the queue.
+    // This prevents the background worker from checking the queue before our request is in it.
     std::unique_lock<std::mutex> lock(list_mtx_);
+    // Resource releases do not always take this lock. Enable notifications before checking
+    // resources, so a concurrent release wakes the worker even if we have not queued the request yet.
     reservation_notifications_needed_ = true;
-    // On every exit, keep notifications enabled only if requests remain; this guard runs before unlock.
+    // Before returning and unlocking, disable notifications if no requests are left waiting.
     auto restore_notifications =
         folly::makeGuard([&] { reservation_notifications_needed_ = !waiting_requests_map_.empty(); });
     TEST_SYNC_POINT("DList::Reserve:BeforeAttempt");
-    // 2. Reject requests larger than the entire capacity, then try to reserve (including eviction).
-    // Success returns an already-completed future; timeout == 0 never enters the waiting queue.
+    // 2. Fail without waiting if the request exceeds capacity. Otherwise try to reserve now,
+    // evicting cached data if needed. On success, return a future that already contains true.
     if (!max_resource_limit_.load().CanHold(size)) {
         LOG_ERROR("[MCL] Failed to reserve size={} as it exceeds max_memory_={}.", size.ToString(),
                   max_resource_limit_.load().ToString());
@@ -265,13 +275,15 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std
         return folly::makeSemiFuture(true);
     }
 
-    // Zero timeout means best-effort: fail immediately without entering the waiting queue.
+    // timeout == 0 means the caller does not want to wait after the attempt above fails.
     if (timeout.count() == 0) {
         return folly::makeSemiFuture(false);
     }
 
-    // 3. Enqueue while still holding list_mtx_. A negative timeout has no expiry and sorts last.
-    // The queue owns the request; the map indexes active requests and arbitrates completion races.
+    // 3. Resources are unavailable, so add the request to the waiting queue before unlocking.
+    // The queue decides retry order. The map records which requests still need a result;
+    // once a request is removed from the map, later timeout/cancel callbacks must ignore it.
+    // A negative timeout means wait indefinitely, behind requests with a finite deadline.
     TEST_SYNC_POINT("DList::Reserve:BeforeEnqueue");
     auto deadline =
         timeout.count() > 0 ? std::chrono::steady_clock::now() + timeout : std::chrono::steady_clock::time_point::max();
@@ -283,11 +295,13 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std
     WaitingRequest* request_ptr = waiting_request.get();
     waiting_requests_map_[request_id] = request_ptr;
     waiting_queue_.push(std::move(waiting_request));
+    // A pending callback must not keep DList alive; it exits if DList has been destroyed.
     std::weak_ptr<DList> weak_self = shared_from_this();
 
-    // 4. Schedule finite timeouts on EventBase. Weak captures do not keep DList alive.
-    // The handler removes the active request under list_mtx_, then fulfills its promise after unlock;
-    // if reservation/cancellation already claimed it, failWaitingRequest does nothing.
+    // 4. For a positive timeout, ask the EventBase thread to fail the request after the delay.
+    // If the request has already succeeded or been cancelled, failWaitingRequest does nothing.
+    // Record failure under the lock, then deliver the result after unlocking: delivering a result
+    // can run caller code that needs this same lock.
     if (timeout.count() > 0) {
         LOG_DEBUG(
             "[MCL] Request {} size {} added to waiting queue, scheduling timeout "
@@ -316,8 +330,9 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std
         });
     }
 
-    // 5. Register cancellation after publishing the request. Registration may invoke the callback
-    // immediately, so dispatch to EventBase instead of reacquiring the list_mtx_ held here.
+    // 5. Let the caller cancel while waiting. If the token is already cancelled, emplace()
+    // may run this callback immediately while we still hold list_mtx_. Send the work to EventBase
+    // so the callback does not try to take the same lock again and deadlock.
     if (ctx && ctx->cancellation_token.canBeCancelled()) {
         request_ptr->cancel_cb.emplace(ctx->cancellation_token, [weak_self, request_id]() {
             auto self = weak_self.lock();
@@ -339,8 +354,9 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std
         });
     }
 
-    // 6. Return the pending result without waiting. The background worker retries reservations;
-    // success, timeout, cancellation, or shutdown completes the promise outside list_mtx_.
+    // 6. Return a future now; this function does not wait for resources.
+    // The background worker retries the queued request. The caller receives success when resources
+    // are reserved, or failure if the request times out, is cancelled, or DList shuts down.
     return std::move(future);
 }
 
