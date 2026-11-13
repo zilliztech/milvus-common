@@ -562,15 +562,21 @@ DList::evictionLoop() {
     bool scanning = false;
     bool restoring = false;
     bool retry_requested = false;
+    // Keep requests that could not reserve resources out of the queue until this scan finishes,
+    // so the next batch can try other requests with the same deadline instead of retrying these.
     std::vector<std::unique_ptr<WaitingRequest>> deferred_requests;
     std::optional<std::chrono::steady_clock::time_point> blocked_deadline;
     while (true) {
+        // 1. When no batch is in progress, wait for a notification or the next periodic check.
+        // Between batches, continue immediately but still check whether shutdown was requested.
         {
             std::unique_lock lock(bg_eviction_mtx_);
             if (!scanning && !restoring) {
                 bg_eviction_thread_cv_.wait_until(lock, next_eviction, [this, &retry_requested] {
                     return stop_bg_eviction_loop_ || waiting_requests_pending_ || retry_requested;
                 });
+                // Several notifications need only one scan. Notifications received during a scan
+                // stay in waiting_requests_pending_ and cause another scan after the current one.
                 retry_requested |= waiting_requests_pending_;
                 waiting_requests_pending_ = false;
             }
@@ -582,10 +588,15 @@ DList::evictionLoop() {
         std::vector<WaitingRequestCompletion> completions;
         {
             std::unique_lock lock(list_mtx_);
+            // 2. On each periodic check, retry requests blocked by physical memory: other parts of
+            // the process may have freed memory without notifying DList. Do this even if periodic
+            // eviction is disabled. Requests blocked only by DList's quota wait for a notification.
             if (std::chrono::steady_clock::now() >= next_eviction) {
                 // shortcut: Physical retries scan the shared queue; split it if mixed-queue retries become costly.
                 retry_requested |= waiting_for_physical_memory_;
                 if (eviction_config_.background_eviction_enabled) {
+                    // At or above the high watermark, try to evict down to the low watermark.
+                    // If eviction frees resources, also retry the waiting requests.
                     const auto using_resources = total_loaded_size_.load() + total_loading_size_.load();
                     const auto eviction_target = ResourceUsage{
                         using_resources.memory_bytes >= high_watermark_.load().memory_bytes
@@ -601,13 +612,17 @@ DList::evictionLoop() {
                 }
                 next_eviction = std::chrono::steady_clock::now() + eviction_interval;
             }
+            // 3. Start a requested scan once the previous scan and reinsertion are finished.
+            // Clear the physical-memory flag; reservation attempts set it again if still blocked.
             if (!scanning && !restoring && retry_requested) {
                 retry_requested = false;
                 waiting_for_physical_memory_ = false;
                 scanning = true;
             }
+            // 4. Process one batch under list_mtx_, then unlock before the next batch so other
+            // threads can use the list. Both reservation attempts and reinsertion are limited to 64.
             if (restoring) {
-                // Restore separately so both scanning and reinsertion release the lock every 64 requests.
+                // Put unsuccessful requests back only after the scan has finished.
                 for (size_t i = 0; i < 64 && !deferred_requests.empty(); ++i) {
                     waiting_queue_.push(std::move(deferred_requests.back()));
                     deferred_requests.pop_back();
@@ -622,10 +637,12 @@ DList::evictionLoop() {
             if (!scanning && !restoring) {
                 blocked_deadline.reset();
             }
+            // Resource releases need to wake this worker only while requests are still waiting.
             reservation_notifications_needed_ = !waiting_requests_map_.empty();
         }
-        // Inline continuations may release the last DList owner. Deliver on EventBase so
-        // destruction can join this worker before its state goes away.
+        // 5. Deliver results after unlocking, on the EventBase thread. Delivering a result can run
+        // caller code that destroys DList. Its destructor waits for this worker to exit, so doing
+        // that here on the worker itself would make it wait for its own exit.
         if (!completions.empty()) {
             event_base_thread_->getEventBase()->runInEventBaseThread(
                 [completions = std::move(completions)]() mutable { completeWaitingRequests(completions); });
@@ -633,7 +650,8 @@ DList::evictionLoop() {
         bool more_batches = scanning || restoring;
         TEST_SYNC_POINT_CALLBACK("DList::WaitingBatchComplete", &more_batches);
     }
-    // Shutdown joins this thread before clearing the queue, including deferred requests.
+    // 6. Before exiting, return any temporarily removed requests to the queue. Shutdown waits for
+    // this worker to exit, then clears the queue and reports failure to all remaining callers.
     std::lock_guard lock(list_mtx_);
     for (auto& request : deferred_requests) {
         waiting_queue_.push(std::move(request));
