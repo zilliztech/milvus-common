@@ -569,6 +569,7 @@ DList::reserveResourceInternalImpl(const ResourceUsage& size, std::function<void
 
 void
 DList::backgroundLoop() {
+    folly::setThreadName("milvus-cache-bg");
     // Use 500ms for a nonpositive interval so physical-memory waiters still get periodic retries.
     const auto eviction_interval = eviction_config_.eviction_interval.count() > 0 ? eviction_config_.eviction_interval
                                                                                   : std::chrono::milliseconds(500);
