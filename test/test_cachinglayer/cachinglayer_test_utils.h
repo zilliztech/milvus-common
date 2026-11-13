@@ -32,13 +32,6 @@ class DListTestFriend {
         return dlist.bg_eviction_thread_.get_id();
     }
 
-    static void
-    set_memory_snapshot(DList& dlist, SystemResourceInfo snapshot) {
-        std::lock_guard lock(dlist.list_mtx_);
-        dlist.system_memory_total_bytes_ = snapshot.total_bytes;
-        dlist.estimated_memory_usage_.store(snapshot.used_bytes);
-    }
-
     static size_t
     waiting_queue_size(const DList& dlist) {
         std::lock_guard lock(dlist.list_mtx_);

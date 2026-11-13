@@ -2246,40 +2246,43 @@ TEST(DListBackgroundSchedulingTest, ReleaseDoesNotWaitForListLockWithQueuedReque
 }
 
 #ifdef ENABLE_SYNCPOINT
-TEST(DListBackgroundSchedulingTest, SamplesOnlyRetryPhysicalBlockers) {
+TEST(DListBackgroundSchedulingTest, PeriodicRetriesOnlyForPhysicalBlockers) {
     for (const bool physical : {false, true}) {
         SCOPED_TRACE(physical);
         auto dlist = std::make_shared<DList>(true, ResourceUsage{100, 0}, ResourceUsage{80, 0}, ResourceUsage{90, 0},
                                              EvictionConfig{});
-        if (physical) {
-            DLF::set_memory_snapshot(*dlist, {100, 95});
-        } else {
+        const auto worker = DLF::background_thread_id(*dlist);
+        std::atomic<int64_t> used{physical ? 95 : 0};
+        std::atomic<int> attempts{0};
+        int ticks = 0;
+        std::promise<void> ticked;
+        auto ticked_future = ticked.get_future();
+        auto* sync = milvus::SyncPoint::GetInstance();
+        sync->Reset();
+        auto reset = folly::makeGuard([&] { sync->Reset(); });
+        sync->SetCallBack("DList::PhysicalMemoryInfo", [&](void* value) {
+            *static_cast<milvus::cachinglayer::internal::SystemResourceInfo*>(value) = {physical ? 100 : 1000,
+                                                                                        used.load()};
+        });
+        sync->SetCallBack("DList::ReserveResourceInternal", [&](void*) {
+            if (std::this_thread::get_id() == worker) {
+                ++attempts;
+            }
+        });
+        sync->SetCallBack("DList::WaitingBatchComplete", [&](void*) {
+            if (std::this_thread::get_id() == worker && ++ticks == 2) {
+                ticked.set_value();
+            }
+        });
+        sync->EnableProcessing();
+        if (!physical) {
             ASSERT_TRUE(
                 std::move(dlist->ReserveLoadingResourceWithTimeout({100, 0}, std::chrono::milliseconds(0))).get());
         }
         auto pending = dlist->ReserveLoadingResourceWithTimeout({1, 0}, std::chrono::milliseconds(-1));
         ASSERT_FALSE(pending.isReady());
-        auto* sync = milvus::SyncPoint::GetInstance();
-        sync->Reset();
-        auto reset = folly::makeGuard([&] { sync->Reset(); });
-        std::atomic<int> attempts{0};
-        int samples = 0;
-        std::promise<void> sampled;
-        auto sampled_future = sampled.get_future();
-        sync->SetCallBack("DList::ReserveResourceInternal", [&](void*) { ++attempts; });
-        sync->SetCallBack("DList::MemorySnapshot", [&](void* value) {
-            *static_cast<milvus::cachinglayer::internal::SystemResourceInfo*>(value) = {1000, 0};
-            ++samples;
-        });
-        sync->SetCallBack("DList::WaitingBatchComplete", [&](void*) {
-            if (samples == 2) {
-                ++samples;
-                sampled.set_value();
-            }
-        });
-        sync->EnableProcessing();
-        EXPECT_EQ(sampled_future.wait_for(std::chrono::seconds(3)), std::future_status::ready);
-        sync->Reset();
+        used = 0;
+        EXPECT_EQ(ticked_future.wait_for(std::chrono::seconds(4)), std::future_status::ready);
         if (physical) {
             EXPECT_TRUE(std::move(pending).get(std::chrono::seconds(1)));
             EXPECT_EQ(attempts, 1);
@@ -2289,6 +2292,7 @@ TEST(DListBackgroundSchedulingTest, SamplesOnlyRetryPhysicalBlockers) {
             dlist->ReleaseLoadingResource({100, 0});
             EXPECT_TRUE(std::move(pending).get(std::chrono::seconds(1)));
         }
+        sync->Reset();
         dlist->ReleaseLoadingResource({1, 0});
     }
 }
@@ -2335,36 +2339,26 @@ TEST(DListBackgroundSchedulingTest, DeferredRequestsAreRestoredInBatches) {
     EXPECT_EQ(DLF::waiting_queue_size(*dlist), 130);
 }
 
-TEST(DListBackgroundSchedulingTest, PhysicalEvictionWaitsForFreshSnapshot) {
+TEST(DListBackgroundSchedulingTest, PhysicalEvictionRechecksLiveUsage) {
     auto dlist = std::make_shared<DList>(true, ResourceUsage{100, 0}, ResourceUsage{80, 0}, ResourceUsage{90, 0},
                                          EvictionConfig{});
     auto* sync = milvus::SyncPoint::GetInstance();
     sync->Reset();
     auto reset = folly::makeGuard([&] { sync->Reset(); });
-    sync->SetCallBack("DList::MemorySnapshot", [&](void* value) {
-        // This lock would deadlock if OS sampling moved back under list_mtx_.
-        auto lock = DLF::test_lock_list(dlist.get());
-        *static_cast<milvus::cachinglayer::internal::SystemResourceInfo*>(value) = {100, 0};
+    int reads = 0;
+    sync->SetCallBack("DList::PhysicalMemoryInfo", [&](void* value) {
+        ++reads;
+        *static_cast<milvus::cachinglayer::internal::SystemResourceInfo*>(value) = {100, reads == 1 ? 95 : 75};
     });
     sync->EnableProcessing();
-    ::testing::NiceMock<MockListNode> first(dlist.get(), "first");
-    ::testing::NiceMock<MockListNode> second(dlist.get(), "second");
-    for (auto* node : {&first, &second}) {
-        node->test_set_loaded_size({20, 0});
-        node->test_set_state(ListNode::State::CACHED);
-        dlist->ChargeLoadedResource({20, 0});
-        dlist->touchItem(node, true, ResourceUsage{20, 0});
-    }
-    EXPECT_CALL(first, unload()).Times(1);
-    EXPECT_CALL(second, unload()).Times(0);
-    DLF::set_memory_snapshot(*dlist, {100, 95});
-    EXPECT_FALSE(std::move(dlist->ReserveLoadingResourceWithTimeout({1, 0}, std::chrono::milliseconds(0))).get());
-    EXPECT_FALSE(first.is_loaded_or_cached());
-    auto pending = dlist->ReserveLoadingResourceWithTimeout({1, 0}, std::chrono::milliseconds(-1));
-    ASSERT_FALSE(pending.isReady());
-    // No release notification: a fresh sample alone must retry the waiter.
-    EXPECT_TRUE(std::move(pending).get(std::chrono::seconds(2)));
-    EXPECT_TRUE(second.is_loaded_or_cached());
+    ::testing::NiceMock<MockListNode> node(dlist.get(), "node");
+    node.test_set_loaded_size({20, 0});
+    node.test_set_state(ListNode::State::CACHED);
+    dlist->ChargeLoadedResource({20, 0});
+    dlist->touchItem(&node, true, ResourceUsage{20, 0});
+    EXPECT_CALL(node, unload()).Times(1);
+    EXPECT_TRUE(std::move(dlist->ReserveLoadingResourceWithTimeout({1, 0}, std::chrono::milliseconds(0))).get());
+    EXPECT_EQ(reads, 2);
     dlist->ReleaseLoadingResource({1, 0});
     sync->Reset();
 }
@@ -2441,10 +2435,11 @@ TEST(DListBackgroundSchedulingTest, CompletionCanReleaseLastOwner) {
     EXPECT_TRUE(weak.expired());
 }
 
-TEST(DListMemorySnapshotTest, CompletedLoadsRemainChargedUntilNextSample) {
+#ifdef ENABLE_SYNCPOINT
+TEST(DListPhysicalMemoryTest, EachReservationReadsCurrentUsage) {
     for (const bool group_aware : {false, true}) {
         SCOPED_TRACE(group_aware);
-        // No worker: keep one sample fixed across successive completed loads.
+        // No worker: usage changes must be visible without a periodic refresh.
         auto dlist = std::make_shared<DList>(false, ResourceUsage{1000, 1000}, ResourceUsage{800, 800},
                                              ResourceUsage{900, 900}, EvictionConfig{});
         auto reserve = [&] {
@@ -2463,11 +2458,19 @@ TEST(DListMemorySnapshotTest, CompletedLoadsRemainChargedUntilNextSample) {
                 dlist->ReleaseLoadingResource({150, 0});
             }
         };
-        DLF::set_memory_snapshot(*dlist, {1000, 700});
+        auto* sync = milvus::SyncPoint::GetInstance();
+        sync->Reset();
+        auto reset = folly::makeGuard([&] { sync->Reset(); });
+        int64_t used = 700;
+        sync->SetCallBack("DList::PhysicalMemoryInfo", [&](void* value) {
+            *static_cast<milvus::cachinglayer::internal::SystemResourceInfo*>(value) = {1000, used};
+        });
+        sync->EnableProcessing();
         // Disk residency must not consume physical-memory headroom.
         dlist->ChargeLoadedResource({0, 500});
         ASSERT_TRUE(reserve());
         dlist->ChargeLoadedResource({150, 0});
+        used = 850;
         release();
         EXPECT_EQ(DLF::get_loading_memory(*dlist), ResourceUsage{});
         const bool admitted = reserve();
@@ -2481,8 +2484,10 @@ TEST(DListMemorySnapshotTest, CompletedLoadsRemainChargedUntilNextSample) {
         if (admitted_before_sample) {
             release();
         }
-        DLF::set_memory_snapshot(*dlist, {1000, 700});
+        used = 700;
         EXPECT_TRUE(reserve());
         release();
     }
 }
+
+#endif

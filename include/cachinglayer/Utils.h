@@ -337,6 +337,7 @@ getHostTotalMemory();
 int64_t
 getContainerMemLimit();
 
+// Returns a five-second cached host/container limit and freshly read process usage.
 // Returns unlimited if failed to get memory info, or if the platform is not supported.
 SystemResourceInfo
 getSystemMemoryInfo();

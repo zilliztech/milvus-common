@@ -21,13 +21,21 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #include "cachinglayer/Utils.h"
-#include "cachinglayer/lrucache/DList.h"
-#include "cachinglayer_test_utils.h"
-#include "syncpoint/sync_point.h"
+#ifdef __linux__
+#include <sys/mman.h>
+#endif
+
+namespace milvus::cachinglayer::internal {
+// Defined only in the unit-test build of Utils.cpp.
+void
+resetSystemMemoryLimitCacheForTest();
+}  // namespace milvus::cachinglayer::internal
+using milvus::cachinglayer::internal::resetSystemMemoryLimitCacheForTest;
 
 namespace fs = std::filesystem;
 using milvus::cachinglayer::internal::getContainerMemLimit;
@@ -297,6 +305,8 @@ TEST(Utils, GetContainerMemLimitCgroupV2ProcSpecific) {
 // Verify that getSystemMemoryInfo prefers container limit when smaller than host memory.
 TEST(Utils, GetSystemMemoryInfoUsesContainerLimitWhenSmaller) {
 #ifdef __linux__
+    resetSystemMemoryLimitCacheForTest();
+    auto reset_cache = folly::makeGuard([] { resetSystemMemoryLimitCacheForTest(); });
     fs::path root = CreateTempDir("mcl_sysmem_");
 
     // Minimal cgroup v2-like setup providing a small limit
@@ -355,7 +365,8 @@ TEST(Utils, ProcessMemoryUsageHandlesVariableFieldOffsets) {
     EnvGuard guard("MCL_PROC_STATUS", path.c_str());
     for (const auto& [content, expected] : std::vector<std::pair<std::string, int64_t>>{
              {"Name:\tqn\nVmRSS:\t100 kB\nRssAnon:\t50 kB\nRssFile:\t30 kB\nRssShmem:\t20 kB\n", 70 * 1024},
-             {"Name:\tlonger-process-name\nVmSize:\t123456789 kB\nRssFile: 300 kB\nVmRSS: 1000 kB\n", 700 * 1024}}) {
+             {"Name:\tlonger-process-name\nVmSize:\t123456789 kB\nRssFile: 300 kB\nVmRSS: 1000 kB\n", 700 * 1024},
+             {std::string(4080, 'x') + "\nVmRSS: 10000 kB\nRssFile: 3000 kB\n", 7000 * 1024}}) {
         std::ofstream(path) << content;
         EXPECT_EQ(getCurrentProcessMemoryUsage(), expected);
     }
@@ -370,50 +381,62 @@ TEST(Utils, ProcessMemoryUsageHandlesVariableFieldOffsets) {
 #endif
 }
 
-#if defined(__linux__) && defined(ENABLE_SYNCPOINT)
-TEST(Utils, DListCachesMemoryLimitForFiveSeconds) {
+TEST(Utils, MemoryInfoCachesOnlyTheLimitForFiveSeconds) {
+#ifdef __linux__
+    resetSystemMemoryLimitCacheForTest();
+    auto reset_cache = folly::makeGuard([] { resetSystemMemoryLimitCacheForTest(); });
     const auto root = CreateTempDir("mcl_limit_cache_");
     const auto proc = root / "cgroup";
     std::ofstream(proc) << "0::/test.slice\n";
     const auto limit_path = root / "memory.max";
     std::ofstream(limit_path) << "67108864\n";
+    const auto status_path = root / "status";
+    std::ofstream(status_path) << "VmRSS: 100 kB\nRssFile: 30 kB\n";
     EnvGuard root_guard("MCL_CGROUP_ROOT", root.c_str());
     EnvGuard proc_guard("MCL_PROC_CGROUP", proc.c_str());
     EnvGuard mem_guard("MEM_LIMIT", nullptr);
+    EnvGuard status_guard("MCL_PROC_STATUS", status_path.c_str());
     auto cleanup = folly::makeGuard([&] { fs::remove_all(root); });
-    auto dlist = std::make_shared<milvus::cachinglayer::internal::DList>(
-        true, milvus::cachinglayer::ResourceUsage{100, 0}, milvus::cachinglayer::ResourceUsage{80, 0},
-        milvus::cachinglayer::ResourceUsage{90, 0}, milvus::cachinglayer::EvictionConfig{});
-    const auto worker = milvus::cachinglayer::internal::DListTestFriend::background_thread_id(*dlist);
-    std::promise<int64_t> first_sample;
-    auto first = first_sample.get_future();
-    std::promise<void> refreshed;
-    auto refresh = refreshed.get_future();
-    bool saw_first = false;
-    bool saw_refresh = false;
-    auto* sync = milvus::SyncPoint::GetInstance();
-    sync->Reset();
-    auto reset = folly::makeGuard([&] { sync->Reset(); });
-    sync->SetCallBack("DList::MemorySnapshot", [&](void* value) {
-        if (std::this_thread::get_id() != worker) {
-            return;
-        }
-        const auto total = static_cast<SystemResourceInfo*>(value)->total_bytes;
-        if (!saw_first) {
-            saw_first = true;
-            first_sample.set_value(total);
-        }
-        if (total == 134217728 && !saw_refresh) {
-            saw_refresh = true;
-            refreshed.set_value();
-        }
-    });
-    sync->EnableProcessing();
-    const auto start = std::chrono::steady_clock::now();
+    auto info = getSystemMemoryInfo();
+    EXPECT_EQ(info.total_bytes, 67108864);
+    EXPECT_EQ(info.used_bytes, 70 * 1024);
     std::ofstream(limit_path) << "134217728\n";
-    ASSERT_EQ(first.wait_for(std::chrono::seconds(2)), std::future_status::ready);
-    EXPECT_EQ(first.get(), 67108864);
-    EXPECT_EQ(refresh.wait_until(start + std::chrono::seconds(4)), std::future_status::timeout);
-    EXPECT_EQ(refresh.wait_until(start + std::chrono::seconds(7)), std::future_status::ready);
-}
+    std::ofstream(status_path) << "VmRSS: 200 kB\nRssFile: 30 kB\n";
+    info = getSystemMemoryInfo();
+    EXPECT_EQ(info.total_bytes, 67108864);
+    EXPECT_EQ(info.used_bytes, 170 * 1024);
+    std::this_thread::sleep_for(std::chrono::milliseconds(5100));
+    EXPECT_EQ(getSystemMemoryInfo().total_bytes, 134217728);
+#else
+    GTEST_SKIP() << "cgroups are Linux-specific";
 #endif
+}
+
+TEST(Utils, ReusedProcessStatusFdReadsLiveUsage) {
+#ifdef __linux__
+    constexpr size_t bytes = 32 * 1024 * 1024;
+    const auto before = getCurrentProcessMemoryUsage();
+    void* memory = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(memory, MAP_FAILED);
+    auto release = folly::makeGuard([&] { munmap(memory, bytes); });
+    auto* pages = static_cast<volatile char*>(memory);
+    for (size_t i = 0; i < bytes; i += 4096) {
+        pages[i] = 1;
+    }
+    const auto during = getCurrentProcessMemoryUsage();
+    EXPECT_GT(during - before, static_cast<int64_t>(bytes / 2));
+    std::vector<std::future<int64_t>> readers;
+    readers.reserve(8);
+    for (int i = 0; i < 8; ++i) {
+        readers.push_back(std::async(std::launch::async, [] { return getCurrentProcessMemoryUsage(); }));
+    }
+    for (auto& reader : readers) {
+        EXPECT_GT(reader.get(), static_cast<int64_t>(bytes / 2));
+    }
+    ASSERT_EQ(munmap(memory, bytes), 0);
+    release.dismiss();
+    EXPECT_GT(during - getCurrentProcessMemoryUsage(), static_cast<int64_t>(bytes / 2));
+#else
+    GTEST_SKIP() << "proc status is Linux-specific";
+#endif
+}

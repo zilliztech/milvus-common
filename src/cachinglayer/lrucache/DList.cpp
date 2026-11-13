@@ -451,16 +451,11 @@ DList::reserveResourceInternalImpl(const ResourceUsage& size, std::function<void
 
     // Combined logical and physical memory limit check
     const bool logical_limit_exceeded = !max_resource_limit_.load().CanHold(required_resources);
-    const auto physical_eviction_needed = checkPhysicalMemoryLimit(size);
-    if (physical_eviction_needed.AnyGTZero() && (!logical_limit_exceeded || physical_eviction_pending_refresh_)) {
-        waiting_for_memory_sample_ = true;
-    }
-    if (physical_eviction_needed.AnyGTZero() && physical_eviction_pending_refresh_) {
-        rollback();
-        return {false, {}};
+    const auto physical_eviction_needed = checkPhysicalResourceLimit(size);
+    if (physical_eviction_needed.AnyGTZero() && !logical_limit_exceeded) {
+        waiting_for_physical_memory_ = true;
     }
 
-    // One eviction attempt per physical snapshot; logical capacity is accounted exactly.
     if (logical_limit_exceeded || physical_eviction_needed.AnyGTZero()) {
         ResourceUsage eviction_target;
         ResourceUsage min_eviction;
@@ -505,11 +500,8 @@ DList::reserveResourceInternalImpl(const ResourceUsage& size, std::function<void
             return {false, {}};
         }
 
-        if (physical_eviction_needed.AnyGTZero()) {
-            // The cached RSS cannot reflect this eviction. Retry after the next sample instead
-            // of evicting repeatedly against the same measurement or admitting on a guessed RSS.
-            physical_eviction_pending_refresh_ = true;
-            waiting_for_memory_sample_ = true;
+        if (physical_eviction_needed.AnyGTZero() && checkPhysicalResourceLimit(size).AnyGTZero()) {
+            waiting_for_physical_memory_ = true;
             rollback();
             return {false, {}};
         }
@@ -524,19 +516,9 @@ DList::reserveResourceInternalImpl(const ResourceUsage& size, std::function<void
 
 void
 DList::evictionLoop() {
-    constexpr auto kSampleInterval = std::chrono::milliseconds(500);
-    constexpr auto kLimitInterval = std::chrono::seconds(5);
-    const auto eviction_interval = std::max(eviction_config_.eviction_interval, std::chrono::milliseconds(1));
-    auto next_sample = std::chrono::steady_clock::now() + kSampleInterval;
-    auto next_eviction = eviction_config_.background_eviction_enabled
-                             ? std::chrono::steady_clock::now() + eviction_interval
-                             : std::chrono::steady_clock::time_point::max();
-    auto next_limit_sample = std::chrono::steady_clock::now() + kLimitInterval;
-    int64_t cached_memory_limit;
-    {
-        std::lock_guard lock(list_mtx_);
-        cached_memory_limit = system_memory_total_bytes_;
-    }
+    const auto eviction_interval = eviction_config_.eviction_interval.count() > 0 ? eviction_config_.eviction_interval
+                                                                                  : std::chrono::milliseconds(1000);
+    auto next_eviction = std::chrono::steady_clock::now() + eviction_interval;
     bool scanning = false;
     bool restoring = false;
     bool retry_requested = false;
@@ -546,7 +528,7 @@ DList::evictionLoop() {
         {
             std::unique_lock lock(bg_eviction_mtx_);
             if (!scanning && !restoring) {
-                bg_eviction_thread_cv_.wait_until(lock, std::min(next_sample, next_eviction), [this, &retry_requested] {
+                bg_eviction_thread_cv_.wait_until(lock, next_eviction, [this, &retry_requested] {
                     return stop_bg_eviction_loop_ || waiting_requests_pending_ || retry_requested;
                 });
                 retry_requested |= waiting_requests_pending_;
@@ -557,48 +539,31 @@ DList::evictionLoop() {
             }
         }
 
-        std::optional<SystemResourceInfo> sample;
-        if (std::chrono::steady_clock::now() >= next_sample) {
-            if (std::chrono::steady_clock::now() >= next_limit_sample) {
-                sample = getSystemMemoryInfo();
-                cached_memory_limit = sample->total_bytes;
-                next_limit_sample = std::chrono::steady_clock::now() + kLimitInterval;
-            } else {
-                sample = SystemResourceInfo{cached_memory_limit, getCurrentProcessMemoryUsage()};
-            }
-            TEST_SYNC_POINT_CALLBACK("DList::MemorySnapshot", &*sample);
-            next_sample = std::chrono::steady_clock::now() + kSampleInterval;
-        }
         std::vector<WaitingRequestCompletion> completions;
         {
             std::unique_lock lock(list_mtx_);
-            if (sample) {
-                // shortcut: Physical retries scan the shared queue; split it if mixed-queue retries become costly.
-                retry_requested |= waiting_for_memory_sample_;
-                system_memory_total_bytes_ = sample->total_bytes;
-                // shortcut: Sampling may overwrite concurrent charges; use generations if stricter accounting is
-                // needed.
-                estimated_memory_usage_.store(sample->used_bytes);
-                physical_eviction_pending_refresh_ = false;
-            }
             if (std::chrono::steady_clock::now() >= next_eviction) {
-                const auto using_resources = total_loaded_size_.load() + total_loading_size_.load();
-                const auto eviction_target = ResourceUsage{
-                    using_resources.memory_bytes >= high_watermark_.load().memory_bytes
-                        ? using_resources.memory_bytes - low_watermark_.load().memory_bytes
-                        : 0,
-                    using_resources.file_bytes >= high_watermark_.load().file_bytes
-                        ? using_resources.file_bytes - low_watermark_.load().file_bytes
-                        : 0,
-                };
-                retry_requested |=
-                    tryEvict(eviction_target, {}, eviction_config_.cache_cell_unaccessed_survival_time.count() > 0)
-                        .AnyGTZero();
+                // shortcut: Physical retries scan the shared queue; split it if mixed-queue retries become costly.
+                retry_requested |= waiting_for_physical_memory_;
+                if (eviction_config_.background_eviction_enabled) {
+                    const auto using_resources = total_loaded_size_.load() + total_loading_size_.load();
+                    const auto eviction_target = ResourceUsage{
+                        using_resources.memory_bytes >= high_watermark_.load().memory_bytes
+                            ? using_resources.memory_bytes - low_watermark_.load().memory_bytes
+                            : 0,
+                        using_resources.file_bytes >= high_watermark_.load().file_bytes
+                            ? using_resources.file_bytes - low_watermark_.load().file_bytes
+                            : 0,
+                    };
+                    retry_requested |=
+                        tryEvict(eviction_target, {}, eviction_config_.cache_cell_unaccessed_survival_time.count() > 0)
+                            .AnyGTZero();
+                }
                 next_eviction = std::chrono::steady_clock::now() + eviction_interval;
             }
             if (!scanning && !restoring && retry_requested) {
                 retry_requested = false;
-                waiting_for_memory_sample_ = false;
+                waiting_for_physical_memory_ = false;
                 scanning = true;
             }
             if (restoring) {
@@ -1022,8 +987,6 @@ DList::IsEmpty() const {
 void
 DList::ChargeLoadedResource(const ResourceUsage& size) {
     total_loaded_size_ += size;
-    // Keep completed loads accounted for before callers release their loading reservation.
-    estimated_memory_usage_.fetch_add(size.memory_bytes);
 }
 
 void
@@ -1234,12 +1197,13 @@ DList::clearWaitingQueue() {
 }
 
 ResourceUsage
-DList::checkPhysicalMemoryLimit(const ResourceUsage& size) const {
+DList::checkPhysicalResourceLimit(const ResourceUsage& size) const {
     if (size.memory_bytes <= 0) {
         return ResourceUsage{0, 0};
     }
     auto current_loading_mem = total_loading_size_.load().memory_bytes;
-    const SystemResourceInfo sys_mem{system_memory_total_bytes_, estimated_memory_usage_.load()};
+    auto sys_mem = getSystemMemoryInfo();
+    TEST_SYNC_POINT_CALLBACK("DList::PhysicalMemoryInfo", &sys_mem);
     auto projected_mem_usage = current_loading_mem + size.memory_bytes + sys_mem.used_bytes;
 
     auto eviction_mem_needed =

@@ -52,9 +52,6 @@ class DList : public std::enable_shared_from_this<DList> {
           high_watermark_(high_watermark),
           eviction_config_(eviction_config),
           next_request_id_(1) {
-        const auto memory = getSystemMemoryInfo();
-        system_memory_total_bytes_ = memory.total_bytes;
-        estimated_memory_usage_.store(memory.used_bytes);
         // if eviction is disabled, we don't need to initialize the event base and thread
         if (!eviction_enabled) {
             return;
@@ -384,7 +381,7 @@ class DList : public std::enable_shared_from_this<DList> {
     // Returns the amount of memory that needs to be evicted to satisfy physical memory limit.
     // Returns 0 if no eviction needed, positive value if eviction needed.
     ResourceUsage
-    checkPhysicalMemoryLimit(const ResourceUsage& size) const;
+    checkPhysicalResourceLimit(const ResourceUsage& size) const;
 
     // not thread safe, use for debug only
     std::string
@@ -403,11 +400,7 @@ class DList : public std::enable_shared_from_this<DList> {
     std::atomic<ResourceUsage> high_watermark_;
     const EvictionConfig eviction_config_;
 
-    // Total and refresh guard are protected by list_mtx_. OS reads happen outside it.
-    int64_t system_memory_total_bytes_;
-    std::atomic<int64_t> estimated_memory_usage_;
-    bool physical_eviction_pending_refresh_{false};
-    bool waiting_for_memory_sample_{false};  // Protected by list_mtx_.
+    bool waiting_for_physical_memory_{false};  // Protected by list_mtx_.
 
     std::thread bg_eviction_thread_;
     std::mutex bg_eviction_mtx_;
