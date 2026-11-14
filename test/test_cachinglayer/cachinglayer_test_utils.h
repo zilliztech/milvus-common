@@ -27,6 +27,17 @@ using namespace cachinglayer;
 namespace cachinglayer::internal {
 class DListTestFriend {
  public:
+    static std::thread::id
+    background_thread_id(const DList& dlist) {
+        return dlist.background_worker_.get_id();
+    }
+
+    static size_t
+    waiting_queue_size(const DList& dlist) {
+        std::lock_guard lock(dlist.list_mtx_);
+        return dlist.waiting_queue_.size();
+    }
+
     static size_t
     get_waiting_request_count(const DList& dlist) {
         std::lock_guard lock(dlist.list_mtx_);

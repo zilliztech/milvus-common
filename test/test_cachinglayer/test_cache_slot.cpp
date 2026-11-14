@@ -925,6 +925,7 @@ TEST_F(CoroutineCacheTest, InlineReservationCompletionCanFinishLoad) {
 
         // The resumed load immediately releases its reservation and reacquires the DList lock.
         dlist->ReleaseLoadingResource(held);
+        pending.wait(std::chrono::seconds(2));
         ASSERT_TRUE(pending.isReady());
         if (fail) {
             EXPECT_THROW(std::move(pending).get(), std::runtime_error);
@@ -1027,6 +1028,7 @@ TEST_F(CoroutineCacheTest, NodeReleaseAllowsInlineReservationReentry) {
         if (!evictable) {
             EXPECT_TRUE(slot->ManualEvict(0));
         }
+        pending.wait(std::chrono::seconds(2));
         ASSERT_TRUE(pending.isReady());
         EXPECT_NO_THROW(std::move(pending).get());
         EXPECT_EQ(DListTestFriend::get_loading_memory(*dlist), (ResourceUsage{3996, 0}));

@@ -97,8 +97,6 @@ DList::BindLoadingOverheadGroups(const LoadingOverheadConfig& config) {
 
 void
 DList::UnbindLoadingOverheadGroups(const LoadingOverheadConfig& config) {
-    std::vector<WaitingRequestCompletion> completions;
-    auto complete = folly::makeGuard([&] { completeWaitingRequests(completions); });
     {
         std::lock_guard<std::mutex> lock(list_mtx_);
         if (config.memory.has_value()) {
@@ -116,21 +114,19 @@ DList::UnbindLoadingOverheadGroups(const LoadingOverheadConfig& config) {
             }
         }
         if (reservation_notifications_needed_) {
-            handleWaitingRequests(completions);
+            notifyWaitingRequests();
         }
     }
 }
 
 LoadingOverheadUpdateResult
 DList::UpdateLoadingOverheadGroup(const LoadingOverheadGroupHandle& group, LoadingOverheadPolicy policy) {
-    std::vector<WaitingRequestCompletion> completions;
-    auto complete = folly::makeGuard([&] { completeWaitingRequests(completions); });
     LoadingOverheadUpdateResult result;
     {
         std::unique_lock<std::mutex> lock(list_mtx_);
         result = group ? group->updatePolicy(std::move(policy)) : LoadingOverheadUpdateResult::kInvalidArgument;
         if (result == LoadingOverheadUpdateResult::kApplied) {
-            handleWaitingRequests(completions);
+            notifyWaitingRequests();
         }
     }
     return result;
@@ -139,16 +135,25 @@ DList::UpdateLoadingOverheadGroup(const LoadingOverheadGroupHandle& group, Loadi
 folly::SemiFuture<LoadingResourceReservationResult>
 DList::ReserveLoadingResourceWithTimeout(const LoadingResourceUsage& usage, const LoadingOverheadConfig* config,
                                          std::chrono::milliseconds timeout, OpContext* ctx) {
+    // 1. Hold the lock until we have reserved resources or added this request to the queue.
+    // This prevents the background worker from checking the queue before our request is in it.
     std::unique_lock<std::mutex> lock(list_mtx_);
-    // Arm before inspecting resources so a concurrent release cannot miss an about-to-enqueue request.
+    // Resource releases do not always take this lock. Enable notifications before checking
+    // resources, so a concurrent release wakes the worker even if we have not queued the request yet.
     reservation_notifications_needed_ = true;
-    auto restore_notifications = folly::makeGuard([&] { reservation_notifications_needed_ = !waiting_queue_.empty(); });
+    // Before returning and unlocking, disable notifications if no requests are left waiting.
+    auto restore_notifications =
+        folly::makeGuard([&] { reservation_notifications_needed_ = !waiting_requests_map_.empty(); });
     TEST_SYNC_POINT("DList::Reserve:BeforeAttempt");
+    // 2. Try to reserve now, evicting cached data if needed. The helper accounts for overhead
+    // shared with other requests in the same Group. On failure, it undoes that overhead reservation.
     auto attempt = reserveResourceInternalWithOverhead(usage, config);
     if (attempt.result.success) {
         return folly::makeSemiFuture(attempt.result);
     }
 
+    // Fail without waiting if this request alone exceeds capacity. Do not include the extra
+    // shared overhead here: another request may reserve it for the Group before we retry.
     const auto minimum_required_size = RequestLocalLoading(usage, config) * eviction_config_.loading_resource_factor;
     if (!max_resource_limit_.load().CanHold(minimum_required_size)) {
         LOG_ERROR(
@@ -158,10 +163,15 @@ DList::ReserveLoadingResourceWithTimeout(const LoadingResourceUsage& usage, cons
         return folly::makeSemiFuture(LoadingResourceReservationResult{});
     }
 
+    // timeout == 0 means the caller does not want to wait after the attempt above fails.
     if (timeout.count() == 0) {
         return folly::makeSemiFuture(LoadingResourceReservationResult{});
     }
 
+    // 3. Resources are unavailable, so add the request to the waiting queue before unlocking.
+    // The queue decides retry order. The map records which requests still need a result;
+    // once a request is removed from the map, later timeout/cancel callbacks must ignore it.
+    // A negative timeout means wait indefinitely, behind requests with a finite deadline.
     TEST_SYNC_POINT("DList::Reserve:BeforeEnqueue");
     auto deadline =
         timeout.count() > 0 ? std::chrono::steady_clock::now() + timeout : std::chrono::steady_clock::time_point::max();
@@ -173,8 +183,13 @@ DList::ReserveLoadingResourceWithTimeout(const LoadingResourceUsage& usage, cons
     WaitingRequest* request_ptr = waiting_request.get();
     waiting_requests_map_[request_id] = request_ptr;
     waiting_queue_.push(std::move(waiting_request));
+    // A pending callback must not keep DList alive; it exits if DList has been destroyed.
     std::weak_ptr<DList> weak_self = shared_from_this();
 
+    // 4. For a positive timeout, ask the EventBase thread to fail the request after the delay.
+    // If the request has already succeeded or been cancelled, failWaitingRequest does nothing.
+    // Record failure under the lock, then deliver the result after unlocking: delivering a result
+    // can run caller code that needs this same lock.
     if (timeout.count() > 0) {
         LOG_DEBUG("[MCL] Request {} resident={} private={} shared={} added to waiting queue, timeout={}ms", request_id,
                   usage.resident.ToString(), usage.private_overhead.ToString(), usage.shared_overhead.ToString(),
@@ -202,6 +217,9 @@ DList::ReserveLoadingResourceWithTimeout(const LoadingResourceUsage& usage, cons
         });
     }
 
+    // 5. Let the caller cancel while waiting. If the token is already cancelled, emplace()
+    // may run this callback immediately while we still hold list_mtx_. Send the work to EventBase
+    // so the callback does not try to take the same lock again and deadlock.
     if (ctx && ctx->cancellation_token.canBeCancelled()) {
         request_ptr->cancel_cb.emplace(ctx->cancellation_token, [weak_self, request_id]() {
             auto self = weak_self.lock();
@@ -223,6 +241,9 @@ DList::ReserveLoadingResourceWithTimeout(const LoadingResourceUsage& usage, cons
         });
     }
 
+    // 6. Return a future now; this function does not wait for resources.
+    // The background worker retries the queued request. The caller receives success when resources
+    // are reserved, or failure if the request times out, is cancelled, or DList shuts down.
     return std::move(future);
 }
 
@@ -233,14 +254,18 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std
     // loading_resource_factor to avoid potential problems from bad resource estimation.
     const auto size = original_size * eviction_config_.loading_resource_factor;
 
-    // Try immediate reservation; if it fails, enqueue atomically under the same lock
-    // to avoid a race window where resources could be released and notified between
-    // a failed reserve and the enqueue.
+    // 1. Hold the lock until we have reserved resources or added this request to the queue.
+    // This prevents the background worker from checking the queue before our request is in it.
     std::unique_lock<std::mutex> lock(list_mtx_);
-    // Keep notifications armed through both the resource check and a possible enqueue.
+    // Resource releases do not always take this lock. Enable notifications before checking
+    // resources, so a concurrent release wakes the worker even if we have not queued the request yet.
     reservation_notifications_needed_ = true;
-    auto restore_notifications = folly::makeGuard([&] { reservation_notifications_needed_ = !waiting_queue_.empty(); });
+    // Before returning and unlocking, disable notifications if no requests are left waiting.
+    auto restore_notifications =
+        folly::makeGuard([&] { reservation_notifications_needed_ = !waiting_requests_map_.empty(); });
     TEST_SYNC_POINT("DList::Reserve:BeforeAttempt");
+    // 2. Fail without waiting if the request exceeds capacity. Otherwise try to reserve now,
+    // evicting cached data if needed. On success, return a future that already contains true.
     if (!max_resource_limit_.load().CanHold(size)) {
         LOG_ERROR("[MCL] Failed to reserve size={} as it exceeds max_memory_={}.", size.ToString(),
                   max_resource_limit_.load().ToString());
@@ -250,11 +275,15 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std
         return folly::makeSemiFuture(true);
     }
 
-    // Zero timeout means best-effort: fail immediately without entering the waiting queue.
+    // timeout == 0 means the caller does not want to wait after the attempt above fails.
     if (timeout.count() == 0) {
         return folly::makeSemiFuture(false);
     }
 
+    // 3. Resources are unavailable, so add the request to the waiting queue before unlocking.
+    // The queue decides retry order. The map records which requests still need a result;
+    // once a request is removed from the map, later timeout/cancel callbacks must ignore it.
+    // A negative timeout means wait indefinitely, behind requests with a finite deadline.
     TEST_SYNC_POINT("DList::Reserve:BeforeEnqueue");
     auto deadline =
         timeout.count() > 0 ? std::chrono::steady_clock::now() + timeout : std::chrono::steady_clock::time_point::max();
@@ -266,8 +295,13 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std
     WaitingRequest* request_ptr = waiting_request.get();
     waiting_requests_map_[request_id] = request_ptr;
     waiting_queue_.push(std::move(waiting_request));
+    // A pending callback must not keep DList alive; it exits if DList has been destroyed.
     std::weak_ptr<DList> weak_self = shared_from_this();
 
+    // 4. For a positive timeout, ask the EventBase thread to fail the request after the delay.
+    // If the request has already succeeded or been cancelled, failWaitingRequest does nothing.
+    // Record failure under the lock, then deliver the result after unlocking: delivering a result
+    // can run caller code that needs this same lock.
     if (timeout.count() > 0) {
         LOG_DEBUG(
             "[MCL] Request {} size {} added to waiting queue, scheduling timeout "
@@ -296,9 +330,9 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std
         });
     }
 
-    // Register cancellation callback. The callback is dispatched to the event base thread
-    // to avoid deadlock - CancellationCallback may invoke synchronously if the token is
-    // already cancelled or gets cancelled during emplace(), and we currently hold list_mtx_.
+    // 5. Let the caller cancel while waiting. If the token is already cancelled, emplace()
+    // may run this callback immediately while we still hold list_mtx_. Send the work to EventBase
+    // so the callback does not try to take the same lock again and deadlock.
     if (ctx && ctx->cancellation_token.canBeCancelled()) {
         request_ptr->cancel_cb.emplace(ctx->cancellation_token, [weak_self, request_id]() {
             auto self = weak_self.lock();
@@ -320,6 +354,9 @@ DList::ReserveLoadingResourceWithTimeout(const ResourceUsage& original_size, std
         });
     }
 
+    // 6. Return a future now; this function does not wait for resources.
+    // The background worker retries the queued request. The caller receives success when resources
+    // are reserved, or failure if the request times out, is cancelled, or DList shuts down.
     return std::move(future);
 }
 
@@ -447,17 +484,25 @@ DList::reserveResourceInternalWithOverhead(const LoadingResourceUsage& usage, co
 
 std::pair<bool, ResourceUsage>
 DList::reserveResourceInternalImpl(const ResourceUsage& size, std::function<void()> rollback) {
-    auto using_resources = total_loaded_size_.load() + total_loading_size_.load();
-    auto required_resources = using_resources + size;
+    TEST_SYNC_POINT("DList::ReserveResourceInternal");
+    const auto using_resources = total_loaded_size_.load() + total_loading_size_.load();
+    const auto required_resources = using_resources + size;
 
     // Combined logical and physical memory limit check
     bool logical_limit_exceeded = !max_resource_limit_.load().CanHold(required_resources);
     auto physical_eviction_needed = checkPhysicalMemoryLimit(size);
+    // Even if the logical quota is also exceeded, eviction may satisfy it once physical memory recovers.
+    // Request periodic retries now: tryEvict() can fail before reaching the post-eviction check below.
+    if (physical_eviction_needed.AnyGTZero()) {
+        waiting_for_physical_memory_ = true;
+    }
 
-    // If either limit is exceeded, attempt unified eviction
-    // we attempt eviction based on logical limit once, but multiple times on physical limit
-    // because physical eviction may not be accurate.
-    while (logical_limit_exceeded || physical_eviction_needed.AnyGTZero()) {
+    // Try once, then retry at most twice if actual memory usage is still too high.
+    // A fixed bound prevents this request from holding list_mtx_ through unlimited eviction rounds.
+    constexpr int kMaxEvictionRetries = 2;
+    for (int attempt = 0;
+         attempt <= kMaxEvictionRetries && (logical_limit_exceeded || physical_eviction_needed.AnyGTZero());
+         ++attempt) {
         ResourceUsage eviction_target;
         ResourceUsage min_eviction;
 
@@ -501,25 +546,18 @@ DList::reserveResourceInternalImpl(const ResourceUsage& size, std::function<void
             return {false, {}};
         }
 
-        using_resources -= evicted_size;
-        // logical limit is accurate, thus we can guarantee after one successful eviction, logical limit is satisfied.
-        required_resources = using_resources + size;
-        logical_limit_exceeded = !max_resource_limit_.load().CanHold(required_resources);
-
-        if (!physical_eviction_needed.AnyGTZero()) {
-            // we only need to evict for logical limit and we have succeeded.
-            break;
+        // Successful eviction freed at least min_eviction, so the logical quota is now sufficient.
+        // Further rounds must use the newly read physical deficit, not the original logical deficit.
+        logical_limit_exceeded = false;
+        if (physical_eviction_needed.AnyGTZero()) {
+            physical_eviction_needed = checkPhysicalMemoryLimit(size);
+            waiting_for_physical_memory_ |= physical_eviction_needed.AnyGTZero();
         }
+    }
 
-        if (physical_eviction_needed = checkPhysicalMemoryLimit(size); !physical_eviction_needed.AnyGTZero()) {
-            // if after eviction we no longer need to evict, we can break.
-            break;
-        }
-        // else perform another round of eviction.
-        LOG_TRACE(
-            "[MCL] reserve resource with size={} failed due to insufficient resources, "
-            "evicted_size={}, still need to evict {}",
-            size.ToString(), evicted_size.ToString(), physical_eviction_needed.ToString());
+    if (physical_eviction_needed.AnyGTZero()) {
+        rollback();
+        return {false, {}};
     }
 
     total_loading_size_ += size;
@@ -530,35 +568,108 @@ DList::reserveResourceInternalImpl(const ResourceUsage& size, std::function<void
 }
 
 void
-DList::evictionLoop() {
+DList::backgroundLoop() {
+    folly::setThreadName("milvus-cache-bg");
+    // Use 500ms for a nonpositive interval so physical-memory waiters still get periodic retries.
+    const auto eviction_interval = eviction_config_.eviction_interval.count() > 0 ? eviction_config_.eviction_interval
+                                                                                  : std::chrono::milliseconds(500);
+    auto next_eviction = std::chrono::steady_clock::now() + eviction_interval;
+    bool scanning = false;
+    bool restoring = false;
+    bool retry_requested = false;
+    // Keep requests that could not reserve resources out of the queue until this scan finishes,
+    // so the next batch can try other requests with the same deadline instead of retrying these.
+    std::vector<std::unique_ptr<WaitingRequest>> deferred_requests;
+    std::optional<std::chrono::steady_clock::time_point> blocked_deadline;
     while (true) {
+        // 1. When no batch is in progress, wait for a notification or the next periodic check.
+        // Between batches, continue immediately but still check whether shutdown was requested.
+        {
+            std::unique_lock lock(background_mtx_);
+            if (!scanning && !restoring) {
+                background_cv_.wait_until(lock, next_eviction, [this, &retry_requested] {
+                    return stop_background_worker_ || waiting_requests_pending_ || retry_requested;
+                });
+                // Several notifications need only one scan. Notifications received during a scan
+                // stay in waiting_requests_pending_ and cause another scan after the current one.
+                retry_requested |= waiting_requests_pending_;
+                waiting_requests_pending_ = false;
+            }
+            if (stop_background_worker_) {
+                break;
+            }
+        }
+
         std::vector<WaitingRequestCompletion> completions;
-        auto complete = folly::makeGuard([&] { completeWaitingRequests(completions); });
-        std::unique_lock<std::mutex> lock(list_mtx_);
-        if (bg_eviction_thread_cv_.wait_for(lock, eviction_config_.eviction_interval,
-                                            [this] { return stop_bg_eviction_loop_.load(); })) {
-            break;
+        {
+            std::unique_lock lock(list_mtx_);
+            // 2. On each periodic check, retry requests blocked by physical memory: other parts of
+            // the process may have freed memory without notifying DList. Do this even if periodic
+            // eviction is disabled. Requests blocked only by DList's quota wait for a notification.
+            if (std::chrono::steady_clock::now() >= next_eviction) {
+                // shortcut: Physical retries scan the shared queue; split it if mixed-queue retries become costly.
+                retry_requested |= waiting_for_physical_memory_;
+                if (eviction_enabled_ && eviction_config_.background_eviction_enabled) {
+                    // At or above the high watermark, try to evict down to the low watermark.
+                    // If eviction frees resources, also retry the waiting requests.
+                    const auto using_resources = total_loaded_size_.load() + total_loading_size_.load();
+                    const auto eviction_target = ResourceUsage{
+                        using_resources.memory_bytes >= high_watermark_.load().memory_bytes
+                            ? using_resources.memory_bytes - low_watermark_.load().memory_bytes
+                            : 0,
+                        using_resources.file_bytes >= high_watermark_.load().file_bytes
+                            ? using_resources.file_bytes - low_watermark_.load().file_bytes
+                            : 0,
+                    };
+                    retry_requested |=
+                        tryEvict(eviction_target, {}, eviction_config_.cache_cell_unaccessed_survival_time.count() > 0)
+                            .AnyGTZero();
+                }
+                next_eviction = std::chrono::steady_clock::now() + eviction_interval;
+            }
+            // 3. Start a requested scan once the previous scan and reinsertion are finished.
+            // Clear the physical-memory flag; reservation attempts set it again if still blocked.
+            if (!scanning && !restoring && retry_requested) {
+                retry_requested = false;
+                waiting_for_physical_memory_ = false;
+                scanning = true;
+            }
+            // 4. Process one batch under list_mtx_, then unlock before the next batch so other
+            // threads can use the list. Both reservation attempts and reinsertion are limited to 64.
+            if (restoring) {
+                // Put unsuccessful requests back only after the scan has finished.
+                for (size_t i = 0; i < 64 && !deferred_requests.empty(); ++i) {
+                    waiting_queue_.push(std::move(deferred_requests.back()));
+                    deferred_requests.pop_back();
+                }
+                restoring = !deferred_requests.empty();
+            } else if (scanning) {
+                scanning = handleWaitingRequests(completions, deferred_requests, blocked_deadline);
+                if (!scanning) {
+                    restoring = !deferred_requests.empty();
+                }
+            }
+            if (!scanning && !restoring) {
+                blocked_deadline.reset();
+            }
+            // Resource releases need to wake this worker only while requests are still waiting.
+            reservation_notifications_needed_ = !waiting_requests_map_.empty();
         }
-        auto using_resources = total_loaded_size_.load() + total_loading_size_.load();
-        // if usage is above high watermark, evict until low watermark is reached.
-        auto eviction_target = ResourceUsage{
-            using_resources.memory_bytes >= high_watermark_.load().memory_bytes
-                ? using_resources.memory_bytes - low_watermark_.load().memory_bytes
-                : 0,
-            using_resources.file_bytes >= high_watermark_.load().file_bytes
-                ? using_resources.file_bytes - low_watermark_.load().file_bytes
-                : 0,
-        };
-        const auto min_eviction = ResourceUsage{0, 0};
-        const auto evicted =
-            tryEvict(eviction_target, min_eviction, eviction_config_.cache_cell_unaccessed_survival_time.count() > 0);
-        // Always try to handle waiting requests if the queue is non-empty,
-        // not just after successful eviction. Resources may have been freed
-        // by other paths (ReleaseLoadingResource, RefundLoadedResource) between
-        // loop iterations without fully draining the queue.
-        if (evicted.AnyGTZero() || reservation_notifications_needed_) {
-            handleWaitingRequests(completions);
+        // 5. Deliver results after unlocking, on the EventBase thread. Delivering a result can run
+        // caller code that destroys DList. Its destructor waits for this worker to exit, so doing
+        // that here on the worker itself would make it wait for its own exit.
+        if (!completions.empty()) {
+            event_base_thread_->getEventBase()->runInEventBaseThread(
+                [completions = std::move(completions)]() mutable { completeWaitingRequests(completions); });
         }
+        bool more_batches = scanning || restoring;
+        TEST_SYNC_POINT_CALLBACK("DList::WaitingBatchComplete", &more_batches);
+    }
+    // 6. Before exiting, return any temporarily removed requests to the queue. Shutdown waits for
+    // this worker to exit, then clears the queue and reports failure to all remaining callers.
+    std::lock_guard lock(list_mtx_);
+    for (auto& request : deferred_requests) {
+        waiting_queue_.push(std::move(request));
     }
 }
 
@@ -616,6 +727,9 @@ DList::chainString() const {
 ResourceUsage
 DList::tryEvict(const ResourceUsage& expected_eviction, const ResourceUsage& min_eviction,
                 const bool evict_expired_items) {
+    if (!eviction_enabled_) {
+        return {};
+    }
     // Fast path: check if we have enough evictable resources
     auto current_evictable = evictable_size_.load();
     if (!current_evictable.CanHold(min_eviction)) {
@@ -754,8 +868,6 @@ DList::UpdateMaxLimit(const ResourceUsage& new_limit) {
                "[MCL] limit must be greater than high watermark. new_limit: "
                "{}, high_watermark: {}",
                new_limit.ToString(), high_watermark_.load().ToString());
-    std::vector<WaitingRequestCompletion> completions;
-    auto complete = folly::makeGuard([&] { completeWaitingRequests(completions); });
     {
         std::unique_lock<std::mutex> list_lock(list_mtx_);
         auto using_resources = total_loaded_size_.load() + total_loading_size_.load();
@@ -772,15 +884,13 @@ DList::UpdateMaxLimit(const ResourceUsage& new_limit) {
         max_resource_limit_ = new_limit;
         cachinglayer::monitor::cache_capacity_bytes(StorageType::MEMORY).Set(max_resource_limit_.load().memory_bytes);
         cachinglayer::monitor::cache_capacity_bytes(StorageType::DISK).Set(max_resource_limit_.load().file_bytes);
-        handleWaitingRequests(completions);
+        notifyWaitingRequests();
     }
     return true;
 }
 
 void
 DList::UpdateLowWatermark(const ResourceUsage& new_low_watermark) {
-    std::vector<WaitingRequestCompletion> completions;
-    auto complete = folly::makeGuard([&] { completeWaitingRequests(completions); });
     {
         std::unique_lock<std::mutex> list_lock(list_mtx_);
         AssertInfo(new_low_watermark.AllGEZero(),
@@ -796,14 +906,12 @@ DList::UpdateLowWatermark(const ResourceUsage& new_low_watermark) {
         low_watermark_ = new_low_watermark;
         cachinglayer::monitor::cache_low_watermark_bytes(StorageType::MEMORY).Set(low_watermark_.load().memory_bytes);
         cachinglayer::monitor::cache_low_watermark_bytes(StorageType::DISK).Set(low_watermark_.load().file_bytes);
-        handleWaitingRequests(completions);
+        notifyWaitingRequests();
     }
 }
 
 void
 DList::UpdateHighWatermark(const ResourceUsage& new_high_watermark) {
-    std::vector<WaitingRequestCompletion> completions;
-    auto complete = folly::makeGuard([&] { completeWaitingRequests(completions); });
     {
         std::unique_lock<std::mutex> list_lock(list_mtx_);
         AssertInfo((new_high_watermark - low_watermark_.load()).AllGEZero(),
@@ -819,14 +927,12 @@ DList::UpdateHighWatermark(const ResourceUsage& new_high_watermark) {
         high_watermark_ = new_high_watermark;
         cachinglayer::monitor::cache_high_watermark_bytes(StorageType::MEMORY).Set(high_watermark_.load().memory_bytes);
         cachinglayer::monitor::cache_high_watermark_bytes(StorageType::DISK).Set(high_watermark_.load().file_bytes);
-        handleWaitingRequests(completions);
+        notifyWaitingRequests();
     }
 }
 
 ResourceUsage
 DList::ReleaseLoadingResource(const LoadingResourceUsage& usage, const LoadingOverheadConfig* config) {
-    std::vector<WaitingRequestCompletion> completions;
-    auto complete = folly::makeGuard([&] { completeWaitingRequests(completions); });
     LoadingOverheadDelta delta{.unscaled_delta = usage.shared_overhead};
     ResourceUsage unscaled;
     {
@@ -845,7 +951,7 @@ DList::ReleaseLoadingResource(const LoadingResourceUsage& usage, const LoadingOv
                 usage.resident.ToString(), usage.private_overhead.ToString(), usage.shared_overhead.ToString(),
                 curr.ToString());
         });
-        handleWaitingRequests(completions);
+        notifyWaitingRequests();
     }
     return unscaled;
 }
@@ -978,29 +1084,26 @@ DList::notifyWaitingRequests() {
     if (!reservation_notifications_needed_) {
         return;
     }
-    std::vector<WaitingRequestCompletion> completions;
-    auto complete = folly::makeGuard([&] { completeWaitingRequests(completions); });
     {
-        std::unique_lock<std::mutex> lock(list_mtx_);
-        handleWaitingRequests(completions);
+        std::lock_guard lock(background_mtx_);
+        waiting_requests_pending_ = true;
     }
+    background_cv_.notify_one();
 }
 
-void
-DList::handleWaitingRequests(std::vector<WaitingRequestCompletion>& completions) {
-    std::vector<std::unique_ptr<WaitingRequest>> deferred_requests;
-    std::optional<std::chrono::steady_clock::time_point> blocked_deadline;
-    auto restore_deferred = folly::makeGuard([&] {
-        // Popping retains queue capacity, so restoring deferred requests cannot allocate.
-        for (auto& request : deferred_requests) {
-            waiting_queue_.push(std::move(request));
-        }
-        reservation_notifications_needed_ = !waiting_queue_.empty();
-    });
-
+bool
+DList::handleWaitingRequests(std::vector<WaitingRequestCompletion>& completions,
+                             std::vector<std::unique_ptr<WaitingRequest>>& deferred_requests,
+                             std::optional<std::chrono::steady_clock::time_point>& blocked_deadline) {
+    constexpr size_t kBatchSize = 64;
+    completions.reserve(std::min(kBatchSize, waiting_queue_.size()));
+    size_t processed = 0;
     while (!waiting_queue_.empty()) {
         if (blocked_deadline.has_value() && waiting_queue_.top()->deadline != blocked_deadline.value()) {
             break;
+        }
+        if (processed++ == kBatchSize) {
+            return true;
         }
         // Allocate completion storage before claiming a request or reserving its resources.
         auto& completion = completions.emplace_back();
@@ -1134,6 +1237,7 @@ DList::handleWaitingRequests(std::vector<WaitingRequestCompletion>& completions)
             completions.pop_back();
         }
     }
+    return false;
 }
 
 void
@@ -1146,7 +1250,7 @@ DList::failWaitingRequest(uint64_t request_id, const char* reason, std::vector<W
     LOG_WARN("[MCL] Waiting request {} {}.", request_id, reason);
     completion.SetResult(*it->second, false);
     waiting_requests_map_.erase(it);
-    handleWaitingRequests(completions);
+    notifyWaitingRequests();
 }
 
 void
@@ -1169,45 +1273,13 @@ DList::clearWaitingQueue() {
 }
 
 ResourceUsage
-DList::checkPhysicalResourceLimit(const ResourceUsage& size) const {
-    static SystemResourceInfo infinity = {std::numeric_limits<int64_t>::max(), 0};
-    auto sys_mem = size.memory_bytes > 0 ? getSystemMemoryInfo() : infinity;
-    auto sys_disk = size.file_bytes > 0 ? getSystemDiskInfo(eviction_config_.disk_path) : infinity;
-
-    auto used = ResourceUsage{sys_mem.used_bytes, sys_disk.used_bytes};
-    auto current_loading = total_loading_size_.load();
-    auto projected_usage = current_loading + size + used;
-
-    auto limit = ResourceUsage{
-        static_cast<int64_t>(sys_mem.total_bytes * eviction_config_.overloaded_memory_threshold_percentage),
-        static_cast<int64_t>(sys_disk.total_bytes * eviction_config_.max_disk_usage_percentage)};
-
-    auto eviction_needed = projected_usage - limit;
-    if (eviction_needed.memory_bytes < 0) {
-        eviction_needed.memory_bytes = 0;
-    }
-    if (eviction_needed.file_bytes < 0) {
-        eviction_needed.file_bytes = 0;
-    }
-
-    LOG_TRACE(
-        "[MCL] Physical resource check: "
-        "projected_usage={}(used={}, loading={}, requesting={}), limit={} "
-        "(mem {}% disk {}% of total {}), eviction_needed={}",
-        projected_usage.ToString(), used.ToString(), current_loading.ToString(), size.ToString(), limit.ToString(),
-        eviction_config_.overloaded_memory_threshold_percentage * 100, eviction_config_.max_disk_usage_percentage * 100,
-        ResourceUsage{sys_mem.total_bytes, sys_disk.total_bytes}.ToString(), eviction_needed.ToString());
-
-    return eviction_needed;
-}
-
-ResourceUsage
 DList::checkPhysicalMemoryLimit(const ResourceUsage& size) const {
     if (size.memory_bytes <= 0) {
         return ResourceUsage{0, 0};
     }
-    auto sys_mem = getSystemMemoryInfo();
     auto current_loading_mem = total_loading_size_.load().memory_bytes;
+    auto sys_mem = getSystemMemoryInfo(process_memory_reader_);
+    TEST_SYNC_POINT_CALLBACK("DList::PhysicalMemoryInfo", &sys_mem);
     auto projected_mem_usage = current_loading_mem + size.memory_bytes + sys_mem.used_bytes;
 
     auto eviction_mem_needed =

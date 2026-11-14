@@ -9,6 +9,7 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
+#include <folly/ScopeGuard.h>
 #include <gtest/gtest.h>
 
 #include <chrono>
@@ -16,17 +17,32 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <utility>
+#include <vector>
 
 #include "cachinglayer/Utils.h"
+#ifdef __linux__
+#include <sys/mman.h>
+#endif
+
+namespace milvus::cachinglayer::internal {
+// Defined only in the unit-test build of Utils.cpp.
+void
+resetSystemMemoryLimitCacheForTest();
+}  // namespace milvus::cachinglayer::internal
+using milvus::cachinglayer::internal::resetSystemMemoryLimitCacheForTest;
 
 namespace fs = std::filesystem;
 using milvus::cachinglayer::internal::getContainerMemLimit;
 using milvus::cachinglayer::internal::getCurrentProcessMemoryUsage;
 using milvus::cachinglayer::internal::getSystemDiskInfo;
 using milvus::cachinglayer::internal::getSystemMemoryInfo;
+using milvus::cachinglayer::internal::ProcessMemoryReader;
 using milvus::cachinglayer::internal::SystemResourceInfo;
 
 namespace {
@@ -290,6 +306,8 @@ TEST(Utils, GetContainerMemLimitCgroupV2ProcSpecific) {
 // Verify that getSystemMemoryInfo prefers container limit when smaller than host memory.
 TEST(Utils, GetSystemMemoryInfoUsesContainerLimitWhenSmaller) {
 #ifdef __linux__
+    resetSystemMemoryLimitCacheForTest();
+    auto reset_cache = folly::makeGuard([] { resetSystemMemoryLimitCacheForTest(); });
     fs::path root = CreateTempDir("mcl_sysmem_");
 
     // Minimal cgroup v2-like setup providing a small limit
@@ -339,4 +357,127 @@ TEST(Utils, GetSystemDiskInfoBasic) {
 TEST(Utils, GetCurrentProcessMemoryUsageNonNegative) {
     int64_t usage = getCurrentProcessMemoryUsage();
     EXPECT_GE(usage, 0);
+}
+
+TEST(Utils, ProcessMemoryUsageHandlesVariableFieldOffsets) {
+#ifdef __linux__
+    const auto root = CreateTempDir("mcl_status_");
+    const auto path = root / "status";
+    EnvGuard guard("MCL_PROC_STATUS", path.c_str());
+    for (const auto& [content, expected] : std::vector<std::pair<std::string, int64_t>>{
+             {"Name:\tqn\nVmRSS:\t100 kB\nRssAnon:\t50 kB\nRssFile:\t30 kB\nRssShmem:\t20 kB\n", 70 * 1024},
+             {"Name:\tlonger-process-name\nVmSize:\t123456789 kB\nRssFile: 300 kB\nVmRSS: 1000 kB\n", 700 * 1024},
+             {"Name:\tVmRSS: 999 kB\nFakeRssFile: 999 kB\nVmRSS: 100 kB\nRssFile: 30 kB\n", 70 * 1024},
+             {std::string(4092, 'x') + "\nVmRSS: 10000 kB\nRssFile: 3000 kB\n", 7000 * 1024},
+             {std::string(4080, 'x') + "\nVmRSS: 10000 kB\nRssFile: 3000 kB\n", 7000 * 1024}}) {
+        std::ofstream(path) << content;
+        EXPECT_EQ(getCurrentProcessMemoryUsage(), expected);
+    }
+    for (const auto& content :
+         {"VmRSS: invalid kB\nRssFile: 1 kB\n", "VmRSS: 10 kB\n", "VmRSS: 9223372036854775807 kB\nRssFile: 1 kB\n"}) {
+        std::ofstream(path) << content;
+        EXPECT_EQ(getCurrentProcessMemoryUsage(), 0);
+    }
+    fs::remove_all(root);
+#else
+    GTEST_SKIP() << "proc status is Linux-specific";
+#endif
+}
+
+TEST(Utils, MemoryInfoCachesOnlyTheLimitForFiveSeconds) {
+#ifdef __linux__
+    resetSystemMemoryLimitCacheForTest();
+    auto reset_cache = folly::makeGuard([] { resetSystemMemoryLimitCacheForTest(); });
+    const auto root = CreateTempDir("mcl_limit_cache_");
+    const auto proc = root / "cgroup";
+    std::ofstream(proc) << "0::/test.slice\n";
+    const auto limit_path = root / "memory.max";
+    std::ofstream(limit_path) << "67108864\n";
+    const auto status_path = root / "status";
+    std::ofstream(status_path) << "VmRSS: 100 kB\nRssFile: 30 kB\n";
+    EnvGuard root_guard("MCL_CGROUP_ROOT", root.c_str());
+    EnvGuard proc_guard("MCL_PROC_CGROUP", proc.c_str());
+    EnvGuard mem_guard("MEM_LIMIT", nullptr);
+    EnvGuard status_guard("MCL_PROC_STATUS", status_path.c_str());
+    auto cleanup = folly::makeGuard([&] { fs::remove_all(root); });
+    ProcessMemoryReader reader;
+    auto info = getSystemMemoryInfo(reader);
+    EXPECT_EQ(info.total_bytes, 67108864);
+    EXPECT_EQ(info.used_bytes, 70 * 1024);
+    std::ofstream(limit_path) << "134217728\n";
+    std::ofstream(status_path) << "VmRSS: 200 kB\nRssFile: 30 kB\n";
+    info = getSystemMemoryInfo(reader);
+    EXPECT_EQ(info.total_bytes, 67108864);
+    EXPECT_EQ(info.used_bytes, 170 * 1024);
+    std::this_thread::sleep_for(std::chrono::milliseconds(5100));
+    EXPECT_EQ(getSystemMemoryInfo(reader).total_bytes, 134217728);
+#else
+    GTEST_SKIP() << "cgroups are Linux-specific";
+#endif
+}
+
+TEST(Utils, ReusedProcessStatusFdReadsLiveUsage) {
+#ifdef __linux__
+    constexpr size_t bytes = 32 * 1024 * 1024;
+    ProcessMemoryReader memory_reader;
+    const auto before = memory_reader.readUsage();
+    void* memory = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(memory, MAP_FAILED);
+    auto release = folly::makeGuard([&] { munmap(memory, bytes); });
+    auto* pages = static_cast<volatile char*>(memory);
+    for (size_t i = 0; i < bytes; i += 4096) {
+        pages[i] = 1;
+    }
+    const auto during = memory_reader.readUsage();
+    EXPECT_GT(during - before, static_cast<int64_t>(bytes / 2));
+    std::vector<std::future<int64_t>> readers;
+    readers.reserve(8);
+    for (int i = 0; i < 8; ++i) {
+        readers.push_back(std::async(std::launch::async, [] {
+            ProcessMemoryReader reader;
+            return reader.readUsage();
+        }));
+    }
+    for (auto& reader : readers) {
+        EXPECT_GT(reader.get(), static_cast<int64_t>(bytes / 2));
+    }
+    ASSERT_EQ(munmap(memory, bytes), 0);
+    release.dismiss();
+    EXPECT_GT(during - memory_reader.readUsage(), static_cast<int64_t>(bytes / 2));
+#else
+    GTEST_SKIP() << "proc status is Linux-specific";
+#endif
+}
+
+TEST(Utils, ProcessMemoryReadersOwnAndReleaseSeparateStatusFds) {
+#ifdef __linux__
+    const auto status_path = fs::canonical("/proc/self") / "status";
+    const auto count_status_fds = [&] {
+        size_t count = 0;
+        for (const auto& entry : fs::directory_iterator("/proc/self/fd")) {
+            std::error_code error;
+            if (fs::read_symlink(entry.path(), error) == status_path && !error) {
+                ++count;
+            }
+        }
+        return count;
+    };
+    const auto before = count_status_fds();
+    {
+        ProcessMemoryReader first;
+        EXPECT_EQ(count_status_fds(), before + 1);
+        {
+            ProcessMemoryReader second;
+            EXPECT_EQ(count_status_fds(), before + 2);
+            EXPECT_GE(first.readUsage(), 0);
+            EXPECT_GE(second.readUsage(), 0);
+            EXPECT_EQ(count_status_fds(), before + 2);
+        }
+        EXPECT_EQ(count_status_fds(), before + 1);
+        EXPECT_GE(first.readUsage(), 0);
+    }
+    EXPECT_EQ(count_status_fds(), before);
+#else
+    GTEST_SKIP() << "proc status is Linux-specific";
+#endif
 }

@@ -12,16 +12,30 @@
 #include "cachinglayer/Utils.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <cerrno>
+#include <charconv>
+#include <chrono>
 #include <cstring>
 #include <fstream>
+#include <mutex>
+#include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "log/Log.h"
 
 #if defined(__linux__) || defined(__APPLE__)
 #include <sys/statvfs.h>
+#endif
+
+#ifdef __linux__
+#include <fcntl.h>
+#include <folly/system/Pid.h>
+#include <unistd.h>
 #endif
 
 #ifdef __APPLE__
@@ -225,37 +239,63 @@ getContainerMemLimit() {
     return 0;
 }
 
+namespace {
+std::atomic<int64_t> cached_memory_limit{0};
+std::atomic<std::chrono::steady_clock::time_point> memory_limit_expires{};
+std::mutex memory_limit_mutex;
+
+int64_t
+readSystemMemoryLimit() {
+    const int64_t host_memory = getHostTotalMemory();
+    const int64_t container_limit = getContainerMemLimit();
+    if (host_memory == 0 && container_limit == 0) {
+        return std::numeric_limits<int64_t>::max();
+    }
+    if (container_limit > 0 && (host_memory == 0 || container_limit < host_memory)) {
+        return container_limit;
+    }
+    return host_memory;
+}
+
+// Only the refresher probes cgroups; concurrent readers may use the previous limit.
+int64_t
+getCachedSystemMemoryLimit() {
+    const auto now = std::chrono::steady_clock::now();
+    if (now < memory_limit_expires.load()) {
+        return cached_memory_limit.load();
+    }
+    std::unique_lock lock(memory_limit_mutex, std::defer_lock);
+    if (cached_memory_limit.load() == 0) {
+        lock.lock();
+    } else if (!lock.try_lock()) {
+        return cached_memory_limit.load();
+    }
+    if (now >= memory_limit_expires.load()) {
+        cached_memory_limit = readSystemMemoryLimit();
+        memory_limit_expires = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    }
+    return cached_memory_limit.load();
+}
+}  // namespace
+
+#ifdef MCL_ENABLE_TEST_CGROUP_OVERRIDE
+// Test-only invalidation when switching synthetic cgroup files.
+void
+resetSystemMemoryLimitCacheForTest() {
+    std::lock_guard lock(memory_limit_mutex);
+    memory_limit_expires = std::chrono::steady_clock::time_point{};
+    cached_memory_limit = 0;
+}
+#endif
+
 SystemResourceInfo
 getSystemMemoryInfo() {
-    SystemResourceInfo info;
+    return getSystemMemoryInfo(ProcessMemoryReader{});
+}
 
-    // Get total memory (host vs container)
-    int64_t host_memory = getHostTotalMemory();
-    int64_t container_limit = getContainerMemLimit();
-
-    if (host_memory == 0 && container_limit == 0) {
-        // This indicates an error or unsupported platform, assume unlimited.
-        info.total_bytes = std::numeric_limits<int64_t>::max();
-        info.used_bytes = 0;
-        return info;
-    }
-
-    if (container_limit > 0 && container_limit < host_memory) {
-        info.total_bytes = container_limit;
-    } else {
-        info.total_bytes = host_memory;
-        if (container_limit > host_memory) {
-            LOG_WARN(
-                "[MCL] Container limit ({}) exceeds host memory ({}), using "
-                "host memory",
-                FormatBytes(container_limit), FormatBytes(host_memory));
-        }
-    }
-
-    // Get current process memory usage (RSS - Shared)
-    info.used_bytes = getCurrentProcessMemoryUsage();
-
-    return info;
+SystemResourceInfo
+getSystemMemoryInfo(const ProcessMemoryReader& reader) {
+    return {getCachedSystemMemoryLimit(), reader.readUsage()};
 }
 
 SystemResourceInfo
@@ -290,49 +330,92 @@ getSystemDiskInfo(const std::string& disk_path) {
 
 int64_t
 getCurrentProcessMemoryUsage() {
+    return ProcessMemoryReader{}.readUsage();
+}
+
+ProcessMemoryReader::ProcessMemoryReader()
 #ifdef __linux__
-    std::ifstream status("/proc/self/status");
-    if (!status.is_open()) {
+    : owner_(folly::get_cached_pid()),
+      status_(::open("/proc/self/status", O_RDONLY | O_CLOEXEC), true)
+#endif
+{
+}
+
+int64_t
+ProcessMemoryReader::readUsage() const {
+#ifdef __linux__
+    folly::File fallback;
+    int fd = status_.fd();
+    const char* path = "/proc/self/status";
+    bool reopen = fd < 0 || owner_ != folly::get_cached_pid();
+#ifdef MCL_ENABLE_TEST_CGROUP_OVERRIDE
+    if (const char* override_path = std::getenv("MCL_PROC_STATUS")) {
+        path = override_path;
+        reopen = true;
+    }
+#endif
+    // An inherited proc fd still refers to the parent process after fork.
+    if (reopen) {
+        fallback = folly::File(::open(path, O_RDONLY | O_CLOEXEC), true);
+        fd = fallback.fd();
+    }
+    if (fd < 0) {
         LOG_WARN("[MCL] Failed to open /proc/self/status, returning 0");
         return 0;
     }
-
-    int64_t rss = 0;
-    int64_t shared = 0;
-    std::string line;
-
-    while (std::getline(status, line)) {
-        if (line.find("VmRSS:") == 0) {
-            std::istringstream iss(line);
-            std::string key;
-            int64_t value;
-            std::string unit;
-
-            if (iss >> key >> value >> unit) {
-                // Convert kB to bytes
-                if (unit == "kB") {
-                    value *= 1024;
+    const auto parse = [](std::string_view text) -> std::optional<int64_t> {
+        int64_t usage = 0;
+        for (const std::string_view key : {"\nVmRSS:", "\nRssFile:"}) {
+            size_t position = 0;
+            if (!text.starts_with(key.substr(1))) {
+                position = text.find(key);
+                if (position == std::string_view::npos) {
+                    return std::nullopt;
                 }
-                rss = value;
+                ++position;  // Skip the newline anchoring the field name.
             }
-        } else if (line.find("RssFile:") == 0) {
-            std::istringstream iss(line);
-            std::string key;
-            int64_t value;
-            std::string unit;
-
-            if (iss >> key >> value >> unit) {
-                // Convert kB to bytes
-                if (unit == "kB") {
-                    value *= 1024;
-                }
-                shared = value;
+            const auto end = text.find('\n', position);
+            if (end == std::string_view::npos) {
+                return std::nullopt;  // A short read may end inside a number.
             }
+            const auto field = text.substr(position, end - position);
+            const auto start = field.find_first_not_of(" \t", key.size() - 1);
+            if (start == std::string_view::npos) {
+                return 0;
+            }
+            int64_t value = 0;
+            const auto result = std::from_chars(field.data() + start, field.data() + field.size(), value);
+            if (result.ec != std::errc{} || value < 0 || value > std::numeric_limits<int64_t>::max() / 1024) {
+                return 0;
+            }
+            usage += key == "\nVmRSS:" ? value * 1024 : -value * 1024;
+        }
+        return usage;
+    };
+    std::array<char, 4096> buffer;
+    std::string partial;
+    off_t offset = 0;
+    while (true) {
+        const auto count = ::pread(fd, buffer.data(), buffer.size(), offset);
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count <= 0) {
+            return 0;
+        }
+        offset += count;
+        std::string_view text(buffer.data(), count);
+        if (!partial.empty()) {
+            partial.append(text);
+            text = partial;
+        }
+        if (const auto usage = parse(text)) {
+            return *usage;
+        }
+        if (partial.empty()) {
+            partial.assign(text);
         }
     }
-
-    // Return RSS - Shared (file-backed memory) to match Go implementation
-    return rss - shared;
 #elif defined(__APPLE__)
     task_vm_info_data_t vm_info;
     mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
