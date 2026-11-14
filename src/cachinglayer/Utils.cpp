@@ -34,8 +34,6 @@
 
 #ifdef __linux__
 #include <fcntl.h>
-#include <folly/File.h>
-#include <folly/Indestructible.h>
 #include <folly/system/Pid.h>
 #include <unistd.h>
 #endif
@@ -292,7 +290,12 @@ resetSystemMemoryLimitCacheForTest() {
 
 SystemResourceInfo
 getSystemMemoryInfo() {
-    return {getCachedSystemMemoryLimit(), getCurrentProcessMemoryUsage()};
+    return getSystemMemoryInfo(ProcessMemoryReader{});
+}
+
+SystemResourceInfo
+getSystemMemoryInfo(const ProcessMemoryReader& reader) {
+    return {getCachedSystemMemoryLimit(), reader.readUsage()};
 }
 
 SystemResourceInfo
@@ -327,14 +330,24 @@ getSystemDiskInfo(const std::string& disk_path) {
 
 int64_t
 getCurrentProcessMemoryUsage() {
+    return ProcessMemoryReader{}.readUsage();
+}
+
+ProcessMemoryReader::ProcessMemoryReader()
 #ifdef __linux__
-    static const auto owner = folly::get_cached_pid();
-    static const folly::Indestructible<folly::File> cached_status(::open("/proc/self/status", O_RDONLY | O_CLOEXEC),
-                                                                  true);
+    : owner_(folly::get_cached_pid()),
+      status_(::open("/proc/self/status", O_RDONLY | O_CLOEXEC), true)
+#endif
+{
+}
+
+int64_t
+ProcessMemoryReader::readUsage() const {
+#ifdef __linux__
     folly::File fallback;
-    int fd = cached_status->fd();
+    int fd = status_.fd();
     const char* path = "/proc/self/status";
-    bool reopen = fd < 0 || owner != folly::get_cached_pid();
+    bool reopen = fd < 0 || owner_ != folly::get_cached_pid();
 #ifdef MCL_ENABLE_TEST_CGROUP_OVERRIDE
     if (const char* override_path = std::getenv("MCL_PROC_STATUS")) {
         path = override_path;

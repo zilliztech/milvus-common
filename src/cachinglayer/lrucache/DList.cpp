@@ -1278,7 +1278,7 @@ DList::checkPhysicalMemoryLimit(const ResourceUsage& size) const {
         return ResourceUsage{0, 0};
     }
     auto current_loading_mem = total_loading_size_.load().memory_bytes;
-    auto sys_mem = getSystemMemoryInfo();
+    auto sys_mem = getSystemMemoryInfo(process_memory_reader_);
     TEST_SYNC_POINT_CALLBACK("DList::PhysicalMemoryInfo", &sys_mem);
     auto projected_mem_usage = current_loading_mem + size.memory_bytes + sys_mem.used_bytes;
 

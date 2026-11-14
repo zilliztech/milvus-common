@@ -20,6 +20,11 @@
 #include <atomic>
 #include <cstdint>
 
+#ifdef __linux__
+#include <folly/File.h>
+#include <sys/types.h>
+#endif
+
 #include "common/CommonMonitor.h"
 #include "common/EasyAssert.h"
 
@@ -332,6 +337,24 @@ struct SystemResourceInfo {
     int64_t used_bytes{0};
 };
 
+/** @brief Reads live process memory usage, owning a separate proc status fd on Linux.
+ * Calls on the same reader must be serialized by its owner.
+ */
+class ProcessMemoryReader {
+ public:
+    ProcessMemoryReader();
+
+    // Returns VmRSS - RssFile in bytes on Linux, or 0 on failure.
+    int64_t
+    readUsage() const;
+
+ private:
+#ifdef __linux__
+    const pid_t owner_;
+    folly::File status_;
+#endif
+};
+
 int64_t
 getHostTotalMemory();
 int64_t
@@ -341,6 +364,10 @@ getContainerMemLimit();
 // Returns unlimited if failed to get memory info, or if the platform is not supported.
 SystemResourceInfo
 getSystemMemoryInfo();
+
+// Reuses the caller's reader; calls using the same reader must be serialized.
+SystemResourceInfo
+getSystemMemoryInfo(const ProcessMemoryReader& reader);
 
 // Returns unlimited if failed to get disk info, or if the platform is not supported.
 SystemResourceInfo

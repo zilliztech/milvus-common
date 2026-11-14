@@ -42,6 +42,7 @@ using milvus::cachinglayer::internal::getContainerMemLimit;
 using milvus::cachinglayer::internal::getCurrentProcessMemoryUsage;
 using milvus::cachinglayer::internal::getSystemDiskInfo;
 using milvus::cachinglayer::internal::getSystemMemoryInfo;
+using milvus::cachinglayer::internal::ProcessMemoryReader;
 using milvus::cachinglayer::internal::SystemResourceInfo;
 
 namespace {
@@ -399,16 +400,17 @@ TEST(Utils, MemoryInfoCachesOnlyTheLimitForFiveSeconds) {
     EnvGuard mem_guard("MEM_LIMIT", nullptr);
     EnvGuard status_guard("MCL_PROC_STATUS", status_path.c_str());
     auto cleanup = folly::makeGuard([&] { fs::remove_all(root); });
-    auto info = getSystemMemoryInfo();
+    ProcessMemoryReader reader;
+    auto info = getSystemMemoryInfo(reader);
     EXPECT_EQ(info.total_bytes, 67108864);
     EXPECT_EQ(info.used_bytes, 70 * 1024);
     std::ofstream(limit_path) << "134217728\n";
     std::ofstream(status_path) << "VmRSS: 200 kB\nRssFile: 30 kB\n";
-    info = getSystemMemoryInfo();
+    info = getSystemMemoryInfo(reader);
     EXPECT_EQ(info.total_bytes, 67108864);
     EXPECT_EQ(info.used_bytes, 170 * 1024);
     std::this_thread::sleep_for(std::chrono::milliseconds(5100));
-    EXPECT_EQ(getSystemMemoryInfo().total_bytes, 134217728);
+    EXPECT_EQ(getSystemMemoryInfo(reader).total_bytes, 134217728);
 #else
     GTEST_SKIP() << "cgroups are Linux-specific";
 #endif
@@ -417,7 +419,8 @@ TEST(Utils, MemoryInfoCachesOnlyTheLimitForFiveSeconds) {
 TEST(Utils, ReusedProcessStatusFdReadsLiveUsage) {
 #ifdef __linux__
     constexpr size_t bytes = 32 * 1024 * 1024;
-    const auto before = getCurrentProcessMemoryUsage();
+    ProcessMemoryReader memory_reader;
+    const auto before = memory_reader.readUsage();
     void* memory = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     ASSERT_NE(memory, MAP_FAILED);
     auto release = folly::makeGuard([&] { munmap(memory, bytes); });
@@ -425,19 +428,55 @@ TEST(Utils, ReusedProcessStatusFdReadsLiveUsage) {
     for (size_t i = 0; i < bytes; i += 4096) {
         pages[i] = 1;
     }
-    const auto during = getCurrentProcessMemoryUsage();
+    const auto during = memory_reader.readUsage();
     EXPECT_GT(during - before, static_cast<int64_t>(bytes / 2));
     std::vector<std::future<int64_t>> readers;
     readers.reserve(8);
     for (int i = 0; i < 8; ++i) {
-        readers.push_back(std::async(std::launch::async, [] { return getCurrentProcessMemoryUsage(); }));
+        readers.push_back(std::async(std::launch::async, [] {
+            ProcessMemoryReader reader;
+            return reader.readUsage();
+        }));
     }
     for (auto& reader : readers) {
         EXPECT_GT(reader.get(), static_cast<int64_t>(bytes / 2));
     }
     ASSERT_EQ(munmap(memory, bytes), 0);
     release.dismiss();
-    EXPECT_GT(during - getCurrentProcessMemoryUsage(), static_cast<int64_t>(bytes / 2));
+    EXPECT_GT(during - memory_reader.readUsage(), static_cast<int64_t>(bytes / 2));
+#else
+    GTEST_SKIP() << "proc status is Linux-specific";
+#endif
+}
+
+TEST(Utils, ProcessMemoryReadersOwnAndReleaseSeparateStatusFds) {
+#ifdef __linux__
+    const auto status_path = fs::canonical("/proc/self") / "status";
+    const auto count_status_fds = [&] {
+        size_t count = 0;
+        for (const auto& entry : fs::directory_iterator("/proc/self/fd")) {
+            std::error_code error;
+            if (fs::read_symlink(entry.path(), error) == status_path && !error) {
+                ++count;
+            }
+        }
+        return count;
+    };
+    const auto before = count_status_fds();
+    {
+        ProcessMemoryReader first;
+        EXPECT_EQ(count_status_fds(), before + 1);
+        {
+            ProcessMemoryReader second;
+            EXPECT_EQ(count_status_fds(), before + 2);
+            EXPECT_GE(first.readUsage(), 0);
+            EXPECT_GE(second.readUsage(), 0);
+            EXPECT_EQ(count_status_fds(), before + 2);
+        }
+        EXPECT_EQ(count_status_fds(), before + 1);
+        EXPECT_GE(first.readUsage(), 0);
+    }
+    EXPECT_EQ(count_status_fds(), before);
 #else
     GTEST_SKIP() << "proc status is Linux-specific";
 #endif

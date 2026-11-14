@@ -379,6 +379,7 @@ class DList : public std::enable_shared_from_this<DList> {
     usageInfo() const;
 
     // Physical memory limit check, used to check if the memory usage will exceed the physical memory limit.
+    // Must be called with list_mtx_ held, which also serializes the process memory reader.
     // Returns the amount of memory that needs to be evicted to satisfy physical memory limit.
     // Returns 0 if no eviction needed, positive value if eviction needed.
     ResourceUsage
@@ -396,6 +397,7 @@ class DList : public std::enable_shared_from_this<DList> {
 
     // TODO(tiered storage 3): benchmark folly::DistributedMutex for this usecase.
     mutable std::mutex list_mtx_;
+    ProcessMemoryReader process_memory_reader_;  // Protected by list_mtx_.
     std::atomic<ResourceUsage> max_resource_limit_;
     std::atomic<ResourceUsage> low_watermark_;
     std::atomic<ResourceUsage> high_watermark_;
