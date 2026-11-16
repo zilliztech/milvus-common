@@ -36,6 +36,21 @@ using milvus::cachinglayer::internal::MockListNode;
 using ::testing::StrictMock;
 using DLF = DListTestFriend;
 
+namespace {
+
+template <typename Future>
+void
+ExpectCancelled(Future&& future) {
+    try {
+        std::move(future).get(std::chrono::seconds(2));
+        FAIL() << "Expected a typed cancellation";
+    } catch (const milvus::SegcoreError& error) {
+        EXPECT_EQ(error.get_error_code(), milvus::ErrorCode::FollyCancel);
+    }
+}
+
+}  // namespace
+
 class DListTest : public ::testing::Test {
  protected:
     ResourceUsage initial_limit{100, 50};
@@ -298,18 +313,24 @@ TEST(DListInlineCompletionTest, NotificationsAllowReentry) {
                               return result.success;
                           })
                     : dlist->ReserveLoadingResourceWithTimeout({40, 0}, timeout, &ctx);
-            auto result = std::move(reservation).via(&folly::InlineExecutor::instance()).thenValue([&](bool success) {
-                EXPECT_TRUE(dlist->IsEmpty());
-                EXPECT_EQ(DLF::get_waiting_request_count(*dlist), 0);
-                if (success) {
-                    if (group_aware) {
-                        dlist->ReleaseLoadingResource({{30, 0}, {}, {10, 0}}, nullptr);
-                    } else {
-                        dlist->ReleaseLoadingResource({40, 0});
+            auto result =
+                std::move(reservation).via(&folly::InlineExecutor::instance()).thenTry([&](folly::Try<bool>&& value) {
+                    EXPECT_TRUE(dlist->IsEmpty());
+                    EXPECT_EQ(DLF::get_waiting_request_count(*dlist), 0);
+                    if (value.hasException()) {
+                        EXPECT_EQ(trigger, Trigger::Cancel);
+                        return value.value();
                     }
-                }
-                return success;
-            });
+                    const bool success = value.value();
+                    if (success) {
+                        if (group_aware) {
+                            dlist->ReleaseLoadingResource({{30, 0}, {}, {10, 0}}, nullptr);
+                        } else {
+                            dlist->ReleaseLoadingResource({40, 0});
+                        }
+                    }
+                    return success;
+                });
             switch (trigger) {
                 case Trigger::Release:
                     dlist->ReleaseLoadingResource({100, 0});
@@ -327,7 +348,11 @@ TEST(DListInlineCompletionTest, NotificationsAllowReentry) {
                     ASSERT_TRUE(dlist->UpdateMaxLimit({20, 0}));
                     break;
             }
-            EXPECT_EQ(std::move(result).get(std::chrono::seconds(2)), trigger == Trigger::Release);
+            if (trigger == Trigger::Cancel) {
+                ExpectCancelled(std::move(result));
+            } else {
+                EXPECT_EQ(std::move(result).get(std::chrono::seconds(2)), trigger == Trigger::Release);
+            }
             if (trigger != Trigger::Release && trigger != Trigger::Shrink) {
                 dlist->ReleaseLoadingResource({100, 0});
             }
@@ -436,16 +461,16 @@ TEST(DListInlineCompletionTest, CancellationNotifiesBeforeRequestLeavesQueue) {
     milvus::OpContext ctx(cancellation.getToken());
     auto tail = dlist->ReserveLoadingResourceWithTimeout({20, 0}, std::chrono::milliseconds(-1), &ctx)
                     .via(&folly::InlineExecutor::instance())
-                    .thenValue([&](bool success) {
+                    .thenTry([&](folly::Try<bool>&& value) {
                         EXPECT_TRUE(dlist->IsEmpty());
                         EXPECT_EQ(DLF::get_waiting_request_count(*dlist), 1);
-                        return success;
+                        return value.value();
                     });
     ASSERT_FALSE(head.isReady());
     ASSERT_FALSE(tail.isReady());
     // The blocked head has an earlier deadline, so handling cancellation cannot pop the tail.
     cancellation.requestCancellation();
-    EXPECT_FALSE(std::move(tail).get(std::chrono::seconds(2)));
+    ExpectCancelled(std::move(tail));
     EXPECT_FALSE(head.isReady());
     dlist->ReleaseLoadingResource({100, 0});
     EXPECT_TRUE(std::move(head).get());
@@ -582,7 +607,11 @@ TEST_F(DListTest, CancelledOrTimedOutPrivateOverheadDoesNotLeakReservations) {
         if (cancel) {
             cancellation.requestCancellation();
         }
-        EXPECT_FALSE(std::move(pending).get(std::chrono::seconds(2)).success);
+        if (cancel) {
+            ExpectCancelled(std::move(pending));
+        } else {
+            EXPECT_FALSE(std::move(pending).get(std::chrono::seconds(2)).success);
+        }
         dlist->ReleaseLoadingResource({100, 0});
         EXPECT_EQ(get_loading_memory(), ResourceUsage{});
         auto retry =
@@ -1770,8 +1799,8 @@ TEST_F(DListTest, ReserveWithCancellationTokenCancelledWhileWaiting) {
     // Cancel the request
     cancel_source.requestCancellation();
 
-    // The future should return false due to cancellation
-    EXPECT_FALSE(std::move(future).get());
+    // The future should throw a typed cancellation
+    ExpectCancelled(std::move(future));
     EXPECT_EQ(get_loading_memory(), ResourceUsage{});
 }
 
@@ -1814,7 +1843,7 @@ TEST_F(DListTest, CancellationOfHeadWaiterReprocessesFollowingRequest) {
     ASSERT_FALSE(following.isReady());
 
     cancel_source.requestCancellation();
-    EXPECT_FALSE(std::move(head).get());
+    ExpectCancelled(std::move(head));
     for (int i = 0; i < 50 && !following.isReady(); ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
@@ -1868,11 +1897,11 @@ TEST_F(DListTest, ReserveWithCancellationTokenMultipleRequests) {
     cancel_source1.requestCancellation();
 
     // First request should fail
-    EXPECT_FALSE(std::move(future1).get());
+    ExpectCancelled(std::move(future1));
 
     // Cancel the second request too
     cancel_source2.requestCancellation();
-    EXPECT_FALSE(std::move(future2).get());
+    ExpectCancelled(std::move(future2));
 
     EXPECT_EQ(get_loading_memory(), ResourceUsage{});
 }
@@ -1902,7 +1931,7 @@ TEST_F(DListTest, ReserveWithCancellationTokenResourceFreedAfterCancel) {
 
     // Cancel the request
     cancel_source.requestCancellation();
-    EXPECT_FALSE(std::move(future).get());
+    ExpectCancelled(std::move(future));
 
     // Resource should not be reserved after cancellation
     EXPECT_EQ(get_loading_memory(), ResourceUsage{});
@@ -1986,8 +2015,8 @@ TEST_F(DListTest, ReserveWithCancellationTokenCancelledQuickly) {
     // Cancel the request
     cancel_source.requestCancellation();
 
-    // The future should return false due to cancellation
-    EXPECT_FALSE(std::move(future).get());
+    // The future should throw a typed cancellation
+    ExpectCancelled(std::move(future));
 
     auto duration = std::chrono::steady_clock::now() - start;
 
@@ -2001,7 +2030,7 @@ TEST_F(DListTest, ReserveWithCancellationTokenCancelledQuickly) {
 }
 
 TEST_F(DListTest, ReserveWithAlreadyCancelledToken) {
-    // Test that a pre-cancelled token returns false quickly without waiting for timeout.
+    // Test that a pre-cancelled token throws a typed cancellation quickly without waiting for timeout.
     // This specifically catches the bug where isCancellationRequested() was used instead
     // of canBeCancelled() - with that bug, a pre-cancelled token would still register
     // the callback (since isCancellationRequested() returns true), but a token cancelled
@@ -2028,8 +2057,8 @@ TEST_F(DListTest, ReserveWithAlreadyCancelledToken) {
     auto future =
         dlist->ReserveLoadingResourceWithTimeout(reserve_size, std::chrono::milliseconds(60000), op_ctx.get());
 
-    // The future should return false due to cancellation
-    EXPECT_FALSE(std::move(future).get());
+    // The future should throw a typed cancellation
+    ExpectCancelled(std::move(future));
 
     auto duration = std::chrono::steady_clock::now() - start;
 
@@ -2078,8 +2107,8 @@ TEST_F(DListTest, ReserveWithNegativeTimeoutWaitsIndefinitelyUntilCancelled) {
         cancel_source.requestCancellation();
     });
 
-    // The future should return false due to cancellation (not timeout)
-    EXPECT_FALSE(std::move(future).get());
+    // The future should throw a typed cancellation (not timeout)
+    ExpectCancelled(std::move(future));
 
     auto duration = std::chrono::steady_clock::now() - start;
 

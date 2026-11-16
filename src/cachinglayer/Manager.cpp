@@ -34,6 +34,12 @@ Manager::~Manager() {
 }
 
 void
+Manager::SetLoadPoolThreads(size_t threads) {
+    AssertInfo(threads > 0, "Shared load pool must have at least one thread");
+    internal::SharedLoadThreadPool().setNumThreads(threads);
+}
+
+void
 Manager::ConfigureTieredStorage(CacheWarmupPolicies warmup_policies, CacheLimit cache_limit,
                                 bool storage_usage_tracking_enabled, bool eviction_enabled,
                                 EvictionConfig eviction_config, std::chrono::milliseconds loading_timeout,
