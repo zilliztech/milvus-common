@@ -36,6 +36,21 @@ using milvus::cachinglayer::internal::MockListNode;
 using ::testing::StrictMock;
 using DLF = DListTestFriend;
 
+namespace {
+
+// Observe asynchronous delivery without consuming a SemiFuture.
+template <typename Future>
+bool
+WaitUntilReady(const Future& future) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!future.isReady() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return future.isReady();
+}
+
+}  // namespace
+
 class DListTest : public ::testing::Test {
  protected:
     ResourceUsage initial_limit{100, 50};
@@ -259,11 +274,11 @@ TEST(DListNotificationTest, UnpinDuringReservationDoesNotLoseNotification) {
             }
             EXPECT_EQ(node.test_get_pin_count(), 0);
             // A reservation is active even though it has not enqueued anything yet.
-            EXPECT_EQ(unpin.wait_for(std::chrono::milliseconds(20)), std::future_status::timeout);
+            EXPECT_EQ(unpin.wait_for(std::chrono::seconds(1)), std::future_status::ready);
             resume.set_value();
             auto pending = reserve.get();
             unpin.get();
-            EXPECT_TRUE(pending.isReady());
+            EXPECT_TRUE(WaitUntilReady(pending));
             if (!pending.isReady()) {
                 DLF::test_clear_waiting_queue(dlist.get());
             }
@@ -375,9 +390,13 @@ TEST(DListNotificationTest, QueuedLoadsRunOnWaitingExecutor) {
         ASSERT_EQ(DLF::get_waiting_request_count(*dlist), kLoads);
         dlist->ReleaseLoadingResource(capacity);
         EXPECT_EQ(completed, 0);
-        executor.drain();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (completed < kLoads && std::chrono::steady_clock::now() < deadline) {
+            executor.drain();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
         for (auto& load : loads) {
-            ASSERT_TRUE(load.isReady());
+            ASSERT_TRUE(WaitUntilReady(load));
             EXPECT_NO_THROW(std::move(load).get());
         }
         EXPECT_EQ(completed, kLoads);
@@ -483,7 +502,7 @@ TEST(DListInlineCompletionTest, BonusPublicationNotifiesAfterNodeUnlock) {
     // Make room for the bonus without notifying waiters before it is published.
     DLF::test_sub_loading_memory(dlist.get(), {20, 0});
     node.LoadBonus(*dlist);
-    ASSERT_TRUE(pending.isReady());
+    ASSERT_TRUE(WaitUntilReady(pending));
     EXPECT_NO_THROW(std::move(pending).get());
     dlist->ReleaseLoadingResource({80, 0});
     EXPECT_EQ(DLF::get_using_memory(*dlist), ResourceUsage{});
@@ -559,7 +578,7 @@ TEST_F(DListTest, PrivateOverheadCannotWaitWhenRequestLocalMinimumExceedsCapacit
     dlist->BindLoadingOverheadGroups(binding);
     const LoadingResourceUsage usage{{10, 0}, {91, 0}, {100, 0}};
     auto result = dlist->ReserveLoadingResourceWithTimeout(usage, &binding, std::chrono::milliseconds(-1));
-    ASSERT_TRUE(result.isReady());
+    ASSERT_TRUE(WaitUntilReady(result));
     EXPECT_FALSE(std::move(result).get().success);
     EXPECT_EQ(DLF::get_waiting_request_count(*dlist), 0);
     EXPECT_EQ(get_loading_memory(), ResourceUsage{});
@@ -719,13 +738,13 @@ TEST_F(DListTest, AggregateOverflowDuringWaiterRetryFailsCleanly) {
 
     ASSERT_NO_THROW(EXPECT_EQ(local_dlist->UpdateLoadingOverheadGroup(group, LoadingOverheadPolicy::Executor(0)),
                               LoadingOverheadUpdateResult::kApplied));
-    ASSERT_TRUE(overflow_waiter.isReady());
+    ASSERT_TRUE(WaitUntilReady(overflow_waiter));
     EXPECT_FALSE(std::move(overflow_waiter).get().success);
     EXPECT_FALSE(deferred_peer.isReady());
 
     EXPECT_EQ(local_dlist->ReleaseLoadingResource({{}, {}, {kLargeOverhead, 0}}, &binding), ResourceUsage{});
     local_dlist->ReleaseLoadingResource({100, 0});
-    ASSERT_TRUE(deferred_peer.isReady());
+    ASSERT_TRUE(WaitUntilReady(deferred_peer));
     EXPECT_TRUE(std::move(deferred_peer).get());
     local_dlist->ReleaseLoadingResource({1, 0});
     local_dlist->UnbindLoadingOverheadGroups(binding);
@@ -753,7 +772,7 @@ TEST_F(DListTest, UnbindingLargestRuntimeUnitWakesWaiters) {
     ASSERT_FALSE(waiter.isReady());
 
     dlist->UnbindLoadingOverheadGroups(large_binding);
-    ASSERT_TRUE(waiter.isReady());
+    ASSERT_TRUE(WaitUntilReady(waiter));
 
     auto result = std::move(waiter).get();
     ASSERT_TRUE(result.success);
@@ -812,7 +831,7 @@ TEST_F(DListTest, PolicyGrowthReheapsIndefiniteWaiters) {
               LoadingOverheadUpdateResult::kApplied);
     dlist->ReleaseLoadingResource({10, 0});
 
-    EXPECT_TRUE(smaller.isReady());
+    EXPECT_TRUE(WaitUntilReady(smaller));
     EXPECT_FALSE(growing.isReady());
 
     dlist->ReleaseLoadingResource({90, 0});
@@ -854,7 +873,7 @@ TEST_F(DListTest, PolicyShrinkRechecksNonTopIndefiniteWaiter) {
               LoadingOverheadUpdateResult::kApplied);
     dlist->ReleaseLoadingResource({8, 0});
 
-    EXPECT_TRUE(shrinking.isReady());
+    EXPECT_TRUE(WaitUntilReady(shrinking));
     EXPECT_FALSE(blocking.isReady());
 
     dlist->ReleaseLoadingResource({92, 0});
@@ -1072,7 +1091,7 @@ TEST_F(DListTest, GroupReconfigurationReprocessesWaitersWithNewBound) {
 
     EXPECT_EQ(dlist->UpdateLoadingOverheadGroup(group, LoadingOverheadPolicy::Budget(80)),
               LoadingOverheadUpdateResult::kApplied);
-    EXPECT_TRUE(waiter.isReady());
+    EXPECT_TRUE(WaitUntilReady(waiter));
     const auto waiter_result = std::move(waiter).get();
     EXPECT_TRUE(waiter_result.success);
     EXPECT_EQ(waiter_result.reserved, ResourceUsage{});
@@ -1100,7 +1119,7 @@ TEST_F(DListTest, UpdateMaxLimitIncreaseReprocessesWaiters) {
     ASSERT_FALSE(waiter.isReady());
 
     ASSERT_TRUE(dlist->UpdateMaxLimit({150, 50}));
-    ASSERT_TRUE(waiter.isReady());
+    ASSERT_TRUE(WaitUntilReady(waiter));
     EXPECT_TRUE(std::move(waiter).get());
     EXPECT_EQ(get_loading_memory(), (ResourceUsage{130, 0}));
     dlist->ReleaseLoadingResource({50, 0});
@@ -1792,7 +1811,7 @@ TEST_F(DListTest, TimeoutOfHeadWaiterReprocessesFollowingRequest) {
     for (int i = 0; i < 50 && !following.isReady(); ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-    ASSERT_TRUE(following.isReady());
+    ASSERT_TRUE(WaitUntilReady(following));
     EXPECT_TRUE(std::move(following).get());
     dlist->ReleaseLoadingResource({20, 0});
     dlist->ReleaseLoadingResource({70, 0});
@@ -1818,7 +1837,7 @@ TEST_F(DListTest, CancellationOfHeadWaiterReprocessesFollowingRequest) {
     for (int i = 0; i < 50 && !following.isReady(); ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-    ASSERT_TRUE(following.isReady());
+    ASSERT_TRUE(WaitUntilReady(following));
     EXPECT_TRUE(std::move(following).get());
     dlist->ReleaseLoadingResource({20, 0});
     dlist->ReleaseLoadingResource({70, 0});
@@ -2210,3 +2229,416 @@ TEST_F(DListTest, ReserveWithZeroTimeoutEvictsAndSucceeds) {
 
     dlist->ReleaseLoadingResource(reserve_size);
 }
+
+TEST(DListBackgroundSchedulingTest, ReleaseDoesNotWaitForListLockWithQueuedRequest) {
+    auto dlist = std::make_shared<DList>(true, ResourceUsage{100, 0}, ResourceUsage{80, 0}, ResourceUsage{90, 0},
+                                         EvictionConfig{});
+    ASSERT_TRUE(std::move(dlist->ReserveLoadingResourceWithTimeout({100, 0}, std::chrono::milliseconds(0))).get());
+    auto pending = dlist->ReserveLoadingResourceWithTimeout({40, 0}, std::chrono::milliseconds(-1));
+    ASSERT_FALSE(pending.isReady());
+    auto lock = DLF::test_lock_list(dlist.get());
+    auto release = std::async(std::launch::async, [&] { dlist->ReleaseLoadingResource({100, 0}); });
+    EXPECT_EQ(release.wait_for(std::chrono::milliseconds(200)), std::future_status::ready);
+    lock.unlock();
+    release.get();
+    EXPECT_TRUE(std::move(pending).get(std::chrono::seconds(2)));
+    dlist->ReleaseLoadingResource({40, 0});
+}
+
+TEST(DListBackgroundSchedulingTest, DisabledEvictionStillRetriesAfterRelease) {
+    auto dlist = std::make_shared<DList>(false, ResourceUsage{0, 100}, ResourceUsage{0, 80}, ResourceUsage{0, 90},
+                                         EvictionConfig{});
+    ASSERT_TRUE(std::move(dlist->ReserveLoadingResourceWithTimeout({0, 100}, std::chrono::milliseconds(0))).get());
+    auto pending = dlist->ReserveLoadingResourceWithTimeout({0, 30}, std::chrono::milliseconds(-1));
+    ASSERT_FALSE(pending.isReady());
+    dlist->ReleaseLoadingResource({0, 100});
+    EXPECT_TRUE(std::move(pending).get(std::chrono::seconds(2)));
+    EXPECT_EQ(DLF::get_loading_memory(*dlist), (ResourceUsage{0, 30}));
+    dlist->ReleaseLoadingResource({0, 30});
+}
+
+TEST(DListBackgroundSchedulingTest, DisabledEvictionHandlesTimeoutCancellationAndShutdown) {
+    auto dlist = std::make_shared<DList>(false, ResourceUsage{0, 100}, ResourceUsage{0, 80}, ResourceUsage{0, 90},
+                                         EvictionConfig{});
+    ASSERT_TRUE(std::move(dlist->ReserveLoadingResourceWithTimeout({0, 100}, std::chrono::milliseconds(0))).get());
+
+    auto timed = dlist->ReserveLoadingResourceWithTimeout({0, 30}, std::chrono::milliseconds(20));
+    EXPECT_FALSE(std::move(timed).get(std::chrono::seconds(2)));
+
+    folly::CancellationSource cancellation;
+    milvus::OpContext ctx(cancellation.getToken());
+    auto cancelled = dlist->ReserveLoadingResourceWithTimeout({0, 30}, std::chrono::milliseconds(-1), &ctx);
+    ASSERT_FALSE(cancelled.isReady());
+    cancellation.requestCancellation();
+    EXPECT_FALSE(std::move(cancelled).get(std::chrono::seconds(2)));
+
+    auto pending = dlist->ReserveLoadingResourceWithTimeout({0, 30}, std::chrono::milliseconds(-1));
+    ASSERT_FALSE(pending.isReady());
+    dlist.reset();
+    EXPECT_FALSE(std::move(pending).get(std::chrono::seconds(2)));
+}
+
+#ifdef ENABLE_SYNCPOINT
+TEST(DListBackgroundSchedulingTest, DisabledEvictionDoesNotEvictFromReservationsOrPeriodicChecks) {
+    auto dlist = std::make_shared<DList>(false, ResourceUsage{0, 100}, ResourceUsage{0, 80}, ResourceUsage{0, 90},
+                                         EvictionConfig{0, true, 20});
+    ::testing::NiceMock<MockListNode> node(dlist.get(), "evictable");
+    node.test_set_loaded_size({0, 100});
+    node.test_set_state(ListNode::State::CACHED);
+    dlist->ChargeLoadedResource({0, 100});
+    dlist->touchItem(&node, true, ResourceUsage{0, 100});
+    EXPECT_CALL(node, unload()).Times(0);
+
+    // The global switch must override the periodic eviction setting and on-demand eviction.
+    EXPECT_FALSE(std::move(dlist->ReserveLoadingResourceWithTimeout({0, 1}, std::chrono::milliseconds(0))).get());
+    const auto worker = DLF::background_thread_id(*dlist);
+    std::promise<void> checked;
+    auto future = checked.get_future();
+    int ticks = 0;
+    auto* sync = milvus::SyncPoint::GetInstance();
+    sync->Reset();
+    auto reset = folly::makeGuard([&] { sync->Reset(); });
+    sync->SetCallBack("DList::WaitingBatchComplete", [&](void*) {
+        if (std::this_thread::get_id() == worker && ++ticks == 2) {
+            checked.set_value();
+        }
+    });
+    sync->EnableProcessing();
+    EXPECT_EQ(future.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    sync->Reset();
+    EXPECT_EQ(DLF::get_used_memory(*dlist), (ResourceUsage{0, 100}));
+}
+
+TEST(DListBackgroundSchedulingTest, PeriodicRetriesOnlyForPhysicalBlockers) {
+    for (const bool physical : {false, true}) {
+        SCOPED_TRACE(physical);
+        auto dlist = std::make_shared<DList>(true, ResourceUsage{100, 0}, ResourceUsage{80, 0}, ResourceUsage{90, 0},
+                                             EvictionConfig{});
+        const auto worker = DLF::background_thread_id(*dlist);
+        std::atomic<int64_t> used{physical ? 95 : 0};
+        std::atomic<int> attempts{0};
+        int ticks = 0;
+        std::promise<void> ticked;
+        auto ticked_future = ticked.get_future();
+        auto* sync = milvus::SyncPoint::GetInstance();
+        sync->Reset();
+        auto reset = folly::makeGuard([&] { sync->Reset(); });
+        sync->SetCallBack("DList::PhysicalMemoryInfo", [&](void* value) {
+            *static_cast<milvus::cachinglayer::internal::SystemResourceInfo*>(value) = {physical ? 100 : 1000,
+                                                                                        used.load()};
+        });
+        sync->SetCallBack("DList::ReserveResourceInternal", [&](void*) {
+            if (std::this_thread::get_id() == worker) {
+                ++attempts;
+            }
+        });
+        sync->SetCallBack("DList::WaitingBatchComplete", [&](void*) {
+            if (std::this_thread::get_id() == worker && ++ticks == 2) {
+                ticked.set_value();
+            }
+        });
+        sync->EnableProcessing();
+        if (!physical) {
+            ASSERT_TRUE(
+                std::move(dlist->ReserveLoadingResourceWithTimeout({100, 0}, std::chrono::milliseconds(0))).get());
+        }
+        auto pending = dlist->ReserveLoadingResourceWithTimeout({1, 0}, std::chrono::milliseconds(-1));
+        ASSERT_FALSE(pending.isReady());
+        used = 0;
+        EXPECT_EQ(ticked_future.wait_for(std::chrono::seconds(4)), std::future_status::ready);
+        if (physical) {
+            EXPECT_TRUE(std::move(pending).get(std::chrono::seconds(1)));
+            EXPECT_EQ(attempts, 1);
+        } else {
+            EXPECT_FALSE(pending.isReady());
+            EXPECT_EQ(attempts, 0);
+            dlist->ReleaseLoadingResource({100, 0});
+            EXPECT_TRUE(std::move(pending).get(std::chrono::seconds(1)));
+        }
+        sync->Reset();
+        dlist->ReleaseLoadingResource({1, 0});
+    }
+}
+
+TEST(DListBackgroundSchedulingTest, CombinedLimitFailureRetriesAfterPhysicalRecovery) {
+    for (const bool background_eviction : {false, true}) {
+        SCOPED_TRACE(background_eviction);
+        EvictionConfig config{0, background_eviction, 20};
+        auto dlist =
+            std::make_shared<DList>(true, ResourceUsage{100, 0}, ResourceUsage{80, 0}, ResourceUsage{90, 0}, config);
+        std::atomic<int64_t> used{930};
+        auto* sync = milvus::SyncPoint::GetInstance();
+        sync->Reset();
+        auto reset = folly::makeGuard([&] { sync->Reset(); });
+        sync->SetCallBack("DList::PhysicalMemoryInfo", [&](void* value) {
+            *static_cast<milvus::cachinglayer::internal::SystemResourceInfo*>(value) = {1000, used.load()};
+        });
+        sync->EnableProcessing();
+
+        // 60 bytes are in use and cannot be evicted; another 20 are evictable.
+        // No load is in progress, and usage is below the periodic eviction watermark.
+        dlist->ChargeLoadedResource({60, 0});
+        ::testing::NiceMock<MockListNode> node(dlist.get(), "evictable");
+        node.test_set_loaded_size({20, 0});
+        node.test_set_state(ListNode::State::CACHED);
+        dlist->ChargeLoadedResource({20, 0});
+        dlist->touchItem(&node, true, ResourceUsage{20, 0});
+        EXPECT_CALL(node, unload()).Times(1);
+
+        // Logical capacity needs 10 bytes freed, but the physical deficit is over 20.
+        // The first attempt therefore cannot evict anything and must wait.
+        auto pending = dlist->ReserveLoadingResourceWithTimeout({30, 0}, std::chrono::milliseconds(-1));
+        EXPECT_FALSE(pending.isReady());
+        EXPECT_EQ(DLF::get_used_memory(*dlist), (ResourceUsage{80, 0}));
+        EXPECT_EQ(DLF::get_loading_memory(*dlist), ResourceUsage{});
+
+        // Simulate another part of the process freeing memory, without notifying DList.
+        // A periodic retry must evict the node and admit the request.
+        used = 800;
+        const bool ready = WaitUntilReady(pending);
+        EXPECT_TRUE(ready);
+        if (ready) {
+            EXPECT_TRUE(std::move(pending).get());
+            EXPECT_EQ(DLF::get_used_memory(*dlist), (ResourceUsage{60, 0}));
+            EXPECT_EQ(DLF::get_loading_memory(*dlist), (ResourceUsage{30, 0}));
+            dlist->ReleaseLoadingResource({30, 0});
+        }
+        sync->Reset();
+    }
+}
+
+TEST(DListBackgroundSchedulingTest, DeferredRequestsAreRestoredInBatches) {
+    auto dlist = std::make_shared<DList>(true, ResourceUsage{100, 0}, ResourceUsage{80, 0}, ResourceUsage{90, 0},
+                                         EvictionConfig{});
+    ASSERT_TRUE(std::move(dlist->ReserveLoadingResourceWithTimeout({100, 0}, std::chrono::milliseconds(0))).get());
+    std::vector<folly::SemiFuture<bool>> pending;
+    pending.reserve(130);
+    for (int i = 0; i < 130; ++i) {
+        pending.push_back(dlist->ReserveLoadingResourceWithTimeout({1, 0}, std::chrono::milliseconds(-1)));
+    }
+    auto* sync = milvus::SyncPoint::GetInstance();
+    sync->Reset();
+    auto reset = folly::makeGuard([&] { sync->Reset(); });
+    const auto worker = DLF::background_thread_id(*dlist);
+    size_t previous_size = 130;
+    int restore_batches = 0;
+    std::promise<void> finished;
+    auto finish = finished.get_future();
+    bool completed = false;
+    sync->SetCallBack("DList::WaitingBatchComplete", [&](void* value) {
+        if (std::this_thread::get_id() != worker || completed) {
+            return;
+        }
+        // Taking the lock here also verifies that the worker releases it between batches.
+        const auto size = DLF::waiting_queue_size(*dlist);
+        if (size > previous_size) {
+            EXPECT_LE(size - previous_size, 64);
+            ++restore_batches;
+        }
+        previous_size = size;
+        if (!*static_cast<bool*>(value)) {
+            completed = true;
+            finished.set_value();
+        }
+    });
+    sync->EnableProcessing();
+    dlist->ReleaseLoadingResource({0, 0});
+    EXPECT_EQ(finish.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    sync->Reset();
+    EXPECT_EQ(restore_batches, 3);
+    EXPECT_EQ(DLF::waiting_queue_size(*dlist), 130);
+}
+
+TEST(DListBackgroundSchedulingTest, PhysicalEvictionRechecksLiveUsage) {
+    auto dlist = std::make_shared<DList>(true, ResourceUsage{100, 0}, ResourceUsage{80, 0}, ResourceUsage{90, 0},
+                                         EvictionConfig{});
+    auto* sync = milvus::SyncPoint::GetInstance();
+    sync->Reset();
+    auto reset = folly::makeGuard([&] { sync->Reset(); });
+    int reads = 0;
+    sync->SetCallBack("DList::PhysicalMemoryInfo", [&](void* value) {
+        ++reads;
+        *static_cast<milvus::cachinglayer::internal::SystemResourceInfo*>(value) = {100, reads == 1 ? 95 : 75};
+    });
+    sync->EnableProcessing();
+    ::testing::NiceMock<MockListNode> node(dlist.get(), "node");
+    node.test_set_loaded_size({20, 0});
+    node.test_set_state(ListNode::State::CACHED);
+    dlist->ChargeLoadedResource({20, 0});
+    dlist->touchItem(&node, true, ResourceUsage{20, 0});
+    EXPECT_CALL(node, unload()).Times(1);
+    EXPECT_TRUE(std::move(dlist->ReserveLoadingResourceWithTimeout({1, 0}, std::chrono::milliseconds(0))).get());
+    EXPECT_EQ(reads, 2);
+    dlist->ReleaseLoadingResource({1, 0});
+    sync->Reset();
+}
+
+TEST(DListBackgroundSchedulingTest, PhysicalEvictionRetriesAtMostTwice) {
+    for (const int rounds_needed : {2, 3, 4}) {
+        SCOPED_TRACE(rounds_needed);
+        auto dlist = std::make_shared<DList>(true, ResourceUsage{100, 0}, ResourceUsage{80, 0}, ResourceUsage{90, 0},
+                                             EvictionConfig{});
+        auto* sync = milvus::SyncPoint::GetInstance();
+        sync->Reset();
+        auto reset = folly::makeGuard([&] { sync->Reset(); });
+        int reads = 0;
+        sync->SetCallBack("DList::PhysicalMemoryInfo", [&](void* value) {
+            ++reads;
+            *static_cast<milvus::cachinglayer::internal::SystemResourceInfo*>(value) = {
+                100, reads <= rounds_needed ? 95 : 75};
+        });
+        sync->EnableProcessing();
+        const int expected_evictions = std::min(rounds_needed, 3);
+        std::vector<std::unique_ptr<::testing::NiceMock<MockListNode>>> nodes;
+        nodes.reserve(4);
+        for (int i = 0; i < 4; ++i) {
+            auto node = std::make_unique<::testing::NiceMock<MockListNode>>(dlist.get(), std::to_string(i));
+            node->test_set_loaded_size({20, 0});
+            node->test_set_state(ListNode::State::CACHED);
+            dlist->ChargeLoadedResource({20, 0});
+            dlist->touchItem(node.get(), true, ResourceUsage{20, 0});
+            EXPECT_CALL(*node, unload()).Times(i < expected_evictions ? 1 : 0);
+            nodes.push_back(std::move(node));
+        }
+
+        // Even a non-waiting caller can succeed on a retry. If a fourth round would be needed,
+        // stop after three rounds although another evictable node remains.
+        const bool success =
+            std::move(dlist->ReserveLoadingResourceWithTimeout({1, 0}, std::chrono::milliseconds(0))).get();
+        EXPECT_EQ(success, rounds_needed <= 3);
+        EXPECT_EQ(reads, expected_evictions + 1);
+        if (success) {
+            dlist->ReleaseLoadingResource({1, 0});
+        }
+        sync->Reset();
+    }
+}
+
+TEST(DListBackgroundSchedulingTest, TimeoutRunsBetweenBackgroundBatches) {
+    auto dlist = std::make_shared<DList>(true, ResourceUsage{1000, 0}, ResourceUsage{800, 0}, ResourceUsage{900, 0},
+                                         EvictionConfig{});
+    ASSERT_TRUE(std::move(dlist->ReserveLoadingResourceWithTimeout({1000, 0}, std::chrono::milliseconds(0))).get());
+    auto* sync = milvus::SyncPoint::GetInstance();
+    sync->Reset();
+    auto reset = folly::makeGuard([&] { sync->Reset(); });
+    std::promise<void> reached;
+    auto reached_future = reached.get_future();
+    std::promise<void> resume;
+    auto resume_future = resume.get_future();
+    auto unblock = folly::makeGuard([&] { resume.set_value(); });
+    std::atomic<bool> paused{false};
+    sync->SetCallBack("DList::WaitingBatchComplete", [&](void* value) {
+        if (*static_cast<bool*>(value) && !paused.exchange(true)) {
+            reached.set_value();
+            resume_future.wait();
+        }
+    });
+    sync->EnableProcessing();
+    folly::CancellationSource cancellation;
+    milvus::OpContext ctx(cancellation.getToken());
+    auto cancelled = dlist->ReserveLoadingResourceWithTimeout({1, 0}, std::chrono::milliseconds(-1), &ctx);
+    std::vector<folly::SemiFuture<bool>> pending;
+    pending.reserve(130);
+    for (int i = 0; i < 130; ++i) {
+        pending.push_back(dlist->ReserveLoadingResourceWithTimeout({2, 0}, std::chrono::milliseconds(-1)));
+    }
+    dlist->ReleaseLoadingResource({0, 0});
+    const auto status = reached_future.wait_for(std::chrono::seconds(2));
+    EXPECT_EQ(status, std::future_status::ready);
+    if (status == std::future_status::ready) {
+        auto timed = dlist->ReserveLoadingResourceWithTimeout({1, 0}, std::chrono::milliseconds(20));
+        // The background scan is paused; EventBase must still handle timeout and
+        // cancellation, including a request temporarily removed from the heap.
+        cancellation.requestCancellation();
+        EXPECT_FALSE(std::move(cancelled).get(std::chrono::seconds(1)));
+        EXPECT_FALSE(std::move(timed).get(std::chrono::seconds(1)));
+    }
+    resume.set_value();
+    unblock.dismiss();
+    dlist->ReleaseLoadingResource({1000, 0});
+    for (auto& request : pending) {
+        EXPECT_TRUE(std::move(request).get(std::chrono::seconds(2)));
+        dlist->ReleaseLoadingResource({2, 0});
+    }
+    sync->Reset();
+    EXPECT_EQ(DLF::get_waiting_request_count(*dlist), 0);
+}
+#endif
+
+TEST(DListBackgroundSchedulingTest, CompletionCanReleaseLastOwner) {
+    auto dlist = std::make_shared<DList>(true, ResourceUsage{100, 0}, ResourceUsage{80, 0}, ResourceUsage{90, 0},
+                                         EvictionConfig{});
+    ASSERT_TRUE(std::move(dlist->ReserveLoadingResourceWithTimeout({100, 0}, std::chrono::milliseconds(0))).get());
+    const std::weak_ptr<DList> weak = dlist;
+    std::promise<void> released;
+    auto released_future = released.get_future();
+    auto result = dlist->ReserveLoadingResourceWithTimeout({1, 0}, std::chrono::milliseconds(-1))
+                      .via(&folly::InlineExecutor::instance())
+                      .thenValue([owner = dlist, &released_future](bool success) mutable {
+                          released_future.wait();
+                          owner.reset();
+                          return success;
+                      });
+    dlist->ReleaseLoadingResource({100, 0});
+    dlist.reset();
+    released.set_value();
+    EXPECT_TRUE(std::move(result).get(std::chrono::seconds(2)));
+    EXPECT_TRUE(weak.expired());
+}
+
+#ifdef ENABLE_SYNCPOINT
+TEST(DListPhysicalMemoryTest, EachReservationReadsCurrentUsage) {
+    for (const bool group_aware : {false, true}) {
+        SCOPED_TRACE(group_aware);
+        // Usage changes must be visible on the next reservation without waiting for a periodic check.
+        auto dlist = std::make_shared<DList>(false, ResourceUsage{1000, 1000}, ResourceUsage{800, 800},
+                                             ResourceUsage{900, 900}, EvictionConfig{});
+        auto reserve = [&] {
+            return group_aware
+                       ? std::move(dlist->ReserveLoadingResourceWithTimeout({{150, 0}, {}, {}}, nullptr,
+                                                                            std::chrono::milliseconds(0)))
+                             .get()
+                             .success
+                       : std::move(dlist->ReserveLoadingResourceWithTimeout({150, 0}, std::chrono::milliseconds(0)))
+                             .get();
+        };
+        auto release = [&] {
+            if (group_aware) {
+                dlist->ReleaseLoadingResource({{150, 0}, {}, {}}, nullptr);
+            } else {
+                dlist->ReleaseLoadingResource({150, 0});
+            }
+        };
+        auto* sync = milvus::SyncPoint::GetInstance();
+        sync->Reset();
+        auto reset = folly::makeGuard([&] { sync->Reset(); });
+        int64_t used = 700;
+        sync->SetCallBack("DList::PhysicalMemoryInfo", [&](void* value) {
+            *static_cast<milvus::cachinglayer::internal::SystemResourceInfo*>(value) = {1000, used};
+        });
+        sync->EnableProcessing();
+        // Disk residency must not consume physical-memory headroom.
+        dlist->ChargeLoadedResource({0, 500});
+        ASSERT_TRUE(reserve());
+        dlist->ChargeLoadedResource({150, 0});
+        used = 850;
+        release();
+        EXPECT_EQ(DLF::get_loading_memory(*dlist), ResourceUsage{});
+        const bool admitted = reserve();
+        EXPECT_FALSE(admitted);
+        if (admitted) {
+            release();
+        }
+        dlist->RefundLoadedResource({150, 500});
+        const bool admitted_before_sample = reserve();
+        EXPECT_FALSE(admitted_before_sample);
+        if (admitted_before_sample) {
+            release();
+        }
+        used = 700;
+        EXPECT_TRUE(reserve());
+        release();
+    }
+}
+
+#endif
