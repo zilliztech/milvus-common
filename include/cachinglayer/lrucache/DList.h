@@ -50,32 +50,29 @@ class DList : public std::enable_shared_from_this<DList> {
         : max_resource_limit_(max_memory),
           low_watermark_(low_watermark),
           high_watermark_(high_watermark),
+          eviction_enabled_(eviction_enabled),
           eviction_config_(eviction_config),
           next_request_id_(1) {
-        // if eviction is disabled, we don't need to initialize the event base and thread
-        if (!eviction_enabled) {
-            return;
+        if (eviction_enabled_) {
+            AssertInfo(low_watermark.AllGEZero(), "[MCL] low watermark must be greater than or equal to 0");
+            AssertInfo((high_watermark - low_watermark).AllGEZero(),
+                       "[MCL] high watermark must be greater than low watermark");
+            AssertInfo((max_memory - high_watermark).AllGEZero(),
+                       "[MCL] max memory must be greater than high watermark");
+
+            monitor::cache_capacity_bytes(StorageType::MEMORY).Set(max_memory.memory_bytes);
+            monitor::cache_capacity_bytes(StorageType::DISK).Set(max_memory.file_bytes);
+            monitor::cache_high_watermark_bytes(StorageType::MEMORY).Set(high_watermark.memory_bytes);
+            monitor::cache_high_watermark_bytes(StorageType::DISK).Set(high_watermark.file_bytes);
+            monitor::cache_low_watermark_bytes(StorageType::MEMORY).Set(low_watermark.memory_bytes);
+            monitor::cache_low_watermark_bytes(StorageType::DISK).Set(low_watermark.file_bytes);
         }
 
-        AssertInfo(low_watermark.AllGEZero(), "[MCL] low watermark must be greater than or equal to 0");
-        AssertInfo((high_watermark - low_watermark).AllGEZero(),
-                   "[MCL] high watermark must be greater than low watermark");
-        AssertInfo((max_memory - high_watermark).AllGEZero(), "[MCL] max memory must be greater than high watermark");
-
-        monitor::cache_capacity_bytes(StorageType::MEMORY).Set(max_memory.memory_bytes);
-        monitor::cache_capacity_bytes(StorageType::DISK).Set(max_memory.file_bytes);
-        monitor::cache_high_watermark_bytes(StorageType::MEMORY).Set(high_watermark.memory_bytes);
-        monitor::cache_high_watermark_bytes(StorageType::DISK).Set(high_watermark.file_bytes);
-        monitor::cache_low_watermark_bytes(StorageType::MEMORY).Set(low_watermark.memory_bytes);
-        monitor::cache_low_watermark_bytes(StorageType::DISK).Set(low_watermark.file_bytes);
-
-        // Initialize event base and thread
+        // Reservations can wait even when eviction is disabled. Always start both threads:
+        // the worker retries reservations, and EventBase handles results, timeouts, and cancellation.
         event_base_thread_ = std::make_unique<folly::ScopedEventBaseThread>("cache-eb");
 
-        if (eviction_config_.background_eviction_enabled) {
-            LOG_INFO("[MCL] Starting periodic background eviction loop thread");
-            bg_eviction_thread_ = std::thread(&DList::evictionLoop, this);
-        }
+        background_worker_ = std::thread(&DList::backgroundLoop, this);
     }
 
     void
@@ -95,7 +92,15 @@ class DList : public std::enable_shared_from_this<DList> {
     UpdateLoadingOverheadGroup(const LoadingOverheadGroupHandle& group, LoadingOverheadPolicy policy);
 
     ~DList() {
-        // waiting requests should be cleared before event base thread is stopped
+        // Stop the producer before clearing requests and draining result delivery on EventBase.
+        {
+            std::lock_guard lock(background_mtx_);
+            stop_background_worker_ = true;
+        }
+        background_cv_.notify_one();
+        if (background_worker_.joinable()) {
+            background_worker_.join();
+        }
         clearWaitingQueue();
 
         if (event_base_thread_) {
@@ -115,15 +120,6 @@ class DList : public std::enable_shared_from_this<DList> {
                 event_base_thread_.reset();
             }
         }
-
-        // stop eviction loop thread
-        if (eviction_config_.background_eviction_enabled) {
-            stop_bg_eviction_loop_ = true;
-            bg_eviction_thread_cv_.notify_all();
-            if (bg_eviction_thread_.joinable()) {
-                bg_eviction_thread_.join();
-            }
-        }
     }
 
     // If after evicting all unpinned items, the used_resources_ is still larger than new_limit, false will be returned
@@ -132,8 +128,8 @@ class DList : public std::enable_shared_from_this<DList> {
     bool
     UpdateMaxLimit(const ResourceUsage& new_limit);
 
-    // Updating a watermark retries queued reservations and may evict cache
-    // entries while satisfying them. Validation failure is reported by exception.
+    // Updating a watermark schedules queued reservations for retry in the background.
+    // Validation failure is reported by exception.
     void
     UpdateLowWatermark(const ResourceUsage& new_low_watermark);
 
@@ -330,8 +326,9 @@ class DList : public std::enable_shared_from_this<DList> {
     LoadingResourceReservationAttempt
     reserveResourceInternalWithOverhead(const LoadingResourceUsage& usage, const LoadingOverheadConfig* config);
 
+    // Retry waiting reservations and perform periodic eviction when enabled.
     void
-    evictionLoop();
+    backgroundLoop();
 
     // Try to evict some items so that the resources of evicted items are larger than expected_eviction.
     // If we cannot achieve the goal, but we can evict min_eviction, we will still perform eviction.
@@ -342,17 +339,19 @@ class DList : public std::enable_shared_from_this<DList> {
     tryEvict(const ResourceUsage& expected_eviction, const ResourceUsage& min_eviction,
              const bool evict_expired_items = false);
 
-    // Called after releasing node locks; skip locking only when neither a reservation attempt nor queued work exists.
+    // Coalesce retry notifications without taking list_mtx_; safe while holding it or node locks.
     void
     notifyWaitingRequests();
 
-    // Handle waiting requests when resources are available.
-    // This method should be called with list_mtx_ already held.
-    // Completions must outlive the lock so promises and callbacks complete outside it.
-    void
-    handleWaitingRequests(std::vector<WaitingRequestCompletion>& completions);
+    // Process at most one batch under list_mtx_. Deferred peers stay owned by the background
+    // loop across batches so a blocked heap prefix cannot starve later equal-deadline requests.
+    // Returns true when another batch remains in this scan.
+    bool
+    handleWaitingRequests(std::vector<WaitingRequestCompletion>& completions,
+                          std::vector<std::unique_ptr<WaitingRequest>>& deferred_requests,
+                          std::optional<std::chrono::steady_clock::time_point>& blocked_deadline);
 
-    // Fail one queued request and immediately retry requests behind it.
+    // Fail one queued request and schedule retries for requests behind it.
     // Must be called with list_mtx_ held; completions must outlive the lock.
     void
     failWaitingRequest(uint64_t request_id, const char* reason, std::vector<WaitingRequestCompletion>& completions);
@@ -379,17 +378,8 @@ class DList : public std::enable_shared_from_this<DList> {
     std::string
     usageInfo() const;
 
-    // [NOTE]: this method is deprecated for now, we only use checkPhysicalMemoryLimit instead.
-    // Physical resource protection methods
-    // Returns the amount of memory/disk that needs to be evicted to satisfy physical resource limit
-    // Returns 0 if no eviction needed, positive value if eviction needed.
-    // For disk, it only checks whether the usage will exceed the disk capacity to avoid using up all disk space.
-    // Does not obey the configured disk capacity limit. Reason is: we can't easily determine the amount of disk space
-    // that is used by the cache(there may be other processes using the disk).
-    [[maybe_unused]] ResourceUsage
-    checkPhysicalResourceLimit(const ResourceUsage& size) const;
-
     // Physical memory limit check, used to check if the memory usage will exceed the physical memory limit.
+    // Must be called with list_mtx_ held, which also serializes the process memory reader.
     // Returns the amount of memory that needs to be evicted to satisfy physical memory limit.
     // Returns 0 if no eviction needed, positive value if eviction needed.
     ResourceUsage
@@ -407,14 +397,20 @@ class DList : public std::enable_shared_from_this<DList> {
 
     // TODO(tiered storage 3): benchmark folly::DistributedMutex for this usecase.
     mutable std::mutex list_mtx_;
+    ProcessMemoryReader process_memory_reader_;  // Protected by list_mtx_.
     std::atomic<ResourceUsage> max_resource_limit_;
     std::atomic<ResourceUsage> low_watermark_;
     std::atomic<ResourceUsage> high_watermark_;
+    const bool eviction_enabled_;
     const EvictionConfig eviction_config_;
 
-    std::thread bg_eviction_thread_;
-    std::condition_variable bg_eviction_thread_cv_;
-    std::atomic<bool> stop_bg_eviction_loop_{false};
+    bool waiting_for_physical_memory_{false};  // Protected by list_mtx_.
+
+    std::thread background_worker_;
+    std::mutex background_mtx_;
+    std::condition_variable background_cv_;
+    bool stop_background_worker_{false};
+    bool waiting_requests_pending_{false};  // Protected by background_mtx_.
 
     // Waiting queue for timeout-based memory reservation
     std::priority_queue<std::unique_ptr<WaitingRequest>, std::vector<std::unique_ptr<WaitingRequest>>,
@@ -437,7 +433,7 @@ class DList : public std::enable_shared_from_this<DList> {
     std::atomic<ResourceUsage> total_loading_size_{};
     std::atomic<ResourceUsage> total_loaded_size_{};
 
-    // EventBase and thread for handling timeout operations
+    // Delivers reservation results and handles timeouts and cancellation.
     std::unique_ptr<folly::ScopedEventBaseThread> event_base_thread_;
 };
 
