@@ -1,18 +1,33 @@
 name: Notify conanfiles
 
-run-name: notify conanfiles for ${{ github.ref_name }}
+run-name: >-
+  notify conanfiles for
+  ${{ github.ref_type == 'tag' && github.ref_name || format('{0}@{1}', github.ref_name, github.sha) }}
 
 on:
   push:
+    branches:
+      - master
     tags:
       - 'v*.*.*'
+  workflow_dispatch:
 
+# contents: write is needed to create the snapshot tag for a master commit.
+# The downstream recipe sources https://github.com/<repo>/archive/refs/tags/<tag>.tar.gz,
+# so the tag has to be a real ref -- a synthetic name would 404 when the
+# conanfiles job computes the source sha256.
 permissions:
-  contents: read
+  contents: write
+
+env:
+  # Base version for auto-created snapshot tags. Matches the v1.0.0-<short sha>
+  # convention every published package already follows.
+  VERSION_BASE: '1.0.0'
 
 jobs:
-  # When a new release tag is pushed to milvus-common, send a repository_dispatch event
-  # to the conanfiles repo to trigger the release of the corresponding Conan package.
+  # A commit on master (or a hand-pushed release tag) is turned into a tag and a
+  # repository_dispatch event to the conanfiles repo, which opens the recipe PR
+  # that publishes the corresponding Conan package.
   dispatch:
     name: send milvus-common release dispatch
     if: github.repository == 'zilliztech/milvus-common'
@@ -23,10 +38,43 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Resolve release tag
+        id: resolve
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          # A release tag pushed by hand keeps its exact name (previous behaviour).
+          if [ "$REF_TYPE" = "tag" ]; then
+            echo "tag=${REF_NAME}" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # A commit that landed on master (or a manual run) publishes a snapshot
+          # of itself, so downstream repos can bump their pin as soon as the PR
+          # is merged instead of waiting for someone to remember to tag.
+          SHORT_SHA=$(git rev-parse --short=7 HEAD)
+          TAG="v${VERSION_BASE}-${SHORT_SHA}"
+
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "Tag ${TAG} already exists; reusing it"
+          else
+            git tag "$TAG" "$(git rev-parse HEAD)"
+            git push origin "refs/tags/${TAG}"
+            echo "Created tag ${TAG}"
+          fi
+
+          # NOTE: a tag pushed with GITHUB_TOKEN does not start another workflow
+          # run, which is why this job dispatches below instead of relying on the
+          # tag trigger to fire a second time.
+          echo "tag=${TAG}" >>"$GITHUB_OUTPUT"
+
       - name: Send repository_dispatch to conanfiles
         env:
           GH_TOKEN: ${{ secrets.CONANFILES_DISPATCH_TOKEN }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ steps.resolve.outputs.tag }}
           SOURCE_REPO: zilliztech/milvus-common
         run: |
           set -euo pipefail
