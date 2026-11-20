@@ -341,14 +341,9 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
         co_return co_await self->PinInternal(ctx, self->AllCellIds(), self->loading_timeout_);
     }
 
-    // Keep queued warmup weak, but retain the slot and context across running I/O.
+    // The worker keeps ctx alive until blockingWait returns.
     static folly::coro::Task<void>
-    BackgroundWarmup(std::weak_ptr<CacheSlot> weak_self, folly::CancellationToken token) {
-        auto self = weak_self.lock();
-        if (!self || token.isCancellationRequested()) {
-            co_return;
-        }
-        OpContext ctx(token);
+    BackgroundWarmup(std::shared_ptr<CacheSlot> self, OpContext& ctx) {
         co_await self->PinInternal(&ctx, self->AllCellIds(), self->warmup_loading_timeout_);
         self->skip_pin_.store(!self->evictable_, std::memory_order_release);
     }
@@ -369,10 +364,16 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             if (prefetch_pool) {
                 std::weak_ptr<CacheSlot> weak_self = self;
                 auto token = self->warmup_cancel_source_.getToken();
-                prefetch_pool->add([weak_self, token] {
+                const auto parent_sequence_id = ctx ? std::make_optional(ctx->sequence_id) : std::nullopt;
+                prefetch_pool->add([weak_self, token, parent_sequence_id] {
+                    auto slot = weak_self.lock();
+                    if (!slot || token.isCancellationRequested()) {
+                        return;
+                    }
                     try {
+                        OpContext background_ctx(token, parent_sequence_id);
                         // Keep the worker occupied until issued loading work drains.
-                        folly::coro::blockingWait(BackgroundWarmup(weak_self, token));
+                        folly::coro::blockingWait(BackgroundWarmup(std::move(slot), background_ctx));
                     } catch (...) {
                         if (!token.isCancellationRequested()) {
                             LOG_ERROR("[MCL] Async warmup failed: {}",

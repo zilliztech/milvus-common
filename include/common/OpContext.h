@@ -30,6 +30,10 @@ namespace milvus {
  * to be passed through operation call chains to maintain context and enable observability.
  */
 struct OpContext {
+    // Process-local operation sequence. Roots allocate increasing IDs; children may share an ID.
+    // Allocation order does not guarantee concurrent construction, execution or completion order.
+    const uint64_t sequence_id = NextSequenceId();
+
     // Build task identifier for correlating build and serialization logs.
     int64_t build_id = 0;
 
@@ -104,7 +108,11 @@ struct OpContext {
     }
 
     OpContext() = default;
-    OpContext(const folly::CancellationToken& cancellation_token) : cancellation_token(cancellation_token) {
+    // Pass an existing OpContext's sequence ID to continue its operation, or omit it to start a new one.
+    OpContext(const folly::CancellationToken& cancellation_token,
+              std::optional<uint64_t> parent_sequence_id = std::nullopt)
+        : sequence_id(parent_sequence_id ? *parent_sequence_id : NextSequenceId()),
+          cancellation_token(cancellation_token) {
     }
     ~OpContext() = default;
     OpContext(const OpContext&) = delete;
@@ -113,6 +121,11 @@ struct OpContext {
     OpContext(OpContext&&) = delete;
     OpContext&
     operator=(OpContext&&) = delete;
+
+ private:
+    // Defined in the shared library so all consumers allocate from the same counter.
+    static uint64_t
+    NextSequenceId() noexcept;
 };
 
 }  // namespace milvus

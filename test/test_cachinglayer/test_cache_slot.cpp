@@ -2212,6 +2212,7 @@ class MockTranslatorWithWarmup : public Translator<TestCell> {
             shared_call_counter_->fetch_add(1);
         }
         last_ctx_ = ctx;
+        last_sequence_id_ = ctx ? ctx->sequence_id : 0;
         last_ctx_has_trace_ = false;
         last_trace_id_hex_.reset();
         if (ctx) {
@@ -2272,6 +2273,11 @@ class MockTranslatorWithWarmup : public Translator<TestCell> {
         return last_ctx_;
     }
 
+    uint64_t
+    LastSequenceId() const {
+        return last_sequence_id_;
+    }
+
     bool
     LastCtxHasTrace() const {
         return last_ctx_has_trace_;
@@ -2315,6 +2321,7 @@ class MockTranslatorWithWarmup : public Translator<TestCell> {
     std::unordered_map<cid_t, int> cid_load_delay_ms_;
     std::atomic<int> get_cells_call_count_ = 0;
     milvus::OpContext* last_ctx_ = nullptr;
+    uint64_t last_sequence_id_ = 0;
     bool last_ctx_has_trace_ = false;
     std::optional<std::string> last_trace_id_hex_;
     std::promise<void>* load_started_promise_ = nullptr;
@@ -2871,6 +2878,41 @@ TEST(AsyncWarmupTest, AsyncWarmupDoesNotInheritTraceContext) {
     EXPECT_NE(translator_ptr->GetLastCtx(), op_ctx.get());
     EXPECT_FALSE(translator_ptr->LastCtxHasTrace());
     EXPECT_FALSE(translator_ptr->LastTraceIdHex().has_value());
+}
+
+TEST(AsyncWarmupTest, SequenceSurvivesParentDestructionOrAllocatesWithoutParent) {
+    for (const bool has_parent : {true, false}) {
+        SCOPED_TRACE(has_parent);
+        const auto limit = ResourceUsage{10000, 0};
+        auto dlist = std::make_shared<DList>(true, limit, limit, limit, EvictionConfig{10, true, 600});
+        auto translator = std::make_unique<MockTranslatorWithWarmup>(
+            std::vector<std::pair<cid_t, int64_t>>{{0, 100}}, std::unordered_map<cl_uid_t, cid_t>{{0, 0}},
+            "async_sequence_slot", StorageType::MEMORY, CacheWarmupPolicy::CacheWarmupPolicy_Async);
+        auto* translator_ptr = translator.get();
+        auto slot =
+            std::make_shared<CacheSlot<TestCell>>(std::move(translator), dlist.get(), true, true, true,
+                                                  std::chrono::milliseconds(100000), std::chrono::milliseconds(0));
+
+        folly::CancellationSource parent_cancel;
+        auto parent = has_parent ? std::make_unique<milvus::OpContext>(parent_cancel.getToken()) : nullptr;
+        const auto parent_id = parent ? parent->sequence_id : 0;
+        std::promise<void> blocker;
+        auto ready = blocker.get_future();
+        auto pool = std::make_shared<folly::CPUThreadPoolExecutor>(1);
+        pool->add([&ready] { ready.wait(); });
+        EXPECT_NO_THROW(folly::coro::blockingWait(slot->Warmup(parent.get(), pool)));
+        parent_cancel.requestCancellation();
+        parent.reset();
+        blocker.set_value();
+        pool->join();
+
+        EXPECT_EQ(translator_ptr->GetCellsCallCount(), 1);
+        if (has_parent) {
+            EXPECT_EQ(translator_ptr->LastSequenceId(), parent_id);
+        } else {
+            EXPECT_GT(translator_ptr->LastSequenceId(), 0);
+        }
+    }
 }
 
 TEST(AsyncWarmupTest, SyncWarmupStillWorks) {
