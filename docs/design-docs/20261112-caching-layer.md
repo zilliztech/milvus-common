@@ -82,7 +82,7 @@ Asynchronous API contracts also matter:
 - `PinCells()` retains the Slot and resolved IDs in its future. Loading starts when the future is awaited or driven. A borrowed `OpContext` must outlive completion.
 - The default `get_cells_async()` calls synchronous `get_cells()`; it does not automatically offload blocking I/O. Overrides must await/offload appropriately and drain issued work before returning or throwing.
 - `Pin*Direct()` and synchronous creation block. Do not occupy an executor needed by the load itself, which can exhaust the workers required for progress.
-- Call Warmup once before ordinary pinning. Background warmup uses its own cancellation context; without a prefetch pool, it falls back to foreground execution.
+- Call Warmup once before ordinary pinning. Background warmup uses the slot's own cancellation token and captures the caller's operation sequence ID by value when a caller context is present. Without a caller context, it allocates a new sequence ID. Without a prefetch pool, warmup falls back to foreground execution.
 
 ## 6. Prefer CacheSlot When Integrating with LRU
 

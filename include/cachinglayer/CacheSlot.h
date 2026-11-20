@@ -344,12 +344,12 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
     // Keep queued warmup weak, but retain the slot and context across running I/O.
     static folly::coro::Task<void>
     BackgroundWarmup(std::weak_ptr<CacheSlot> weak_self, folly::CancellationToken token,
-                     std::optional<OpContext::InheritSequence> inherited) {
+                     std::optional<uint64_t> parent_sequence_id) {
         auto self = weak_self.lock();
         if (!self || token.isCancellationRequested()) {
             co_return;
         }
-        OpContext ctx = inherited ? OpContext(*inherited, token) : OpContext(token);
+        OpContext ctx(token, parent_sequence_id);
         co_await self->PinInternal(&ctx, self->AllCellIds(), self->warmup_loading_timeout_);
         self->skip_pin_.store(!self->evictable_, std::memory_order_release);
     }
@@ -370,11 +370,11 @@ class CacheSlot final : public std::enable_shared_from_this<CacheSlot<CellT>> {
             if (prefetch_pool) {
                 std::weak_ptr<CacheSlot> weak_self = self;
                 auto token = self->warmup_cancel_source_.getToken();
-                const auto inherited = ctx ? std::make_optional(OpContext::InheritSequence{*ctx}) : std::nullopt;
-                prefetch_pool->add([weak_self, token, inherited] {
+                const auto parent_sequence_id = ctx ? std::make_optional(ctx->sequence_id) : std::nullopt;
+                prefetch_pool->add([weak_self, token, parent_sequence_id] {
                     try {
                         // Keep the worker occupied until issued loading work drains.
-                        folly::coro::blockingWait(BackgroundWarmup(weak_self, token, inherited));
+                        folly::coro::blockingWait(BackgroundWarmup(weak_self, token, parent_sequence_id));
                     } catch (...) {
                         if (!token.isCancellationRequested()) {
                             LOG_ERROR("[MCL] Async warmup failed: {}",

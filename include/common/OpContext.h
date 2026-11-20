@@ -30,17 +30,6 @@ namespace milvus {
  * to be passed through operation call chains to maintain context and enable observability.
  */
 struct OpContext {
-    /** @brief Copyable sequence snapshot; does not retain the parent or inherit its other fields. */
-    class InheritSequence {
-     public:
-        explicit InheritSequence(const OpContext& parent) noexcept : sequence_id_(parent.sequence_id) {
-        }
-
-     private:
-        friend struct OpContext;
-        uint64_t sequence_id_;
-    };
-
     // Process-local operation sequence. Roots allocate increasing IDs; children may share an ID.
     // Allocation order does not guarantee concurrent construction, execution or completion order.
     const uint64_t sequence_id = NextSequenceId();
@@ -119,11 +108,11 @@ struct OpContext {
     }
 
     OpContext() = default;
-    OpContext(const folly::CancellationToken& cancellation_token) : cancellation_token(cancellation_token) {
-    }
-    // Inherit only the operation sequence; cancellation is explicitly chosen by the caller.
-    explicit OpContext(InheritSequence inherited, const folly::CancellationToken& cancellation_token = {})
-        : sequence_id(inherited.sequence_id_), cancellation_token(cancellation_token) {
+    // Pass an existing OpContext's sequence ID to continue its operation, or omit it to start a new one.
+    OpContext(const folly::CancellationToken& cancellation_token,
+              std::optional<uint64_t> parent_sequence_id = std::nullopt)
+        : sequence_id(parent_sequence_id ? *parent_sequence_id : NextSequenceId()),
+          cancellation_token(cancellation_token) {
     }
     ~OpContext() = default;
     OpContext(const OpContext&) = delete;

@@ -24,7 +24,6 @@ using milvus::OpContext;
 static_assert(!std::is_copy_constructible_v<OpContext>);
 static_assert(!std::is_move_constructible_v<OpContext>);
 static_assert(std::is_const_v<decltype(OpContext::sequence_id)>);
-static_assert(std::is_trivially_copyable_v<OpContext::InheritSequence>);
 
 TEST(OpContext, RootsAllocateIncreasingSequences) {
     const OpContext first;
@@ -62,7 +61,7 @@ TEST(OpContext, ConcurrentRootsHaveDistinctSequences) {
     EXPECT_EQ(std::adjacent_find(ids.begin(), ids.end()), ids.end());
 }
 
-TEST(OpContext, ChildrenInheritOnlySequence) {
+TEST(OpContext, ChildrenReuseSequenceWithFreshState) {
     folly::CancellationSource parent_cancel;
     OpContext parent(parent_cancel.getToken());
     parent.build_id = 42;
@@ -71,13 +70,14 @@ TEST(OpContext, ChildrenInheritOnlySequence) {
     parent.storage_usage.scanned_total_bytes = 100;
     parent_cancel.requestCancellation();
 
-    const OpContext child(OpContext::InheritSequence{parent});
-    const OpContext sibling(OpContext::InheritSequence{parent});
-    const OpContext grandchild(OpContext::InheritSequence{child});
+    const OpContext child(parent.cancellation_token, parent.sequence_id);
+    const OpContext sibling({}, parent.sequence_id);
+    const OpContext grandchild(child.cancellation_token, child.sequence_id);
     EXPECT_EQ(child.sequence_id, parent.sequence_id);
     EXPECT_EQ(sibling.sequence_id, parent.sequence_id);
     EXPECT_EQ(grandchild.sequence_id, parent.sequence_id);
-    EXPECT_FALSE(child.cancellation_token.canBeCancelled());
+    EXPECT_TRUE(child.cancellation_token.isCancellationRequested());
+    EXPECT_FALSE(sibling.cancellation_token.canBeCancelled());
     EXPECT_EQ(child.build_id, 0);
     EXPECT_FALSE(child.runtime_load_priority.has_value());
     EXPECT_TRUE(child.coload_fields.empty());
@@ -85,14 +85,12 @@ TEST(OpContext, ChildrenInheritOnlySequence) {
 }
 
 TEST(OpContext, InheritanceSurvivesParentDestruction) {
-    uint64_t parent_id = 0;
-    const auto inherited = [&] {
+    const auto parent_id = [] {
         const OpContext parent;
-        parent_id = parent.sequence_id;
-        return OpContext::InheritSequence{parent};
+        return parent.sequence_id;
     }();
     const OpContext unrelated;
-    const OpContext child(inherited);
+    const OpContext child({}, parent_id);
     EXPECT_EQ(child.sequence_id, parent_id);
     EXPECT_LT(child.sequence_id, unrelated.sequence_id);
 }
@@ -100,7 +98,7 @@ TEST(OpContext, InheritanceSurvivesParentDestruction) {
 TEST(OpContext, ChildUsesExplicitCancellationToken) {
     const OpContext parent;
     folly::CancellationSource cancel;
-    const OpContext child(OpContext::InheritSequence{parent}, cancel.getToken());
+    const OpContext child(cancel.getToken(), parent.sequence_id);
     cancel.requestCancellation();
     EXPECT_EQ(child.sequence_id, parent.sequence_id);
     EXPECT_TRUE(child.cancellation_token.isCancellationRequested());
