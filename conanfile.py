@@ -22,7 +22,7 @@ class MilvusCommonConan(ConanFile):
         "xz_utils/5.4.5#fc4e36861e0a47ecd4a40a00e6d29ac8",
         "zlib/1.3.1#8045430172a5f8d56ba001b14561b4ea",
         "libevent/2.1.12#95065aaefcd58d3956d6dfbfc5631d97",
-        "folly/2026.04.20.00@milvus/dev#06852bea5b6449f0c4eb0df002b5779c",
+        "folly/2026.04.20.00@milvus/dev#bb88f7ffd53457e8fa8f4516eaec6c60",
         "boost/1.83.0#4e8a94ac1b88312af95eded83cd81ca8",
     )
 
@@ -59,8 +59,11 @@ class MilvusCommonConan(ConanFile):
         # Force overrides openssl to resolve opentelemetry-cpp's transitive deps
         self.requires("openssl/3.3.2#9f9f130d58e7c13e76bb8a559f0a6a8b", force=True, override=True)
         self.requires("libcurl/8.10.1#a3113369c86086b0e84231844e7ed0a9", force=True, override=True)
-        # folly/2026.x recipe still pins fmt/10.2.1; align on fmt/11 (matches knowhere)
-        self.requires("fmt/11.2.0#eb98daa559c7c59d591f4720dde4cd5c", force=True)
+        # force=True keeps this fmt revision authoritative for transitive
+        # consumers (e.g. opentelemetry-cpp). The folly recipe revision from
+        # conanfiles PR #224 already requires fmt/11.2.0 for non-MSVC
+        # toolchains, so this aligns with it (matches knowhere).
+        self.requires("fmt/11.2.0#9e6db8ce0c09fbec6b24e461cf520c53", force=True)
         # nlohmann_json is a direct dependency (used in Tracer.cpp) and also forces
         # the transitive version from opentelemetry-cpp to align
         self.requires("nlohmann_json/3.11.3#ffb9e9236619f1c883e36662f944345d", force=True)
