@@ -40,7 +40,7 @@ jobs:
       - name: Install Dependency
         run: |
           sudo apt update && sudo apt install -y cmake libaio-dev g++-12 gcc-12 python3 python3-pip \
-          && pip3 install conan==2.25.1
+          && pip3 install conan==2.33.0
       - name: Restore Conan Packages
         uses: actions/cache@v4
         with:
@@ -74,7 +74,7 @@ jobs:
       - name: Install Dependency
         run: |
           python3 -m venv "$RUNNER_TEMP/conan-venv"
-          "$RUNNER_TEMP/conan-venv/bin/python" -m pip install conan==2.25.1 "cmake<4"
+          "$RUNNER_TEMP/conan-venv/bin/python" -m pip install conan==2.33.0 "cmake<4"
           echo "$RUNNER_TEMP/conan-venv/bin" >> $GITHUB_PATH
       - name: Restore Conan Packages
         uses: actions/cache@v4
@@ -97,3 +97,106 @@ jobs:
         with:
           path: ~/.conan2
           key: milvus-common-macos-15-${{ hashFiles('conanfile.py')}}
+
+  ut-linux-gcc16:
+    name: UT on ubuntu-24.04 (gcc-16)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      CC: gcc
+      CXX: g++
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install Dependency
+        run: |
+          sudo apt update && sudo apt install -y cmake libaio-dev python3 python3-pip
+      - name: Install gcc-16 toolchain
+        run: |
+          # gcc-16 is not packaged by Ubuntu 24.04 apt or the toolchain PPA, so use
+          # Homebrew-on-Linux; its bundled glibc (2.39) matches ubuntu-24.04's libc.
+          NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          brew install gcc@16 binutils
+          mkdir -p "$RUNNER_TEMP/toolchain-bin"
+          ln -sf "$(brew --prefix gcc@16)/bin/gcc-16" "$RUNNER_TEMP/toolchain-bin/gcc"
+          ln -sf "$(brew --prefix gcc@16)/bin/g++-16" "$RUNNER_TEMP/toolchain-bin/g++"
+          # gcc-16 emits .base64 pseudo-ops that require binutils >= 2.43; the system
+          # as is 2.42, so prefer the binutils bundled with Homebrew gcc.
+          echo "$(brew --prefix binutils)/bin" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/toolchain-bin" >> "$GITHUB_PATH"
+      - name: Record gcc-16 version
+        run: |
+          # Homebrew updates the gcc@16 formula over time; hash the compiler
+          # identity into the Conan cache key so a restored cache can never
+          # silently reuse binaries built by an older gcc-16 patch release.
+          GCC16_ID="$("$(brew --prefix gcc@16)/bin/gcc-16" --version | sha256sum | cut -d' ' -f1 | cut -c1-12)"
+          echo "GCC16_ID=$GCC16_ID" >> "$GITHUB_ENV"
+      - name: Install Conan
+        run: |
+          pip3 install conan==2.33.0
+      - name: Restore Conan Packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.conan2
+          key: milvus-common-ubuntu-24.04-gcc16-${GCC16_ID}-${{ hashFiles('conanfile.py')}}
+          restore-keys: milvus-common-ubuntu-24.04-gcc16-${GCC16_ID}-
+      - name: Setup Conan
+        run: |
+          conan profile detect --force \
+          && conan remote add default-conan-local2 https://milvus01.jfrog.io/artifactory/api/conan/default-conan-local2 --force
+      - name: Build & Run
+        run: |
+          make test BUILD_TYPE=Release CONAN_EXTRA='-o \&:with_asan=True -s compiler=gcc -s compiler.version=16 -s compiler.libcxx=libstdc++11'
+      - name: Save Conan Packages
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.conan2
+          key: milvus-common-ubuntu-24.04-gcc16-${GCC16_ID}-${{ hashFiles('conanfile.py')}}
+
+  ut-macos-clang23:
+    name: UT on macos-26 (clang-23)
+    runs-on: macos-26
+    timeout-minutes: 120
+    env:
+      CC: clang
+      CXX: clang++
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install Dependency
+        run: |
+          python3 -m venv "$RUNNER_TEMP/conan-venv"
+          "$RUNNER_TEMP/conan-venv/bin/python" -m pip install conan==2.33.0 "cmake<4"
+          echo "$RUNNER_TEMP/conan-venv/bin" >> $GITHUB_PATH
+      - name: Install clang-23 toolchain
+        run: |
+          brew install llvm@23
+          echo "$(brew --prefix llvm@23)/bin" >> "$GITHUB_PATH"
+          # Export the macOS SDK so tools invoked without an explicit -isysroot
+          # (e.g. b2, autotools) can still find the system headers.
+          echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+      - name: Restore Conan Packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.conan2
+          key: milvus-common-macos-26-clang23-${{ hashFiles('conanfile.py')}}
+          restore-keys: milvus-common-macos-26-clang23-
+      - name: Setup Conan
+        run: |
+          conan profile detect --force \
+          && conan remote add default-conan-local2 https://milvus01.jfrog.io/artifactory/api/conan/default-conan-local2 --force
+      - name: Build & Run
+        env:
+          CONAN_EXTRA: "-c tools.build:exelinkflags='[\"-Wl,-headerpad_max_install_names\"]' -c tools.build:sharedlinkflags='[\"-Wl,-headerpad_max_install_names\"]' -s compiler=clang -s compiler.version=23 -s compiler.libcxx=libc++"
+        run: |
+          make test BUILD_TYPE=Release
+      - name: Save Conan Packages
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.conan2
+          key: milvus-common-macos-26-clang23-${{ hashFiles('conanfile.py')}}

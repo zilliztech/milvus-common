@@ -19,7 +19,7 @@ Milvus Common is a core component library that serves as a bridge between Milvus
 ### Prepare
 
 ```
-pip install conan==2.25.1
+pip install conan==2.33.0
 conan profile detect
 conan remote add default-conan-local2 https://milvus01.jfrog.io/artifactory/api/conan/default-conan-local2
 ```
