@@ -18,7 +18,11 @@
 #include <prometheus/histogram.h>
 
 #include <atomic>
+#include <concepts>
+#include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <type_traits>
 
 #ifdef __linux__
 #include <folly/File.h>
@@ -32,6 +36,13 @@ namespace milvus::cachinglayer {
 
 using uid_t = int64_t;
 using cid_t = int64_t;
+
+// Shared by the cache definition and its forward/friend declarations.
+template <typename Key>
+concept CacheMapKey =
+    std::copy_constructible<Key> && std::equality_comparable<Key> && std::default_initializable<std::hash<Key>> &&
+    std::regular_invocable<const std::hash<Key>&, const Key&> &&
+    std::same_as<std::invoke_result_t<const std::hash<Key>&, const Key&>, std::size_t>;
 
 enum class StorageType {
     MEMORY,
