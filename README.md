@@ -137,9 +137,10 @@ auto result = GetAnswer(*cache);
   entries are removed by `Erase`, cache destruction or configured time-based background
   eviction; size-based reservation eviction does not select them.
 - The index is a trimmed CacheLib `ChainedHashTable` with fixed buckets and striped mutexes.
-  `CreateCacheMap<Key, Value>({.buckets_power = 10, .locks_power = 6})` selects
-  1024 buckets and 64 mutexes (the defaults). It does not rehash; size the bucket
-  count for the expected resident key count to avoid long chains.
+  `CreateCacheMap<Key, Value>({.buckets_power = 14, .locks_power = 9})` selects
+  16,384 buckets and 512 mutexes (the defaults). Size the fixed bucket count
+  for the expected resident key count to avoid long chains. For fewer than 512
+  buckets, also set `locks_power` to at most `buckets_power`.
 - `Get` retains an Entry under its index mutex, releases that mutex, then pins under
   the node lock. If eviction won the race, it returns a miss. It does not acquire
   the global LRU lock. Unpin reuses the CacheSlot touch-window path; moving an entry

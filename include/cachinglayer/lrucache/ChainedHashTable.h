@@ -33,8 +33,8 @@
 namespace milvus::cachinglayer::internal {
 
 struct ChainedHashTableConfig {
-    uint32_t buckets_power{10};  // 1024 buckets; no automatic rehash.
-    uint32_t locks_power{6};     // 64 mutexes shared by the buckets.
+    uint32_t buckets_power{14};  // 16,384 fixed buckets.
+    uint32_t locks_power{9};     // 512 mutexes shared by the buckets.
 };
 
 template <typename T>
